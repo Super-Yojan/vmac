@@ -4,7 +4,7 @@
 
 use crate::buffer::Buffer;
 use crate::editor::{Editor, Rect};
-use crate::lisp::{Lisp, Segment};
+use crate::lisp::{FaceSpec, Lisp, Segment};
 use crate::picker::Picker;
 use crate::syntax::{Syntax, face_for, language_for_path};
 use gpui_kit::base::{h_flex, v_flex};
@@ -115,6 +115,7 @@ pub fn key_name(ks: &Keystroke) -> Option<(String, String)> {
 fn face_color(face: &str, cx: &App) -> Hsla {
     let t = cx.theme();
     match face {
+        "muted" => t.muted,
         "strong" => t.foreground,
         "dim" => t.muted_foreground,
         "accent" => t.primary,
@@ -129,13 +130,52 @@ fn face_color(face: &str, cx: &App) -> Hsla {
     }
 }
 
+/// How a run of text looks: a face resolved against the theme.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Style {
+    color: Option<Hsla>,
+    background: Option<Hsla>,
+    scale: f32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    sans: bool,
+}
+
+impl Style {
+    fn color(color: Hsla) -> Self {
+        Self { color: Some(color), background: None, scale: 1., bold: false, italic: false, underline: false, sans: false }
+    }
+}
+
+/// A face by name: its spec from `(face-specs)` if it has one, else a color.
+fn resolve_style(face: &str, specs: &[FaceSpec], cx: &App) -> Style {
+    match specs.iter().find(|s| s.name == face) {
+        Some(spec) => Style {
+            color: spec.color.as_deref().map(|c| face_color(c, cx)),
+            background: spec.background.as_deref().map(|c| face_color(c, cx)),
+            scale: spec.scale.unwrap_or(1.),
+            bold: spec.bold,
+            italic: spec.italic,
+            underline: spec.underline,
+            sans: spec.sans,
+        },
+        None => Style::color(face_color(face, cx)),
+    }
+}
+
+/// The tallest text on a line, as a multiple of the normal size.
+fn line_scale(styles: &[(usize, usize, Style)]) -> f32 {
+    styles.iter().map(|s| s.2.scale).fold(1., f32::max)
+}
+
 /// How one character cell is drawn.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Cell {
     selected: bool,
     matched: bool,
     cursor: bool,
-    color: Option<Hsla>,
+    style: Option<Style>,
 }
 
 /// Column ranges where the search pattern matches in a line of text.
@@ -156,20 +196,22 @@ fn line_element(
     cursor: Option<usize>,
     selected: Option<(usize, usize)>,
     matches: Vec<(usize, usize)>,
-    colors: Vec<(usize, usize, Hsla)>,
+    styles: Vec<(usize, usize, Style)>,
     bar: bool,
     cx: &App,
 ) -> impl IntoElement {
+    let height = ROW_HEIGHT * line_scale(&styles);
     let t = cx.theme();
     let chars: Vec<char> = text.chars().collect();
     let in_sel = |col: usize| selected.is_some_and(|(a, b)| col >= a && col < b);
     let in_match = |col: usize| matches.iter().any(|&(a, b)| col >= a && col < b);
-    let color = |col: usize| colors.iter().find(|&&(a, b, _)| col >= a && col < b).map(|c| c.2);
+    // Later styles win: Scheme's faces over syntax.
+    let style = |col: usize| styles.iter().rev().find(|&&(a, b, _)| col >= a && col < b).map(|s| s.2);
     let cell = |col: usize| Cell {
         selected: in_sel(col),
         matched: in_match(col),
         cursor: cursor == Some(col),
-        color: color(col),
+        style: style(col),
     };
     // The cell after the last character exists when it is drawn.
     let end = chars.len();
@@ -187,9 +229,19 @@ fn line_element(
         }
     }
 
-    h_flex().h(px(ROW_HEIGHT)).whitespace_nowrap().children(runs.into_iter().map(|(c, text)| {
+    let sans = t.font_family.clone();
+    h_flex().h(px(height)).items_end().whitespace_nowrap().children(runs.into_iter().map(|(c, text)| {
+        let st = c.style;
         let run = div()
-            .when_some(c.color, |d, color| d.text_color(color))
+            .when_some(st.and_then(|s| s.color), |d, color| d.text_color(color))
+            .when_some(st.and_then(|s| s.background), |d, bg| d.bg(bg))
+            .when_some(st.filter(|s| s.scale != 1.), |d, s| {
+                d.text_size(px(FONT_SIZE * s.scale)).line_height(px(ROW_HEIGHT * s.scale))
+            })
+            .when(st.is_some_and(|s| s.bold), |d| d.font_weight(gpui_kit::FontWeight::BOLD))
+            .when(st.is_some_and(|s| s.italic), |d| d.italic())
+            .when(st.is_some_and(|s| s.underline), |d| d.underline())
+            .when(st.is_some_and(|s| s.sans), |d| d.font_family(sans.clone()))
             .when(c.matched, |d| d.bg(t.warning.opacity(0.35)))
             .when(c.selected, |d| d.bg(t.selection))
             .child(text);
@@ -197,7 +249,7 @@ fn line_element(
             (false, _) => run,
             (true, true) => run
                 .relative()
-                .child(div().absolute().left_0().top_0().w(px(2.)).h(px(ROW_HEIGHT)).bg(t.caret)),
+                .child(div().absolute().left_0().top_0().w(px(2.)).h(px(height)).bg(t.caret)),
             (true, false) => run.bg(t.caret).text_color(t.background),
         }
     }))
@@ -344,6 +396,22 @@ fn display_line(rope_line: ropey::RopeSlice<'_>) -> String {
         .replace('\t', "    ")
 }
 
+/// Which lines fill `room` pixels: scrolls down from `top` until the
+/// cursor's line fits, then takes lines while they fit (at least one), up to
+/// `end`. Returns the first and one-past-last lines.
+fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl Fn(usize) -> f32) -> (usize, usize) {
+    while top < cursor && (top..=cursor).map(&height).sum::<f32>() > room {
+        top += 1;
+    }
+    let mut last = top;
+    let mut used = 0.;
+    while last < end && (last == top || used + height(last) <= room) {
+        used += height(last);
+        last += 1;
+    }
+    (top, last)
+}
+
 /// Text rows a window of this size shows: its height less its modeline.
 fn window_rows(r: &Rect, area_height: f32) -> usize {
     ((r.h * area_height / ROW_HEIGHT) as usize).saturating_sub(1).max(1)
@@ -373,6 +441,11 @@ impl Render for Shell {
         let syntax = &mut self.syntax;
         let theme = cx.theme();
 
+        let face_specs = self.lisp.face_specs();
+        // Where each window ends up scrolled and how many lines it shows,
+        // once line heights are known (headings are taller).
+        let mut fitted: Vec<(crate::editor::WindowId, usize, usize)> = Vec::new();
+
         let windows: Vec<_> = rects
             .iter()
             .filter_map(|(id, r)| {
@@ -385,13 +458,48 @@ impl Render for Shell {
                 let point = st.window_point(*id);
                 let cur_line = text.char_to_line(point);
                 let cur_col = point - text.line_to_char(cur_line);
-                let rows = window_rows(r, area);
-                let last = text.len_lines().min(w.scroll_top + rows);
+
+                // Styles for every line that could be on screen: from the top (or
+                // the cursor, if above) through as many normal-height rows as fit.
+                let estimate = window_rows(r, area);
+                let lo = w.scroll_top.min(cur_line);
+                let hi = (w.scroll_top + estimate).max(cur_line + 1).min(text.len_lines());
                 let spans = match buffer.file().and_then(|f| language_for_path(f)) {
-                    Some(lang) => syntax.highlight(w.buffer, lang, buffer.revision(), text, w.scroll_top..last),
+                    Some(lang) => syntax.highlight(w.buffer, lang, buffer.revision(), text, lo..hi),
                     None => Vec::new(),
                 };
-                let lines: Vec<_> = (w.scroll_top..last)
+                // Styles of line i, in character columns (not yet screen columns).
+                let styles_of = |i: usize| -> Vec<(usize, usize, Style)> {
+                    let start = text.line_to_char(i);
+                    let line_len = text.line(i).len_chars();
+                    let mut out: Vec<(usize, usize, Style)> = spans
+                        .get(i - lo)
+                        .map(|line_spans| {
+                            line_spans
+                                .iter()
+                                .filter_map(|sp| {
+                                    let face = face_for(&sp.capture, &syntax_theme)?;
+                                    Some((sp.start, sp.end, resolve_style(face, &face_specs, cx)))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // Faces Scheme put on the text (the tree's folders, ...).
+                    out.extend(buffer.faces().iter().filter(|f| f.0 < start + line_len && f.1 > start).map(
+                        |(a, b, face)| {
+                            (a.saturating_sub(start), b.saturating_sub(start), resolve_style(face, &face_specs, cx))
+                        },
+                    ));
+                    out
+                };
+                let styles: Vec<_> = (lo..hi).map(styles_of).collect();
+                let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
+
+                let room = (r.h * area - ROW_HEIGHT).max(ROW_HEIGHT);
+                let (top, last) = fit_lines(w.scroll_top.min(cur_line), cur_line, hi, room, height_of);
+                fitted.push((*id, top, last - top));
+
+                let lines: Vec<_> = (top..last)
                     .map(|i| {
                         let raw = text.line(i).to_string();
                         let cols = display_columns(raw.trim_end_matches(['\n', '\r']));
@@ -409,31 +517,13 @@ impl Render for Shell {
                             .map(|&(a, b)| {
                                 (to_screen(a.saturating_sub(start)), to_screen(b.saturating_sub(start)))
                             });
-                        let mut colors: Vec<(usize, usize, Hsla)> = spans
-                            .get(i - w.scroll_top)
-                            .map(|line_spans| {
-                                line_spans
-                                    .iter()
-                                    .filter_map(|sp| {
-                                        let face = face_for(&sp.capture, &syntax_theme)?;
-                                        Some((to_screen(sp.start), to_screen(sp.end), face_color(face, cx)))
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        // Faces Scheme put on the text (the tree's folders, ...).
-                        colors.extend(buffer.faces().iter().filter(|f| f.0 < start + line_len && f.1 > start).map(
-                            |(a, b, face)| {
-                                (
-                                    to_screen(a.saturating_sub(start)),
-                                    to_screen(b.saturating_sub(start)),
-                                    face_color(face, cx),
-                                )
-                            },
-                        ));
+                        let line_styles = styles[i - lo]
+                            .iter()
+                            .map(|&(a, b, style)| (to_screen(a), to_screen(b), style))
+                            .collect();
                         let line = display_line(text.line(i));
                         let matches = match_columns(&line, search.as_ref());
-                        let row = line_element(line, cursor, selected, matches, colors, bar, cx);
+                        let row = line_element(line, cursor, selected, matches, line_styles, bar, cx);
                         let current = is_sidebar && i == cur_line;
                         div().when(current, |d| {
                             d.bg(if is_selected { theme.list_active } else { theme.list_hover })
@@ -477,6 +567,12 @@ impl Render for Shell {
             })
             .collect();
 
+        for (id, top, rows) in fitted {
+            if let Some(w) = st.window_by_id_mut(id) {
+                w.scroll_top = top;
+                w.rows = rows.max(1);
+            }
+        }
         syntax.retain(|id| st.buffer_by_id(id).is_some());
         // The picker draws its own query line; the echo area keeps the message.
         let overlay = st.picker.as_ref().map(|p| picker_element(p, &st.minibuffer, bar, height, cx));
@@ -516,6 +612,18 @@ mod tests {
         let mut k = Keystroke::parse(s).unwrap();
         k.key_char = key_char.map(Into::into);
         k
+    }
+
+    #[test]
+    fn tall_lines_scroll_the_cursor_into_view() {
+        // Line 0 is a heading twice as tall; room for 4 normal rows.
+        let h = |i: usize| if i == 0 { 2. * ROW_HEIGHT } else { ROW_HEIGHT };
+        let room = 4. * ROW_HEIGHT;
+        assert_eq!(fit_lines(0, 1, 10, room, h), (0, 3), "heading + 2 lines fit");
+        assert_eq!(fit_lines(0, 3, 10, room, h), (1, 5), "the cursor on line 3 scrolls the heading off");
+        assert_eq!(fit_lines(0, 0, 1, room, h), (0, 1), "stops at the buffer's end");
+        let huge = |_| 10. * ROW_HEIGHT;
+        assert_eq!(fit_lines(0, 0, 10, room, huge), (0, 1), "always at least one line");
     }
 
     #[test]

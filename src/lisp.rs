@@ -35,6 +35,59 @@ impl Source {
     }
 }
 
+/// How a face looks, from Scheme's `(face-specs)`. Colors are face/theme
+/// color names (`accent`, `blue`, `muted`, ...).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FaceSpec {
+    pub name: String,
+    pub color: Option<String>,
+    pub background: Option<String>,
+    /// Text size relative to the editor's (1.0 = normal).
+    pub scale: Option<f32>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    /// The UI's proportional font instead of the monospace one.
+    pub sans: bool,
+}
+
+fn symbol_text(v: &SteelVal) -> Option<String> {
+    match v {
+        SteelVal::SymbolV(s) | SteelVal::StringV(s) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// `("name" key value key value ...)`: keys `color`, `background`, `scale`,
+/// `weight` (bold), `slant` (italic), `underline` (#t), `family` (sans).
+fn parse_face_spec(v: &SteelVal) -> Option<FaceSpec> {
+    let SteelVal::ListV(items) = v else { return None };
+    let items: Vec<&SteelVal> = items.iter().collect();
+    let mut spec = FaceSpec { name: symbol_text(items.first()?)?, ..Default::default() };
+    for pair in items[1..].chunks(2) {
+        let [key, value] = pair else { break };
+        let key = symbol_text(key).unwrap_or_default();
+        let text = symbol_text(value).unwrap_or_default();
+        match key.as_str() {
+            "color" => spec.color = Some(text),
+            "background" => spec.background = Some(text),
+            "scale" => {
+                spec.scale = match value {
+                    SteelVal::NumV(n) => Some(*n as f32),
+                    SteelVal::IntV(n) => Some(*n as f32),
+                    _ => None,
+                }
+            }
+            "weight" => spec.bold = text == "bold",
+            "slant" => spec.italic = text == "italic",
+            "underline" => spec.underline = matches!(value, SteelVal::BoolV(true)),
+            "family" => spec.sans = text == "sans",
+            _ => {}
+        }
+    }
+    Some(spec)
+}
+
 /// One modeline segment: text plus a face name the view maps to a theme color.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
@@ -210,6 +263,14 @@ impl Lisp {
         match self.engine.call_function_by_name_with_args("syntax-theme", vec![]) {
             Ok(v) => parse_segments(&v).into_iter().map(|s| (s.text, s.face)).collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Calls Scheme's `(face-specs)`: how named faces look.
+    pub fn face_specs(&mut self) -> Vec<FaceSpec> {
+        match self.engine.call_function_by_name_with_args("face-specs", vec![]) {
+            Ok(SteelVal::ListV(items)) => items.iter().filter_map(parse_face_spec).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -497,6 +558,14 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
         }
     });
 
+    // Markdown tables, aligned like Org mode.
+    prim!(engine, editor, "table-at-point?", |s| {
+        let b = s.current();
+        let line = b.line();
+        crate::markdown::is_table_row(&b.text().line(line).to_string())
+    });
+    prim!(engine, editor, "align-table", |s, move_cells: isize| align_table_at_point(s.current(), move_cells));
+
     // The echo area and minibuffer.
     prim!(engine, editor, "message", |s, text: String| s.message = text);
     prim!(engine, editor, "current-message", |s| s.message.clone());
@@ -511,6 +580,39 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     // Runs Scheme source after the current command (see `pending_eval`).
     prim!(engine, editor, "eval-string", |s, code: String| s.pending_eval.push(code));
     prim!(engine, editor, "quit-editor", |s| s.quit_requested = true);
+}
+
+/// Aligns the table around the point (its rows are the lines around it that
+/// start with `|`), moving the cursor `move_cells` cells. One edit, so one
+/// undo step; nothing changes if it was aligned already.
+fn align_table_at_point(b: &mut Buffer, move_cells: isize) -> bool {
+    let row_at = |b: &Buffer, line: usize| crate::markdown::is_table_row(&b.text().line(line).to_string());
+    let here = b.line();
+    if !row_at(b, here) {
+        return false;
+    }
+    let mut first = here;
+    while first > 0 && row_at(b, first - 1) {
+        first -= 1;
+    }
+    let mut last = here;
+    while last + 1 < b.line_count() && row_at(b, last + 1) {
+        last += 1;
+    }
+    let lines: Vec<String> = (first..=last)
+        .map(|l| b.text().line(l).to_string().trim_end_matches(['\n', '\r']).to_string())
+        .collect();
+    let aligned = crate::markdown::align_table(&lines, (here - first, b.column()), move_cells);
+    let (start, end) = (b.line_to_pos(first), b.line_end(b.line_to_pos(last)));
+    if aligned.lines != lines {
+        b.delete_range(start, end);
+        b.goto_char(start);
+        b.insert(&aligned.lines.join("\n"));
+    }
+    let (row, col) = aligned.cursor;
+    let target = b.line_to_pos(first + row) + col;
+    b.goto_char(target);
+    true
 }
 
 /// A folder's entries for the file tree: folders first (with a trailing
@@ -1518,6 +1620,115 @@ mod tests {
         typed(&mut lisp, "0.");
         assert_eq!(editor.lock().buffer().text().to_string(), "hihifn main() {}\n", ". repeats the insert, not a tree key");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn face_specs_come_from_scheme() {
+        let (mut lisp, _editor) = lisp_with("");
+        lisp.eval(
+            r#"(define (face-specs)
+                 (list (list "big" 'color 'accent 'scale 1.5 'weight 'bold 'family 'sans)
+                       (list "code" 'background 'muted 'slant 'italic 'underline #t)))"#,
+        )
+        .unwrap();
+        let specs = lisp.face_specs();
+        assert_eq!(specs[0].name, "big");
+        assert_eq!(specs[0].color.as_deref(), Some("accent"));
+        assert_eq!(specs[0].scale, Some(1.5));
+        assert!(specs[0].bold && specs[0].sans && !specs[0].italic);
+        assert_eq!(specs[1].background.as_deref(), Some("muted"));
+        assert!(specs[1].italic && specs[1].underline);
+    }
+
+    #[test]
+    fn markdown_headings_get_their_faces() {
+        let (mut lisp, _editor) = lisp_with("");
+        let theme = lisp.syntax_theme();
+        let specs = lisp.face_specs();
+        let face = crate::syntax::face_for("markup.heading.1", &theme).unwrap().to_string();
+        let spec = specs.iter().find(|f| f.name == face).expect("the h1 face is defined");
+        assert!(spec.scale.unwrap() > 1.5 && spec.bold && spec.sans);
+        let marker = crate::syntax::face_for("markup.heading.1.marker", &theme).unwrap().to_string();
+        let marker = specs.iter().find(|f| f.name == marker).unwrap();
+        assert_eq!(marker.scale, spec.scale, "the # marks are as big as the heading");
+    }
+
+    #[test]
+    fn readme_face_override_example() {
+        let (mut lisp, _editor) = lisp_with("");
+        lisp.eval(
+            r#"(set-faces! (append (heading-faces 1 2.2 'magenta)
+                                   (list (list "md-bold" 'weight 'bold 'color 'yellow))))"#,
+        )
+        .unwrap();
+        let specs = lisp.face_specs();
+        let first = |name: &str| specs.iter().find(|f| f.name == name).cloned().unwrap();
+        assert_eq!(first("md-h1").scale, Some(2.2));
+        assert_eq!(first("md-bold").color.as_deref(), Some("yellow"));
+        assert_eq!(first("md-h2").scale, Some(1.5), "the rest keep their defaults");
+    }
+
+    fn markdown_buffer(text: &str) -> (Lisp, Editor) {
+        let (lisp, editor) = lisp_with("");
+        let path = std::env::temp_dir().join(format!("gmacs-table-{}-{}.md", std::process::id(), text.len()));
+        std::fs::write(&path, text).unwrap();
+        editor.lock().open_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        (lisp, editor)
+    }
+
+    #[test]
+    fn leaving_insert_in_a_table_aligns_it() {
+        let (mut lisp, editor) = markdown_buffer("# T\n\n| a | b |\n|-|-|\n| c | d |\n");
+        typed(&mut lisp, "jjjjfca longer");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(
+            editor.lock().buffer().text().to_string(),
+            "# T\n\n| a        | b   |\n|----------|-----|\n| c longer | d   |\n"
+        );
+        typed(&mut lisp, "u");
+        assert_eq!(editor.lock().buffer().text().to_string(), "# T\n\n| a | b |\n|-|-|\n| c | d |\n", "typing and aligning are one undo step");
+    }
+
+    #[test]
+    fn tab_moves_through_cells_and_adds_a_row() {
+        let (mut lisp, editor) = markdown_buffer("| name | n |\n|-|-|\n| x | 1 |");
+        typed(&mut lisp, "jjli");
+        lisp.dispatch_key("TAB", "");
+        typed(&mut lisp, "2");
+        lisp.dispatch_key("TAB", "");
+        typed(&mut lisp, "y");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(
+            editor.lock().buffer().text().to_string(),
+            "| name | n   |\n|------|-----|\n| x    | 21  |\n| y    |     |"
+        );
+        typed(&mut lisp, "i");
+        lisp.dispatch_key("S-TAB", "");
+        typed(&mut lisp, "!");
+        lisp.dispatch_key("ESC", "");
+        assert!(
+            editor.lock().buffer().text().to_string().contains("| x    | !21 |"),
+            "S-TAB goes to the start of the previous cell"
+        );
+    }
+
+    #[test]
+    fn spc_m_a_aligns_and_tab_outside_tables_indents() {
+        let (mut lisp, editor) = markdown_buffer("text\n|a|bb|\n");
+        typed(&mut lisp, "j ma");
+        assert_eq!(editor.lock().buffer().text().to_string(), "text\n| a   | bb  |\n");
+        typed(&mut lisp, "ggi");
+        lisp.dispatch_key("TAB", "");
+        assert_eq!(editor.lock().buffer().text().to_string(), "    text\n| a   | bb  |\n");
+    }
+
+    #[test]
+    fn tables_outside_markdown_are_left_alone() {
+        let (mut lisp, editor) = lisp_with("| a | bb |");
+        typed(&mut lisp, "A x");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(text(&editor), "| a | bb | x");
     }
 
     #[test]

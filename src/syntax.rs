@@ -25,6 +25,7 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "c" | "h" => "c",
         "go" => "go",
         "sh" | "bash" | "zsh" => "bash",
+        "md" | "markdown" => "markdown",
         _ => return None,
     })
 }
@@ -95,6 +96,10 @@ impl Syntax {
         rope: &Rope,
         lines: Range<usize>,
     ) -> Vec<Vec<Span>> {
+        // Markdown has its own line scanner (markdown.rs), no parse tree.
+        if language == "markdown" {
+            return crate::markdown::highlight(rope, lines);
+        }
         let empty = || vec![Vec::new(); lines.len()];
         let config = self.languages.entry(language).or_insert_with(|| load_language(language));
         let Some(config) = config.as_ref() else { return empty() };
@@ -230,6 +235,7 @@ mod tests {
     fn languages_by_extension() {
         assert_eq!(language_for_path(Path::new("a/b.rs")), Some("rust"));
         assert_eq!(language_for_path(Path::new("x.tsx")), Some("tsx"));
+        assert_eq!(language_for_path(Path::new("README.md")), Some("markdown"));
         assert_eq!(language_for_path(Path::new("notes.txt")), None);
     }
 

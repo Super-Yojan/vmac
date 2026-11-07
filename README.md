@@ -9,13 +9,13 @@ cargo run -- path/to/file
 
 ## How it is split
 
-| Layer | Where | What |
-|---|---|---|
-| Text storage, undo | `src/buffer.rs` (Rust) | a rope, the point, undo snapshots |
-| Primitives | `src/lisp.rs` (Rust) | `insert`, `char-at`, `delete-region`, `undo`, `find-file`, `message`, ... |
-| Window | `src/shell.rs` (Rust, GPUI) | draws lines, modeline, echo area; sends every key to Scheme |
-| Everything else | `lisp/core.scm` | states, commands, keymaps, the dispatcher, the modeline |
-| Your config | `~/.config/gmacs/init.scm` | loaded after core.scm |
+| Layer              | Where                       | What                                                                      |
+|--------------------|-----------------------------|---------------------------------------------------------------------------|
+| Text storage, undo | `src/buffer.rs` (Rust)      | a rope, the point, undo snapshots                                         |
+| Primitives         | `src/lisp.rs` (Rust)        | `insert`, `char-at`, `delete-region`, `undo`, `find-file`, `message`, ... |
+| Window             | `src/shell.rs` (Rust, GPUI) | draws lines, modeline, echo area; sends every key to Scheme               |
+| Everything else    | `lisp/core.scm`             | states, commands, keymaps, the dispatcher, the modeline                   |
+| Your config        | `~/.config/gmacs/init.scm`  | loaded after core.scm                                                     |
 
 Rust calls Scheme functions by name: `(dispatch-key key text)`,
 `(modeline)`, `(cursor-shape)`, `(selection)`, `(search-highlight)` and
@@ -87,6 +87,27 @@ from `(syntax-theme)` in Scheme: capture names to faces.
 (define (syntax-theme)
   (list (list "comment" 'yellow) (list "string" 'red)
         (list "keyword" 'magenta) (list "function" 'blue) (list "type" 'cyan)))
+```
+
+## Markdown
+
+`.md` files are styled in place, still fully editable: headings are larger,
+bold and in the UI's sans-serif font (the `#` marks stay, dimmed), with
+`**bold**`, `*italic*`, `` `code` ``, links, quotes, lists and code blocks
+each styled.
+
+Tables work like Org mode's: leaving insert state in one aligns it (every
+column padded to its widest cell, the `|---|` row redrawn, `:---:` alignment
+kept), `TAB`/`S-TAB` move between cells as they align, `TAB` in the last cell
+adds a row, and `SPC m a` aligns the table under the cursor.
+
+The styles are faces, defined in Scheme with attributes:
+
+```scheme
+;; (name key value ...): color, background, scale, weight, slant, underline, family.
+;; set-faces! puts yours in front of the defaults.
+(set-faces! (append (heading-faces 1 2.2 'magenta)   ; a bigger, magenta h1
+                    (list (list "md-bold" 'weight 'bold 'color 'yellow))))
 ```
 
 ## Customizing
