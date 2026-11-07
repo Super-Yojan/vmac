@@ -24,6 +24,11 @@ pub struct Buffer {
     goal_column: Option<usize>,
     file: Option<PathBuf>,
     modified: bool,
+    /// Edits are refused (the file tree, help buffers). `set_text` still works.
+    read_only: bool,
+    /// Faces on ranges of the text, set from Scheme (like Emacs text
+    /// properties): `(start, end, face)` in characters.
+    faces: Vec<(usize, usize, String)>,
     /// Bumped on every change; tells undo snapshots apart.
     edit: u64,
     /// Every edit count ever used, so a new edit after an undo never reuses
@@ -45,6 +50,8 @@ impl Buffer {
             goal_column: None,
             file: None,
             modified: false,
+            read_only: false,
+            faces: Vec::new(),
             edit: 0,
             edits_made: 0,
             undo: Vec::new(),
@@ -73,6 +80,8 @@ impl Buffer {
             goal_column: None,
             file: Some(path),
             modified: false,
+            read_only: false,
+            faces: Vec::new(),
             edit: 0,
             edits_made: 0,
             undo: Vec::new(),
@@ -100,6 +109,19 @@ impl Buffer {
     pub fn file(&self) -> Option<&PathBuf> {
         self.file.as_ref()
     }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+    pub fn add_face(&mut self, start: usize, end: usize, face: String) {
+        self.faces.push((start, end, face));
+    }
+    pub fn faces(&self) -> &[(usize, usize, String)] {
+        &self.faces
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -201,6 +223,9 @@ impl Buffer {
     /// Removes `start..end` and returns it; the point moves to `start` when it
     /// was inside or after the range.
     pub fn delete_range(&mut self, start: usize, end: usize) -> String {
+        if self.read_only {
+            return String::new();
+        }
         let (a, b) = (start.min(self.len()), end.min(self.len()));
         let (a, b) = (a.min(b), a.max(b));
         let removed = self.text.slice(a..b).to_string();
@@ -263,7 +288,9 @@ impl Buffer {
         true
     }
 
+    /// Replaces the whole text, dropping its faces.
     pub fn set_text(&mut self, s: &str) {
+        self.faces.clear();
         self.revision += 1;
         self.text = Rope::from_str(s);
         self.point = self.point.min(self.len());
@@ -276,6 +303,9 @@ impl Buffer {
     }
 
     pub fn insert(&mut self, s: &str) {
+        if self.read_only {
+            return;
+        }
         self.text.insert(self.point, s);
         self.point += s.chars().count();
         self.goal_column = None;
@@ -283,6 +313,9 @@ impl Buffer {
     }
 
     pub fn delete_backward(&mut self, n: usize) {
+        if self.read_only {
+            return;
+        }
         let start = self.point.saturating_sub(n);
         if start < self.point {
             self.text.remove(start..self.point);
@@ -293,6 +326,9 @@ impl Buffer {
     }
 
     pub fn delete_forward(&mut self, n: usize) {
+        if self.read_only {
+            return;
+        }
         let end = (self.point + n).min(self.len());
         if self.point < end {
             self.text.remove(self.point..end);
@@ -368,6 +404,21 @@ mod tests {
         let b = Buffer::from_file(PathBuf::from("Cargo.toml")).unwrap();
         assert!(b.file().unwrap().is_absolute());
         assert_eq!(b.name(), "Cargo.toml");
+    }
+
+    #[test]
+    fn read_only_refuses_edits_but_set_text_works() {
+        let mut b = Buffer::new("t");
+        b.set_read_only(true);
+        b.insert("x");
+        b.delete_backward(1);
+        assert_eq!(b.text().to_string(), "");
+        b.set_text("tree");
+        b.add_face(0, 4, "blue".into());
+        assert_eq!(b.text().to_string(), "tree");
+        assert_eq!(b.faces().len(), 1);
+        b.set_text("again");
+        assert!(b.faces().is_empty(), "new text, no old faces");
     }
 
     #[test]

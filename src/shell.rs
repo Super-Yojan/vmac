@@ -18,6 +18,8 @@ use std::time::Duration;
 const ROW_HEIGHT: f32 = 20.;
 const FONT_SIZE: f32 = 14.;
 const RELOAD_POLL: Duration = Duration::from_millis(400);
+/// How wide the sidebar (the file tree) is.
+const SIDEBAR_WIDTH: f32 = 260.;
 
 pub struct Shell {
     editor: Editor,
@@ -359,6 +361,7 @@ impl Render for Shell {
         let pattern = self.lisp.search_highlight();
         let mut modeline = Some(self.lisp.modeline());
         let mut st = self.editor.lock();
+        st.sidebar_width = (SIDEBAR_WIDTH / width.max(1.)).clamp(0.12, 0.45);
         let rects = st.window_rects();
         for (id, r) in &rects {
             st.fit_window(*id, window_rows(r, area));
@@ -377,6 +380,8 @@ impl Render for Shell {
                 let buffer = st.buffer_by_id(w.buffer)?;
                 let text = buffer.text();
                 let is_selected = *id == selected;
+                // The sidebar marks its cursor's line instead of drawing a cursor.
+                let is_sidebar = st.is_sidebar(*id);
                 let point = st.window_point(*id);
                 let cur_line = text.char_to_line(point);
                 let cur_col = point - text.line_to_char(cur_line);
@@ -391,13 +396,20 @@ impl Render for Shell {
                         let raw = text.line(i).to_string();
                         let cols = display_columns(raw.trim_end_matches(['\n', '\r']));
                         let to_screen = |col: usize| cols.get(col).copied().unwrap_or(col);
-                        let cursor = (is_selected && i == cur_line && !minibuffer_open)
+                        let cursor = (is_selected && !is_sidebar && i == cur_line && !minibuffer_open)
                             .then_some(to_screen(cur_col));
                         let start = text.line_to_char(i);
-                        let selected = selection.filter(|_| is_selected).map(|(a, b)| {
-                            (to_screen(a.saturating_sub(start)), to_screen(b.saturating_sub(start)))
-                        });
-                        let colors = spans
+                        // The selected range touching this line (a block has one per line);
+                        // it may run past the line's end, over its line break.
+                        let line_len = text.line(i).len_chars();
+                        let selected = selection
+                            .iter()
+                            .filter(|_| is_selected)
+                            .find(|&&(a, b)| a < start + line_len.max(1) && b > start)
+                            .map(|&(a, b)| {
+                                (to_screen(a.saturating_sub(start)), to_screen(b.saturating_sub(start)))
+                            });
+                        let mut colors: Vec<(usize, usize, Hsla)> = spans
                             .get(i - w.scroll_top)
                             .map(|line_spans| {
                                 line_spans
@@ -409,9 +421,24 @@ impl Render for Shell {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        // Faces Scheme put on the text (the tree's folders, ...).
+                        colors.extend(buffer.faces().iter().filter(|f| f.0 < start + line_len && f.1 > start).map(
+                            |(a, b, face)| {
+                                (
+                                    to_screen(a.saturating_sub(start)),
+                                    to_screen(b.saturating_sub(start)),
+                                    face_color(face, cx),
+                                )
+                            },
+                        ));
                         let line = display_line(text.line(i));
                         let matches = match_columns(&line, search.as_ref());
-                        line_element(line, cursor, selected, matches, colors, bar, cx)
+                        let row = line_element(line, cursor, selected, matches, colors, bar, cx);
+                        let current = is_sidebar && i == cur_line;
+                        div().when(current, |d| {
+                            d.bg(if is_selected { theme.list_active } else { theme.list_hover })
+                        })
+                        .child(row)
                     })
                     .collect();
                 // The selected window's modeline comes from Scheme; others show their buffer.
@@ -427,6 +454,7 @@ impl Render for Shell {
                         .w(px(r.w * width))
                         .h(px(r.h * area))
                         .when(r.x > 0., |d| d.border_l_1().border_color(theme.border))
+                        .when(is_sidebar, |d| d.bg(theme.sidebar))
                         .child(v_flex().flex_1().overflow_hidden().px(px(8.)).children(lines))
                         .child(
                             h_flex()

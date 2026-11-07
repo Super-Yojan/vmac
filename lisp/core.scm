@@ -103,7 +103,7 @@
 
 (define evil-state 'normal)
 
-(define (visual?) (contains? '(visual visual-line) evil-state))
+(define (visual?) (contains? '(visual visual-line visual-block) evil-state))
 ;; The minibuffer is for typing, except in a picker, which has its own normal
 ;; mode (like telescope): ESC there leaves typing, and Vim keys move through
 ;; the results or edit the query.
@@ -114,9 +114,13 @@
       (and (minibuffer-active?) (not (picker-active?)))))
 
 (define picker-normal-map '())
+(define tree-map '())
+(define tree-buffer "*tree*")
 
 (define (current-keymap)
-  (cond ((picker-normal?)
+  (cond ((and (equal? evil-state 'normal) (not (minibuffer-active?)) (equal? (buffer-name) tree-buffer))
+         (append tree-map normal-map))
+        ((picker-normal?)
          (cond ((visual?) visual-map)
                ((equal? evil-state 'operator) operator-map)
                (else (append picker-normal-map normal-map))))
@@ -139,6 +143,7 @@
 (define pending-keys "")
 (define pending-count "")
 (define current-count 1)
+(define count-given #f)
 
 ;; (read-char f): the next key is a character for f, not a command (f, t, r).
 (define char-reader #f)
@@ -158,9 +163,64 @@
     (call-binding binding)
     (repeat (- n 1) binding)))
 
+;;;; Repeating the last change: .
+;;
+;; Every key is recorded from the start of a command in normal state until
+;; the editor is back in normal state with nothing pending. If the buffer
+;; changed in between, those keys are the last change, and . types them
+;; again: dw, ciwfoo<ESC>, 3x, vjd, d/foo<RET> and so on. A count on .
+;; replaces the original one. Undo, redo and : commands aren't changes.
+
+(define recording '())
+(define recording-buffer "")
+(define recording-revision 0)
+(define last-change '())
+(define replaying #f)
+
+(define (idle-normal?)
+  (and (equal? evil-state 'normal) (equal? pending-keys "") (equal? pending-count "")
+       (not char-reader) (not (minibuffer-active?))))
+
+(define (digit-key? k) (contains? '("0" "1" "2" "3" "4" "5" "6" "7" "8" "9") (car k)))
+
+(define (drop-count keys)
+  (if (and (not (null? keys)) (digit-key? (car keys))) (drop-count (cdr keys)) keys))
+
+;; Whether recorded keys (in order) are a change . should repeat.
+(define (repeatable? keys)
+  (let ((first (drop-count keys)))
+    (and (not (null? first))
+         (not (contains? '("u" "C-r" "." ":") (car (car first)))))))
+
 (define (dispatch-key key text)
+  (when (and (not replaying) (idle-normal?))
+    (set! recording '())
+    (set! recording-buffer (buffer-name))
+    (set! recording-revision (buffer-revision)))
+  (when (not replaying) (set! recording (cons (list key text) recording)))
   (dispatch-key-1 key text)
-  (when (minibuffer-active?) (minibuffer-update)))
+  (when (minibuffer-active?) (minibuffer-update))
+  (when (and (not replaying) (idle-normal?) (not (null? recording)))
+    (let ((keys (reverse recording)))
+      (when (and (equal? (buffer-name) recording-buffer)
+                 (not (buffer-read-only?))
+                 (not (equal? (buffer-revision) recording-revision))
+                 (repeatable? keys))
+        (set! last-change keys)))
+    (set! recording '())))
+
+(define (count-keys n)
+  (map (lambda (c) (list (string c) (string c))) (string->list (number->string n))))
+
+(defcommand (repeat-last-change)
+  (if (null? last-change)
+      (message "No change to repeat")
+      (let ((keys (if count-given
+                      (append (count-keys current-count) (drop-count last-change))
+                      last-change)))
+        (set! replaying #t)
+        (for-each (lambda (k) (dispatch-key (car k) (second k))) keys)
+        (set! replaying #f))))
 
 (define (dispatch-key-1 key text)
   (cond
@@ -180,6 +240,7 @@
              (keymap (current-keymap))
              (binding (keymap-lookup keymap seq)))
         (cond (binding
+               (set! count-given (not (equal? pending-count "")))
                (set! current-count
                      (if (equal? pending-count "") 1 (string->number pending-count)))
                ;; The "SPC f-" shown while a sequence was pending goes away.
@@ -305,6 +366,9 @@
 ;; Moving the cursor. j and k keep the column (the buffer remembers it), and
 ;; outside visual mode the cursor stays on a character, never past the line.
 (define (move-by motion)
+  (when (equal? evil-state 'visual-block)
+    (cond ((equal? motion 'line-end) (set! block-to-eol #t))
+          ((not (contains? '(down up buffer-start buffer-end) motion)) (set! block-to-eol #f))))
   (cond ((equal? motion 'down) (forward-line current-count))
         ((equal? motion 'up) (forward-line (- 0 current-count)))
         ((equal? motion 'buffer-end)
@@ -545,6 +609,11 @@
       (buffer-substring start end)))
 
 (define (op-delete start end type)
+  (if (equal? type 'block)
+      (begin (delete-block! (block-ranges)) (goto-block-top-left) (clamp-to-line!))
+      (op-delete-range start end type)))
+
+(define (op-delete-range start end type)
   (register-set (range-text start end type))
   (let ((r (if (equal? type 'linewise) (linewise-range start end) (list start end))))
     (delete-region (car r) (second r))
@@ -552,6 +621,13 @@
     (if (equal? type 'linewise) (goto-char (first-non-blank)) (clamp-to-line!))))
 
 (define (op-change start end type)
+  (if (equal? type 'block)
+      (let ((top (block-top)) (left (block-left)) (targets (block-lines-reaching (block-left))))
+        (delete-block! (block-ranges))
+        (start-block-insert left top targets #f #f))
+      (op-change-range start end type)))
+
+(define (op-change-range start end type)
   (register-set (range-text start end type))
   (if (equal? type 'linewise)
       (begin (delete-region (first-non-blank-at start) (line-end-at end))
@@ -560,6 +636,11 @@
   (set! evil-state 'insert))
 
 (define (op-yank start end type)
+  (if (equal? type 'block)
+      (begin (yank-block! (block-ranges)) (goto-block-top-left) (message "yanked a block"))
+      (op-yank-range start end type)))
+
+(define (op-yank-range start end type)
   (register-set (range-text start end type))
   (goto-char (if (equal? type 'linewise) (point) start))
   (message (if (equal? type 'linewise) "yanked lines" "yanked")))
@@ -643,25 +724,143 @@
 
 (define visual-anchor 0)
 
+;; Visual block (C-v): the rectangle between the anchor and the cursor,
+;; columns included. After $ it reaches each line's end.
+(define block-to-eol #f)
+
+(define (column-at pos) (- pos (line-start-at pos)))
+(define (block-top) (min (pos->line visual-anchor) (pos->line (point))))
+(define (block-bottom) (max (pos->line visual-anchor) (pos->line (point))))
+(define (block-left) (min (column-at visual-anchor) (column-at (point))))
+(define (block-right) (+ 1 (max (column-at visual-anchor) (column-at (point)))))
+
+;; One (start end) per line of the block; empty on lines too short to reach it.
+(define (block-ranges)
+  (let loop ((line (block-bottom)) (out '()))
+    (if (< line (block-top))
+        out
+        (let* ((s (line->pos line))
+               (len (- (line-end-at s) s))
+               (a (+ s (min (block-left) len)))
+               (b (if block-to-eol (+ s len) (+ s (min (block-right) len)))))
+          (loop (- line 1) (cons (list a (max a b)) out))))))
+
 (define (visual-bounds)
   (let ((lo (min visual-anchor (point))) (hi (max visual-anchor (point))))
-    (if (equal? evil-state 'visual-line)
-        (list (line-start-at lo) (line-end-at hi) 'linewise)
-        (list lo (min (point-max) (+ hi 1)) 'exclusive))))
+    (cond ((equal? evil-state 'visual-line) (list (line-start-at lo) (line-end-at hi) 'linewise))
+          ((equal? evil-state 'visual-block) (list (line->pos (block-top)) (line->pos (block-bottom)) 'block))
+          (else (list lo (min (point-max) (+ hi 1)) 'exclusive)))))
 
 (define (selection)
   (if (visual?)
       (let ((b (visual-bounds)))
-        (if (equal? (third b) 'linewise)
-            (list (car b) (min (point-max) (+ (second b) 1)))
-            (list (car b) (second b))))
+        (cond ((equal? (third b) 'linewise) (list (car b) (min (point-max) (+ (second b) 1))))
+              ((equal? (third b) 'block) (block-ranges))
+              (else (list (car b) (second b)))))
       '()))
+
+;; The block register: a yanked or deleted block, pasted back as a column.
+;; It is the register only while the register still holds that text.
+(define block-register-lines #f)
+(define block-register-text "")
+
+(define (join-lines lines)
+  (cond ((null? lines) "")
+        ((null? (cdr lines)) (car lines))
+        (else (string-append (car lines) "\n" (join-lines (cdr lines))))))
+
+(define (block-register?)
+  (and block-register-lines (equal? (register-get) block-register-text)))
+
+(define (yank-block! ranges)
+  (let ((lines (map (lambda (r) (buffer-substring (car r) (second r))) ranges)))
+    (set! block-register-lines lines)
+    (set! block-register-text (join-lines lines))
+    (register-set block-register-text)))
+
+(define (goto-block-top-left)
+  (let* ((s (line->pos (block-top))) (len (- (line-end-at s) s)))
+    (goto-char (+ s (min (block-left) len)))))
+
+(define (delete-block! ranges)
+  (yank-block! ranges)
+  (for-each (lambda (r) (delete-region (car r) (second r))) (reverse ranges)))
+
+;; I, A and c in a block: type on the first line; ESC copies what was typed
+;; to the block's other lines, at the same column. Which lines get it is
+;; decided when typing starts: for I and c the lines that reach into the
+;; block, for A every line (short ones padded with spaces).
+(define block-insert #f)
+
+(define (line-length line) (let ((s (line->pos line))) (- (line-end-at s) s)))
+
+;; Lines after the first of the block that reach past `column`.
+(define (block-lines-reaching column)
+  (let loop ((line (block-bottom)) (out '()))
+    (if (<= line (block-top))
+        out
+        (loop (- line 1) (if (> (line-length line) column) (cons line out) out)))))
+
+(define (block-lines-after-top)
+  (let loop ((line (block-bottom)) (out '()))
+    (if (<= line (block-top)) out (loop (- line 1) (cons line out)))))
+
+(define (start-block-insert column top targets to-eol pad)
+  (let* ((s (line->pos top)) (len (- (line-end-at s) s)))
+    (cond (to-eol (goto-char (+ s len)))
+          ((< len column) (goto-char (+ s len))
+                          (when pad (insert (make-string (- column len) #\space))))
+          (else (goto-char (+ s column))))
+    (set! block-insert (list column top targets to-eol pad (point)))
+    (set! evil-state 'insert)))
+
+(define (finish-block-insert)
+  (let* ((column (car block-insert)) (top (second block-insert))
+         (targets (third block-insert))
+         (to-eol (list-ref block-insert 3)) (pad (list-ref block-insert 4))
+         (start (list-ref block-insert 5))
+         (typed (if (and (>= (point) start) (= (pos->line (point)) top))
+                    (buffer-substring start (point))
+                    "")))
+    (set! block-insert #f)
+    (when (not (equal? typed ""))
+      (for-each
+       (lambda (line)
+         (let* ((s (line->pos line)) (len (- (line-end-at s) s)))
+           (cond (to-eol (goto-char (+ s len)) (insert typed))
+                 ((>= len column) (goto-char (+ s column)) (insert typed))
+                 (pad (goto-char (+ s len))
+                      (insert (string-append (make-string (- column len) #\space) typed))))))
+       targets))
+    (goto-char start)))
+
+(defcommand (block-insert-start)
+  (if (equal? evil-state 'visual-block)
+      (start-block-insert (block-left) (block-top) (block-lines-reaching (block-left)) #f #f)
+      (begin (set! evil-state 'normal) (goto-char (min visual-anchor (point))) (insert-state))))
+
+(defcommand (block-append)
+  (if (equal? evil-state 'visual-block)
+      (start-block-insert (block-right) (block-top) (block-lines-after-top) block-to-eol #t)
+      (begin (set! evil-state 'normal)
+             (goto-char (min (point-max) (+ 1 (max visual-anchor (point)))))
+             (insert-state))))
+
+;; O in a block: the cursor goes to the other side, same line.
+(defcommand (visual-swap-columns)
+  (if (equal? evil-state 'visual-block)
+      (let* ((ac (column-at visual-anchor)) (pc (column-at (point)))
+             (a-line (line-start-at visual-anchor)) (p-line (line-start-at (point))))
+        (set! visual-anchor (+ a-line (min pc (- (line-end-at a-line) a-line))))
+        (goto-char (+ p-line (min ac (- (line-end-at p-line) p-line)))))
+      (visual-swap-ends)))
 
 (define (enter-visual state)
   (lambda ()
     (if (equal? evil-state state)
         (exit-visual)
         (begin (when (not (visual?)) (set! visual-anchor (point)))
+               (set! block-to-eol #f)
                (set! evil-state state)))))
 
 (defcommand (exit-visual) (set! evil-state 'normal) (clamp-to-line!))
@@ -695,6 +894,7 @@
 
 (defcommand (normal-state)
   (set! evil-state 'normal)
+  (when block-insert (finish-block-insert))
   (when (> (point) (line-start)) (forward-char -1))
   (message ""))
 (defcommand (insert-state) (set! evil-state 'insert))
@@ -726,9 +926,26 @@
 
 (define (without-last-char text) (substring text 0 (- (string-length text) 1)))
 
+;; Pastes the block register as a column, starting at `column` of this line.
+(define (paste-block column)
+  (let ((first-line (pos->line (point))))
+    (let loop ((lines block-register-lines) (line first-line))
+      (when (not (null? lines))
+        (when (>= line (line-count))
+          (goto-char (point-max)) (insert "\n"))
+        (let* ((s (line->pos line)) (len (- (line-end-at s) s)))
+          (if (< len column)
+              (begin (goto-char (+ s len))
+                     (insert (string-append (make-string (- column len) #\space) (car lines))))
+              (begin (goto-char (+ s column)) (insert (car lines)))))
+        (loop (cdr lines) (+ line 1))))
+    (goto-char (+ (line->pos first-line) column))))
+
 (defcommand (paste-after)
   (let ((text (register-get)))
-    (cond ((linewise? text)
+    (cond ((block-register?)
+           (paste-block (if (empty-line? (point)) 0 (+ 1 (column-at (point))))))
+          ((linewise? text)
            (if (< (line-end) (point-max))
                (begin (goto-char (+ (line-end) 1)) (insert text) (forward-line -1))
                (begin (goto-char (line-end)) (insert (string-append "\n" (without-last-char text)))))
@@ -740,7 +957,8 @@
 
 (defcommand (paste-before)
   (let ((text (register-get)))
-    (cond ((linewise? text)
+    (cond ((block-register?) (paste-block (column-at (point))))
+          ((linewise? text)
            (goto-char (line-start)) (insert text) (forward-line -1) (goto-char (first-non-blank)))
           ((> (string-length text) 0)
            (insert text) (forward-char -1)))))
@@ -917,6 +1135,206 @@
 ;; :q closes the window, and quits from the last one.
 (defcommand (quit-window) (when (not (delete-window)) (quit-editor)))
 
+;;;; The file tree (SPC o p)
+;;
+;; A sidebar at the left edge showing the project's folders. It is an
+;; ordinary (read-only) buffer, so every motion works in it; its own keys
+;; are in tree-map. Folders hidden by .gitignore don't show.
+
+(define tree-root "")
+(define tree-expanded '())
+;; What each line shows, in order: (path folder? depth). Line 0 is the root.
+(define tree-entries '())
+
+(define (path-join dir name) (string-append dir "/" name))
+
+(define (basename path)
+  (let loop ((i (- (string-length path) 1)))
+    (cond ((< i 0) path)
+          ((equal? (substring path i (+ i 1)) "/") (substring path (+ i 1) (string-length path)))
+          (else (loop (- i 1))))))
+
+(define (dirname path)
+  (let loop ((i (- (string-length path) 1)))
+    (cond ((<= i 0) "/")
+          ((equal? (substring path i (+ i 1)) "/") (substring path 0 i))
+          (else (loop (- i 1))))))
+
+(define (ends-with-slash? s)
+  (and (> (string-length s) 0)
+       (equal? (substring s (- (string-length s) 1) (string-length s)) "/")))
+
+(define (without-slash s) (if (ends-with-slash? s) (substring s 0 (- (string-length s) 1)) s))
+
+(define (expanded? dir) (contains? tree-expanded dir))
+(define (expand! dir) (when (not (expanded? dir)) (set! tree-expanded (cons dir tree-expanded))))
+(define (collapse! dir) (set! tree-expanded (filter (lambda (d) (not (equal? d dir))) tree-expanded)))
+
+;; Entries under dir, recursing into expanded folders.
+(define (tree-collect dir depth)
+  (let loop ((names (directory-entries dir)) (out '()))
+    (if (null? names)
+        (reverse out)
+        (let* ((name (car names))
+               (folder (ends-with-slash? name))
+               (path (path-join dir (without-slash name)))
+               (entry (list path folder depth))
+               (below (if (and folder (expanded? path)) (tree-collect path (+ depth 1)) '())))
+          (loop (cdr names) (append (reverse below) (cons entry out)))))))
+
+;; Faces by file extension, so the tree isn't one color.
+(define (file-face name)
+  (let ((ext (let loop ((i (- (string-length name) 1)))
+               (cond ((< i 0) "")
+                     ((equal? (substring name i (+ i 1)) ".") (substring name (+ i 1) (string-length name)))
+                     (else (loop (- i 1)))))))
+    (cond ((contains? '("rs" "py" "js" "ts" "tsx" "go" "c" "h" "scm" "sh") ext) 'default)
+          ((contains? '("md" "txt") ext) 'cyan)
+          ((contains? '("toml" "json" "yaml" "yml" "lock") ext) 'yellow)
+          (else 'default))))
+
+;; Redraws the tree buffer, keeping the cursor on the same path.
+(define (tree-render)
+  (let ((here (tree-entry-at-point)))
+    (set! tree-entries (cons (list tree-root #t -1) (tree-collect tree-root 0)))
+    (let loop ((entries (cdr tree-entries))
+               (text (string-append (basename tree-root) "\n"))
+               (faces (list (list 0 (string-length (basename tree-root)) 'accent))))
+      (if (null? entries)
+          (begin
+            (set-buffer-text tree-buffer (substring text 0 (- (string-length text) 1)))
+            (for-each (lambda (f) (add-face tree-buffer (car f) (second f) (symbol->string (third f))))
+                      faces)
+            (when here (tree-goto-path (car here))))
+          (let* ((e (car entries)) (path (car e)) (folder (second e)) (depth (third e))
+                 (indent (make-string (* 2 depth) #\space))
+                 (icon (cond ((not folder) "  ") ((expanded? path) "▾ ") (else "▸ ")))
+                 (name (basename path))
+                 (start (+ (string-length text) (string-length indent)))
+                 (name-start (+ start (string-length icon)))
+                 (line (string-append indent icon name (if folder "/" "") "\n")))
+            (loop (cdr entries)
+                  (string-append text line)
+                  (append (if folder
+                              (list (list start name-start 'dim)
+                                    (list name-start (+ name-start (string-length name) 1) 'blue))
+                              (list (list name-start (+ name-start (string-length name)) (file-face name))))
+                          faces)))))))
+
+(define (tree-entry-at-point)
+  (let ((line (- (line-number) 1)))
+    (and (equal? (buffer-name) tree-buffer)
+         (< line (length tree-entries))
+         (list-ref tree-entries line))))
+
+(define (tree-goto-path path)
+  (let loop ((entries tree-entries) (line 0))
+    (cond ((null? entries) #f)
+          ((equal? (car (car entries)) path)
+           (goto-char (first-non-blank-at (line->pos line))) #t)
+          (else (loop (cdr entries) (+ line 1))))))
+
+;; Expands every folder between the root and a file, so it shows.
+(define (tree-reveal file)
+  (when (string-prefix? (string-append tree-root "/") file)
+    (let loop ((dir (dirname file)))
+      (when (and (string-prefix? tree-root dir) (not (equal? dir tree-root)))
+        (expand! dir)
+        (loop (dirname dir))))))
+
+(defcommand (tree-open)
+  (let ((file (buffer-file-name)) (root (project-root)))
+    (when (not (equal? root tree-root))
+      (set! tree-root root)
+      (set! tree-expanded '()))
+    (ensure-buffer tree-buffer)
+    (set-buffer-read-only tree-buffer #t)
+    (sidebar-open tree-buffer)
+    (set! evil-state 'normal)
+    (tree-reveal file)
+    (tree-render)
+    (when (not (tree-goto-path file)) (goto-char 0))))
+
+(defcommand (tree-close) (sidebar-close))
+
+(defcommand (tree-toggle) (if (sidebar-open?) (tree-close) (tree-open)))
+
+;; RET, o: a folder opens or closes; a file opens in the main window.
+(defcommand (tree-activate)
+  (let ((e (tree-entry-at-point)))
+    (cond ((not e) #f)
+          ((equal? (third e) -1) (tree-refresh))
+          ((second e)
+           (if (expanded? (car e)) (collapse! (car e)) (expand! (car e)))
+           (tree-render))
+          (else (select-main-window) (find-file (car e))))))
+
+;; l: open a folder (or a file); h: close the folder, else go to its parent.
+(defcommand (tree-expand)
+  (let ((e (tree-entry-at-point)))
+    (when e
+      (if (and (second e) (not (expanded? (car e))))
+          (begin (expand! (car e)) (tree-render))
+          (tree-activate)))))
+
+(defcommand (tree-collapse)
+  (let ((e (tree-entry-at-point)))
+    (when (and e (not (equal? (third e) -1)))
+      (if (and (second e) (expanded? (car e)))
+          (begin (collapse! (car e)) (tree-render))
+          (tree-goto-path (dirname (car e)))))))
+
+(defcommand (tree-refresh) (tree-render) (message "tree refreshed"))
+
+;; The folder new things go in: the folder on this line, else the line's folder.
+(define (tree-target-dir)
+  (let ((e (tree-entry-at-point)))
+    (cond ((not e) tree-root)
+          ((second e) (car e))
+          (else (dirname (car e))))))
+
+(defcommand (tree-add)
+  (let ((dir (tree-target-dir)))
+    (read-from-minibuffer (string-append "New file in " (basename dir) "/ (end with / for a folder): ")
+      (lambda (name)
+        (when (not (equal? name ""))
+          (let ((path (path-join dir name)))
+            (when (create-path path)
+              (expand! dir)
+              (tree-render)
+              (tree-goto-path (without-slash path))
+              (message (string-append "created " name)))))))))
+
+(defcommand (tree-rename)
+  (let ((e (tree-entry-at-point)))
+    (when (and e (not (equal? (third e) -1)))
+      (read-from-minibuffer (string-append "Rename " (basename (car e)) " to: ")
+        (lambda (name)
+          (when (not (equal? name ""))
+            (let ((to (path-join (dirname (car e)) name)))
+              (when (rename-path (car e) to)
+                (tree-render)
+                (tree-goto-path to)
+                (message (string-append "renamed to " name))))))))))
+
+(defcommand (tree-delete)
+  (let ((e (tree-entry-at-point)))
+    (when (and e (not (equal? (third e) -1)))
+      (read-from-minibuffer (string-append "Delete " (basename (car e)) (if (second e) "/ and everything in it" "") "? (y/n) ")
+        (lambda (answer)
+          (if (contains? '("y" "yes") answer)
+              (when (delete-path (car e))
+                (collapse! (car e))
+                (tree-render)
+                (message (string-append "deleted " (basename (car e)))))
+              (message "not deleted")))))))
+
+(for-each-pair (lambda (k b) (define-key tree-map k b))
+  (list (list "RET" 'tree-activate) (list "o" 'tree-activate) (list "TAB" 'tree-activate)
+        (list "l" 'tree-expand) (list "h" 'tree-collapse)
+        (list "a" 'tree-add) (list "r" 'tree-rename) (list "d" 'tree-delete)
+        (list "R" 'tree-refresh) (list "q" 'tree-close)))
+
 ;;;; Default bindings
 
 ;; Motions move in normal and visual state, and complete an operator.
@@ -970,6 +1388,9 @@
         (list "I" 'insert-line-start) (list "A" 'insert-line-end)
         (list "o" 'open-below) (list "O" 'open-above)
         (list "v" (enter-visual 'visual)) (list "V" (enter-visual 'visual-line))
+        (list "C-v" (enter-visual 'visual-block))
+        ;; A procedure binding runs once, whatever the count; it reads the count.
+        (list "." (lambda () (repeat-last-change)))
         (list "x" 'delete-char-under)
         (list "D" (shorthand op-delete 'line-end))
         (list "C" (shorthand op-change 'line-end))
@@ -980,6 +1401,7 @@
         ;; Doom's leader
         (list "SPC :" 'execute-extended-command) (list "SPC ;" 'eval-expression)
         (list "SPC f f" 'find-file-command) (list "SPC SPC" 'find-file-command)
+        (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)
         (list "SPC b n" 'buffer-next) (list "SPC b p" 'buffer-previous)
@@ -1006,7 +1428,10 @@
 
 (for-each-pair (lambda (k b) (define-key visual-map k b))
   (list (list "v" (enter-visual 'visual)) (list "V" (enter-visual 'visual-line))
-        (list "o" 'visual-swap-ends) (list "x" (visual-operator op-delete))
+        (list "C-v" (enter-visual 'visual-block))
+        (list "o" 'visual-swap-ends) (list "O" 'visual-swap-columns)
+        (list "I" 'block-insert-start) (list "A" 'block-append)
+        (list "x" (visual-operator op-delete))
         (list "p" 'visual-paste) (list "ESC" 'exit-visual) (list ":" 'ex)
         (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
         (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
@@ -1065,6 +1490,7 @@
         ((equal? evil-state 'insert) "INSERT")
         ((equal? evil-state 'visual) "VISUAL")
         ((equal? evil-state 'visual-line) "V-LINE")
+        ((equal? evil-state 'visual-block) "V-BLOCK")
         ((equal? evil-state 'operator) "O-PENDING")
         (else "NORMAL")))
 

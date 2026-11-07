@@ -32,11 +32,23 @@ are read or what the window shows.
   `< >`, `" ' ``, `p` (paragraph).
 - **Visual:** `v` characters, `V` lines; move with any motion, select with a
   text object (`viw`, `va{`), `o` swaps ends, then `d x c y > < p`; `ESC` leaves.
+- **Visual block:** `C-v`, then any motion (`$` reaches every line's end), `o`
+  and `O` swap corners; `d x y` cut or copy the rectangle (`p`/`P` paste it
+  back as a column), `I`/`A` type before/after it on every line, `c` changes it.
+- **Repeat:** `.` repeats the last change: an operator (`dw`, `ci"foo`), an
+  insert session, `x`, `p`, a visual change. A count replaces the original
+  (`3.`).
 - **Find a character:** `f t F T` on the line, `;` and `,` to repeat; they
   work after operators (`dt)`, `cf,`) and in visual mode.
 - **Search:** `/` and `?` (regex, smartcase, wraps around), `n N`, `*` and `#`
   for the word under the cursor. Matches highlight as you type and stay
   highlighted until `ESC` or `:noh`. Operators take them too (`d/foo`, `dn`).
+- **File tree:** `SPC o p` opens and closes a sidebar with the project's
+  folders, opened down to the current file (.gitignore'd files hidden). Every
+  motion works in it (`j k gg G /`); `RET`/`o` open a file or toggle a folder,
+  `l`/`h` open/close a folder (`h` on a closed one goes to its parent), `a` adds
+  a file (end with `/` for a folder), `r` renames, `d` deletes (asks first),
+  `R` refreshes, `q` closes. `C-w h`/`C-w l` move between it and your files.
 - **Find file:** `SPC f f` or `SPC SPC` opens a telescope-style picker over the
   project (the git repo of the current file; .gitignore respected): type to
   filter fuzzily, `C-n`/`C-p`, `C-j`/`C-k` or arrows to move, `RET` to open.
@@ -111,7 +123,7 @@ redefining a command changes its keys at once.
 
 ## Not yet
 
-Visual block (`C-v`), `.` repeat, registers beyond one, marks, `:s`
+Registers beyond one, marks, macros, `:s`
 substitution, resizing splits, incremental re-parsing (the whole file is
 parsed again after each change), more languages, a custom text `Element`
 (lines are plain divs now), UI trees described from Scheme beyond the

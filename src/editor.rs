@@ -127,6 +127,12 @@ pub struct EditorState {
     layout: Layout,
     selected: WindowId,
     next_id: u64,
+    /// A window fixed at the left edge, outside the split layout (the file tree).
+    sidebar: Option<WindowId>,
+    /// The sidebar's width as a share of the editor's, set by the view.
+    pub sidebar_width: f32,
+    /// The last selected window in the layout, where files open from the sidebar.
+    last_main: WindowId,
     pub minibuffer: Buffer,
     pub minibuffer_prompt: Option<String>,
     pub message: String,
@@ -149,6 +155,9 @@ impl EditorState {
             layout: Layout::Leaf(2),
             selected: 2,
             next_id: 3,
+            sidebar: None,
+            sidebar_width: 0.22,
+            last_main: 2,
             minibuffer: Buffer::new("*minibuffer*"),
             minibuffer_prompt: None,
             message: String::new(),
@@ -187,6 +196,22 @@ impl EditorState {
             &mut self.minibuffer
         } else {
             self.buffer_mut()
+        }
+    }
+
+    pub fn buffer_id_named(&self, name: &str) -> Option<BufferId> {
+        self.buffers.iter().find(|(_, b)| b.name() == name).map(|(id, _)| *id)
+    }
+
+    pub fn buffer_named_mut(&mut self, name: &str) -> Option<&mut Buffer> {
+        self.buffers.iter_mut().find(|(_, b)| b.name() == name).map(|(_, b)| b)
+    }
+
+    /// The buffer with this name, made (empty) if there isn't one.
+    pub fn ensure_buffer(&mut self, name: &str) -> BufferId {
+        match self.buffer_id_named(name) {
+            Some(id) => id,
+            None => self.add_buffer(Buffer::new(name)),
         }
     }
 
@@ -321,6 +346,9 @@ impl EditorState {
         if id == self.selected || self.window_by_id(id).is_none() {
             return;
         }
+        if Some(id) != self.sidebar {
+            self.last_main = id;
+        }
         let point = self.buffer().point();
         self.window_mut().point = point;
         self.selected = id;
@@ -328,9 +356,62 @@ impl EditorState {
         self.buffer_mut().goto_char(point);
     }
 
+    // ---- The sidebar
+
+    pub fn sidebar(&self) -> Option<WindowId> {
+        self.sidebar
+    }
+
+    pub fn is_sidebar(&self, id: WindowId) -> bool {
+        self.sidebar == Some(id)
+    }
+
+    /// Shows a buffer in the sidebar (opening it if needed) and selects it.
+    pub fn open_sidebar(&mut self, buffer: BufferId) {
+        let id = match self.sidebar {
+            Some(id) => id,
+            None => {
+                let id = self.fresh_id();
+                self.windows.push(Window { id, buffer, point: 0, scroll_top: 0, rows: 0 });
+                self.sidebar = Some(id);
+                id
+            }
+        };
+        if self.selected == id {
+            self.show_buffer(buffer);
+        } else {
+            if let Some(w) = self.window_by_id_mut(id) {
+                w.buffer = buffer;
+            }
+            self.select_window(id);
+        }
+    }
+
+    pub fn close_sidebar(&mut self) {
+        let Some(id) = self.sidebar else { return };
+        if self.selected == id {
+            self.select_main_window();
+        }
+        self.windows.retain(|w| w.id != id);
+        self.sidebar = None;
+    }
+
+    /// Selects the layout window last used (when the sidebar is selected).
+    pub fn select_main_window(&mut self) {
+        let target = if self.window_by_id(self.last_main).is_some() {
+            self.last_main
+        } else {
+            self.window_order().into_iter().find(|&w| !self.is_sidebar(w)).unwrap_or(self.selected)
+        };
+        self.select_window(target);
+    }
+
     /// Splits the selected window: the new one, on the same buffer and line,
     /// goes right of it (`Row`) or below it (`Column`) and is selected.
     pub fn split_window(&mut self, axis: Axis) {
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
         let id = self.fresh_id();
         let mut new = self.window().clone();
         new.id = id;
@@ -341,9 +422,13 @@ impl EditorState {
         self.select_window(id);
     }
 
-    /// Closes the selected window. The last one can't be closed.
+    /// Closes the selected window. The last one in the layout can't be closed.
     pub fn close_window(&mut self) -> bool {
-        if self.windows.len() < 2 {
+        if self.is_sidebar(self.selected) {
+            self.close_sidebar();
+            return true;
+        }
+        if self.window_order().iter().filter(|&&w| !self.is_sidebar(w)).count() < 2 {
             return false;
         }
         let order = self.window_order();
@@ -356,16 +441,20 @@ impl EditorState {
         true
     }
 
-    /// Closes every window but the selected one.
+    /// Closes every window but the selected one (the sidebar too).
     pub fn only_window(&mut self) {
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
+        self.sidebar = None;
         let keep = self.selected;
         self.windows.retain(|w| w.id == keep);
         self.layout = Layout::Leaf(keep);
     }
 
-    /// Windows in layout order (left to right, top to bottom).
+    /// Windows in order: the sidebar, then the layout left to right, top to bottom.
     pub fn window_order(&self) -> Vec<WindowId> {
-        let mut out = Vec::new();
+        let mut out: Vec<WindowId> = self.sidebar.into_iter().collect();
         self.layout.leaves(&mut out);
         out
     }
@@ -377,9 +466,18 @@ impl EditorState {
         self.select_window(next);
     }
 
+    /// Where each window goes: the sidebar at the left edge, the layout in
+    /// the rest.
     pub fn window_rects(&self) -> Vec<(WindowId, Rect)> {
         let mut out = Vec::new();
-        self.layout.rects(Rect { x: 0., y: 0., w: 1., h: 1. }, &mut out);
+        let left = match self.sidebar {
+            Some(id) => {
+                out.push((id, Rect { x: 0., y: 0., w: self.sidebar_width, h: 1. }));
+                self.sidebar_width
+            }
+            None => 0.,
+        };
+        self.layout.rects(Rect { x: left, y: 0., w: 1. - left, h: 1. }, &mut out);
         out
     }
 
@@ -540,6 +638,32 @@ mod tests {
         assert_eq!(s.buffer().name(), "a");
         s.kill_buffer(true).unwrap();
         assert_eq!(s.buffer_names(), vec!["*scratch*"]);
+    }
+
+    #[test]
+    fn the_sidebar_sits_left_of_the_layout() {
+        let mut s = state("x");
+        let main = s.selected_window();
+        let tree = s.add_buffer(Buffer::new("*tree*"));
+        s.sidebar_width = 0.25;
+        s.open_sidebar(tree);
+        let side = s.selected_window();
+        assert!(s.is_sidebar(side));
+        assert_eq!(s.buffer().name(), "*tree*");
+        let rects = s.window_rects();
+        assert_eq!(rects[0], (side, Rect { x: 0., y: 0., w: 0.25, h: 1. }));
+        assert_eq!(rects[1], (main, Rect { x: 0.25, y: 0., w: 0.75, h: 1. }));
+        assert_eq!(s.window_in_direction("right"), Some(main));
+        s.select_window(main);
+        assert_eq!(s.window_in_direction("left"), Some(side));
+        assert!(!s.close_window(), "the last layout window stays while the sidebar is open");
+        s.select_window(side);
+        s.split_window(Axis::Row);
+        assert!(!s.is_sidebar(s.selected_window()), "splitting from the sidebar splits the main window");
+        s.select_window(side);
+        s.close_sidebar();
+        assert_eq!(s.sidebar(), None);
+        assert!(!s.is_sidebar(s.selected_window()));
     }
 
     #[test]

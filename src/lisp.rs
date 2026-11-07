@@ -171,16 +171,28 @@ impl Lisp {
         }
     }
 
-    /// Calls Scheme's `(selection)`: the selected range `[start, end)` in
-    /// characters, or None when nothing is selected.
-    pub fn selection(&mut self) -> Option<(usize, usize)> {
-        let v = self.engine.call_function_by_name_with_args("selection", vec![]).ok()?;
-        let SteelVal::ListV(items) = v else { return None };
-        let mut it = items.iter();
-        match (it.next()?, it.next()?) {
-            (SteelVal::IntV(a), SteelVal::IntV(b)) if a < b => Some((*a as usize, *b as usize)),
-            _ => None,
-        }
+    /// Calls Scheme's `(selection)`: the selected ranges `[start, end)` in
+    /// characters. Scheme returns one range `(start end)`, a list of them
+    /// (a visual block: one per line), or `()` for none.
+    pub fn selection(&mut self) -> Vec<(usize, usize)> {
+        let Ok(v) = self.engine.call_function_by_name_with_args("selection", vec![]) else {
+            return vec![];
+        };
+        let pair = |v: &SteelVal| -> Option<(usize, usize)> {
+            let SteelVal::ListV(items) = v else { return None };
+            let mut it = items.iter();
+            match (it.next()?, it.next()?) {
+                (SteelVal::IntV(a), SteelVal::IntV(b)) => Some((*a as usize, *b as usize)),
+                _ => None,
+            }
+        };
+        let ranges = match &v {
+            SteelVal::ListV(items) if matches!(items.iter().next(), Some(SteelVal::ListV(_))) => {
+                items.iter().filter_map(pair).collect()
+            }
+            other => pair(other).into_iter().collect::<Vec<_>>(),
+        };
+        ranges.into_iter().filter(|(a, b)| a < b).collect()
     }
 
     /// Calls Scheme's `(search-highlight)`: the pattern whose matches the
@@ -352,6 +364,8 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
         .file()
         .map(|p| p.display().to_string())
         .unwrap_or_default());
+    prim!(engine, editor, "buffer-read-only?", |s| s.buffer().is_read_only());
+    prim!(engine, editor, "buffer-revision", |s| s.buffer().revision() as isize);
     prim!(engine, editor, "buffer-modified?", |s| s.buffer().is_modified());
     prim!(engine, editor, "buffer-language", |s| s
         .buffer()
@@ -413,6 +427,76 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     prim!(engine, editor, "scroll-window", |s, n: isize| s.scroll(n));
     prim!(engine, editor, "recenter", |s, place: String| s.recenter(&place));
 
+    // Buffers by name, for buffers Scheme draws itself (the file tree).
+    prim!(engine, editor, "ensure-buffer", |s, name: String| {
+        s.ensure_buffer(&name);
+    });
+    prim!(engine, editor, "set-buffer-text", |s, name: String, text: String| {
+        if let Some(b) = s.buffer_named_mut(&name) {
+            b.set_text(&text);
+        }
+    });
+    prim!(engine, editor, "set-buffer-read-only", |s, name: String, read_only: bool| {
+        if let Some(b) = s.buffer_named_mut(&name) {
+            b.set_read_only(read_only);
+        }
+    });
+    prim!(engine, editor, "add-face", |s, name: String, start: isize, end: isize, face: String| {
+        if let Some(b) = s.buffer_named_mut(&name) {
+            b.add_face(start.max(0) as usize, end.max(0) as usize, face);
+        }
+    });
+
+    // The sidebar: a window at the left edge, outside the splits.
+    prim!(engine, editor, "sidebar-open", |s, name: String| {
+        let id = s.ensure_buffer(&name);
+        s.open_sidebar(id);
+    });
+    prim!(engine, editor, "sidebar-close", |s| s.close_sidebar());
+    prim!(engine, editor, "sidebar-open?", |s| s.sidebar().is_some());
+    prim!(engine, editor, "sidebar-selected?", |s| s.is_sidebar(s.selected_window()));
+    prim!(engine, editor, "select-main-window", |s| s.select_main_window());
+
+    // Files and folders.
+    engine.register_fn("directory-entries", |dir: String| directory_entries(Path::new(&dir)));
+    prim!(engine, editor, "create-path", |s, path: String| {
+        let path = PathBuf::from(path);
+        let made = if path.to_string_lossy().ends_with('/') {
+            std::fs::create_dir_all(&path)
+        } else if path.exists() {
+            Err(std::io::Error::other("already exists"))
+        } else {
+            path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, ""))
+        };
+        match made {
+            Ok(()) => true,
+            Err(e) => {
+                s.message = format!("{}: {e}", path.display());
+                false
+            }
+        }
+    });
+    prim!(engine, editor, "rename-path", |s, from: String, to: String| {
+        match std::fs::rename(&from, &to) {
+            Ok(()) => true,
+            Err(e) => {
+                s.message = format!("{from}: {e}");
+                false
+            }
+        }
+    });
+    prim!(engine, editor, "delete-path", |s, path: String| {
+        let p = Path::new(&path);
+        let gone = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+        match gone {
+            Ok(()) => true,
+            Err(e) => {
+                s.message = format!("{path}: {e}");
+                false
+            }
+        }
+    });
+
     // The echo area and minibuffer.
     prim!(engine, editor, "message", |s, text: String| s.message = text);
     prim!(engine, editor, "current-message", |s| s.message.clone());
@@ -427,6 +511,30 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     // Runs Scheme source after the current command (see `pending_eval`).
     prim!(engine, editor, "eval-string", |s, code: String| s.pending_eval.push(code));
     prim!(engine, editor, "quit-editor", |s| s.quit_requested = true);
+}
+
+/// A folder's entries for the file tree: folders first (with a trailing
+/// `/`), then files, each sorted; hidden by .gitignore and `.git` left out,
+/// other dotfiles kept.
+fn directory_entries(dir: &Path) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let walk = ignore::WalkBuilder::new(dir).max_depth(Some(1)).hidden(false).build();
+    for entry in walk.filter_map(Result::ok) {
+        if entry.depth() == 0 || entry.file_name() == ".git" {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().is_some_and(|t| t.is_dir()) {
+            dirs.push(format!("{name}/"));
+        } else {
+            files.push(name);
+        }
+    }
+    dirs.sort_by_key(|d| d.to_lowercase());
+    files.sort_by_key(|f| f.to_lowercase());
+    dirs.extend(files);
+    dirs
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -714,17 +822,17 @@ mod tests {
         let (mut lisp, editor) = lisp_with("abcdef");
         at(&mut lisp, &editor, 1);
         typed(&mut lisp, "vll");
-        assert_eq!(lisp.selection(), Some((1, 4)));
+        assert_eq!(lisp.selection(), vec![(1, 4)]);
         typed(&mut lisp, "d");
         assert_eq!(text(&editor), "aef");
-        assert_eq!(lisp.selection(), None, "back in normal state");
+        assert_eq!(lisp.selection(), vec![], "back in normal state");
     }
 
     #[test]
     fn visual_line_and_swap_ends() {
         let (mut lisp, editor) = lisp_with("one\ntwo\nthree\nfour");
         typed(&mut lisp, "jVj");
-        assert_eq!(lisp.selection(), Some((4, 14)));
+        assert_eq!(lisp.selection(), vec![(4, 14)]);
         typed(&mut lisp, "o");
         assert_eq!(editor.lock().buffer().line(), 1);
         typed(&mut lisp, "d");
@@ -739,7 +847,7 @@ mod tests {
         typed(&mut lisp, "u");
         at(&mut lisp, &editor, 7);
         typed(&mut lisp, "viw");
-        assert_eq!(lisp.selection(), Some((6, 10)));
+        assert_eq!(lisp.selection(), vec![(6, 10)]);
         typed(&mut lisp, "cgamma");
         lisp.dispatch_key("ESC", "");
         assert_eq!(text(&editor), "alpha gamma");
@@ -750,9 +858,9 @@ mod tests {
         let (mut lisp, _editor) = lisp_with("abc");
         typed(&mut lisp, "vl");
         lisp.dispatch_key("ESC", "");
-        assert_eq!(lisp.selection(), None);
+        assert_eq!(lisp.selection(), vec![]);
         typed(&mut lisp, "vlv");
-        assert_eq!(lisp.selection(), None);
+        assert_eq!(lisp.selection(), vec![]);
     }
 
     #[test]
@@ -1155,6 +1263,261 @@ mod tests {
         lisp.dispatch_key("RET", "");
         typed(&mut lisp, "z");
         assert_eq!(text(&editor), "z");
+    }
+
+    #[test]
+    fn dot_repeats_operators_and_counts() {
+        let (mut lisp, editor) = lisp_with("a b c d e f g");
+        typed(&mut lisp, "dw");
+        typed(&mut lisp, ".");
+        assert_eq!(text(&editor), "c d e f g");
+        typed(&mut lisp, "2dw");
+        assert_eq!(text(&editor), "e f g");
+        typed(&mut lisp, ".");
+        assert_eq!(text(&editor), "g", "repeats with its own count");
+        typed(&mut lisp, "u");
+        typed(&mut lisp, "1.");
+        assert_eq!(text(&editor), "f g", "a count on . replaces it");
+    }
+
+    #[test]
+    fn dot_repeats_an_insert_session() {
+        let (mut lisp, editor) = lisp_with("one\ntwo");
+        typed(&mut lisp, "A!");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "j.");
+        assert_eq!(text(&editor), "one!\ntwo!");
+        typed(&mut lisp, "0ciwTWO");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "k0.");
+        assert_eq!(text(&editor), "TWO!\nTWO!");
+    }
+
+    #[test]
+    fn dot_ignores_motions_undo_and_ex() {
+        let (mut lisp, editor) = lisp_with("abcdef");
+        typed(&mut lisp, "x");
+        typed(&mut lisp, "ll");
+        typed(&mut lisp, "u");
+        typed(&mut lisp, ":noh\n");
+        typed(&mut lisp, "0.");
+        assert_eq!(text(&editor), "bcdef", "x is still the last change");
+        typed(&mut lisp, "3.");
+        assert_eq!(text(&editor), "ef");
+    }
+
+    #[test]
+    fn dot_repeats_visual_and_f_changes() {
+        let (mut lisp, editor) = lisp_with("1\n2\n3\n4\n5");
+        typed(&mut lisp, "Vjd");
+        assert_eq!(text(&editor), "3\n4\n5");
+        typed(&mut lisp, ".");
+        assert_eq!(text(&editor), "5");
+        let (mut lisp, editor) = lisp_with("a,b,c,d");
+        typed(&mut lisp, "dt,");
+        typed(&mut lisp, "l.");
+        assert_eq!(text(&editor), ",,c,d");
+    }
+
+    #[test]
+    fn dot_without_a_change() {
+        let (mut lisp, editor) = lisp_with("abc");
+        typed(&mut lisp, ".");
+        assert_eq!(editor.lock().message, "No change to repeat");
+    }
+
+    #[test]
+    fn visual_block_selects_a_rectangle() {
+        let (mut lisp, editor) = lisp_with("abcd\nefgh\nij\nklmn");
+        at(&mut lisp, &editor, 1);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jjjl");
+        assert_eq!(lisp.selection(), vec![(1, 3), (6, 8), (11, 12), (14, 16)]);
+        assert!(lisp.modeline().iter().any(|s| s.text == "V-BLOCK"));
+        typed(&mut lisp, "$");
+        assert_eq!(lisp.selection(), vec![(1, 4), (6, 9), (11, 12), (14, 17)], "$ reaches every line's end");
+    }
+
+    #[test]
+    fn visual_block_delete_yank_and_paste() {
+        let (mut lisp, editor) = lisp_with("abcd\nefgh\nijkl");
+        at(&mut lisp, &editor, 1);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jld");
+        assert_eq!(text(&editor), "ad\neh\nijkl");
+        assert_eq!(point(&editor), 1);
+        typed(&mut lisp, "$p");
+        assert_eq!(text(&editor), "adbc\nehfg\nijkl", "pasted as a column");
+        typed(&mut lisp, "u");
+        at(&mut lisp, &editor, 0);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jjy");
+        typed(&mut lisp, "P");
+        assert_eq!(text(&editor), "aad\neeh\niijkl");
+    }
+
+    #[test]
+    fn visual_block_insert_and_append_on_every_line() {
+        let (mut lisp, editor) = lisp_with("one\ntwo\nthree");
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jjI// ");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(text(&editor), "// one\n// two\n// three");
+        typed(&mut lisp, "u");
+        assert_eq!(text(&editor), "one\ntwo\nthree", "one undo step");
+        at(&mut lisp, &editor, 0);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jj$A;");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(text(&editor), "one;\ntwo;\nthree;");
+    }
+
+    #[test]
+    fn visual_block_change_and_append_pads_short_lines() {
+        let (mut lisp, editor) = lisp_with("abc\nd\nefg");
+        at(&mut lisp, &editor, 1);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jjlcX");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(text(&editor), "aX\nd\neX", "a line too short is left alone");
+        typed(&mut lisp, "u");
+        at(&mut lisp, &editor, 2);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jjA|");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(text(&editor), "abc|\nd  |\nefg|", "A pads to the column");
+    }
+
+    #[test]
+    fn visual_block_swap_corners() {
+        let (mut lisp, editor) = lisp_with("abcd\nefgh");
+        at(&mut lisp, &editor, 1);
+        lisp.dispatch_key("C-v", "");
+        typed(&mut lisp, "jl");
+        typed(&mut lisp, "O");
+        assert_eq!(point(&editor), 6, "same line, other side");
+        assert_eq!(lisp.selection(), vec![(1, 3), (6, 8)]);
+        typed(&mut lisp, "o");
+        assert_eq!(point(&editor), 2);
+    }
+
+    #[test]
+    fn steel_strings_count_characters() {
+        let (mut lisp, _editor) = lisp_with("");
+        assert_eq!(lisp.eval(r#"(string-length "▾ é")"#).unwrap(), "3");
+        assert_eq!(lisp.eval(r#"(substring "▾ é" 2 3)"#).unwrap(), "\"é\"");
+    }
+
+    /// A throwaway project: src/main.rs, src/util/, README.md, an ignored
+    /// target/, and gmacs opened on src/main.rs.
+    fn tree_project(tag: &str) -> (Lisp, Editor, PathBuf) {
+        let root = std::env::temp_dir().join(format!("gmacs-tree-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/util")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("README.md"), "# hi\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("src/util/mod.rs"), "").unwrap();
+        let (lisp, editor) = lisp_with("");
+        editor.lock().open_file(&root.join("src/main.rs")).unwrap();
+        (lisp, editor, root)
+    }
+
+    fn tree_text(editor: &Editor) -> String {
+        let st = editor.lock();
+        let id = st.buffer_id_named("*tree*").unwrap();
+        st.buffer_by_id(id).unwrap().text().to_string()
+    }
+
+    #[test]
+    fn spc_o_p_opens_the_tree_on_the_current_file_and_closes_it() {
+        let (mut lisp, editor, root) = tree_project("open");
+        typed(&mut lisp, " op");
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            tree_text(&editor),
+            format!("{name}\n▾ src/\n  ▸ util/\n    main.rs\n  .gitignore\n  README.md"),
+            "folders first, ignored target/ and .git hidden, src opened to show main.rs"
+        );
+        {
+            let st = editor.lock();
+            assert!(st.is_sidebar(st.selected_window()));
+            assert_eq!(st.buffer().line(), 3, "the cursor is on main.rs");
+        }
+        typed(&mut lisp, " op");
+        assert!(editor.lock().sidebar().is_none());
+        assert_eq!(editor.lock().buffer().name(), "main.rs");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tree_folders_open_close_and_files_open_in_the_main_window() {
+        let (mut lisp, editor, root) = tree_project("nav");
+        typed(&mut lisp, " op");
+        typed(&mut lisp, "k");
+        lisp.dispatch_key("RET", "");
+        assert!(tree_text(&editor).contains("▾ util/\n      mod.rs"), "{}", tree_text(&editor));
+        typed(&mut lisp, "h");
+        assert!(tree_text(&editor).contains("▸ util/"));
+        typed(&mut lisp, "h");
+        assert_eq!(editor.lock().buffer().line(), 1, "h on a closed folder goes to its parent");
+        typed(&mut lisp, "G");
+        lisp.dispatch_key("RET", "");
+        let st = editor.lock();
+        assert_eq!(st.buffer().name(), "README.md");
+        assert!(!st.is_sidebar(st.selected_window()), "the file opened in the main window");
+        assert!(st.sidebar().is_some(), "the tree stays open");
+        drop(st);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tree_is_read_only_and_motions_work() {
+        let (mut lisp, editor, root) = tree_project("ro");
+        typed(&mut lisp, " op");
+        let before = tree_text(&editor);
+        typed(&mut lisp, "x");
+        typed(&mut lisp, "ix");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(tree_text(&editor), before);
+        typed(&mut lisp, "gg/readme\n");
+        assert_eq!(editor.lock().buffer().line(), 5);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tree_adds_renames_and_deletes() {
+        let (mut lisp, editor, root) = tree_project("ops");
+        typed(&mut lisp, " op");
+        typed(&mut lisp, "anew.txt\n");
+        assert!(root.join("src/new.txt").exists(), "added next to main.rs, in src/");
+        assert!(tree_text(&editor).contains("    new.txt"));
+        typed(&mut lisp, "rrenamed.txt\n");
+        assert!(root.join("src/renamed.txt").exists());
+        assert!(!root.join("src/new.txt").exists());
+        typed(&mut lisp, "dn\n");
+        assert!(root.join("src/renamed.txt").exists(), "n keeps it");
+        typed(&mut lisp, "dy\n");
+        assert!(!root.join("src/renamed.txt").exists());
+        typed(&mut lisp, "gganotes/\n");
+        assert!(root.join("notes").is_dir(), "a trailing / makes a folder");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tree_keys_dont_become_the_last_change() {
+        let (mut lisp, editor, root) = tree_project("dot");
+        typed(&mut lisp, "ihi");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " op");
+        typed(&mut lisp, "kR");
+        lisp.dispatch_key("C-w", "");
+        lisp.dispatch_key("l", "l");
+        typed(&mut lisp, "0.");
+        assert_eq!(editor.lock().buffer().text().to_string(), "hihifn main() {}\n", ". repeats the insert, not a tree key");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
