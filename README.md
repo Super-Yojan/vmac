@@ -1,15 +1,32 @@
-# vmac
+<p align="center"><img src="assets/logo-wordmark.svg" alt="vmac" width="420"></p>
 
-A modal (evil-style) editor on GPUI whose behavior is written in Steel Scheme
-and can be redefined while it runs.
+<p align="center">A modal (evil-style) editor on GPUI whose behavior is written in Steel
+Scheme and Lua, and can be redefined while it runs.</p>
+
+<p align="center"><a href="https://super-yojan.github.io/vmac/">Install and configure</a></p>
 
 vmac was called gmacs. Plugins that use `gmacs.*` in Lua still work (it's an
 alias of `vmac`), and `~/.config/gmacs/` is read while `~/.config/vmac/`
 doesn't exist; move it there when you like.
 
+## Install
+
+vmac builds from source with Rust's cargo (get it from [rustup.rs](https://rustup.rs)).
+It's tested on macOS.
+
 ```sh
-cargo run -- path/to/file
+curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh
 ```
+
+or, the same thing by hand:
+
+```sh
+cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.1 --locked
+```
+
+Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.scm`,
+`init.lua`, `plugins/`). From a checkout, `cargo run -- FILE` runs it with
+live reload of `lisp/core/`.
 
 ## How it is split
 
@@ -265,3 +282,8 @@ substitution, resizing splits, incremental re-parsing (the whole file is
 parsed again after each change), more languages, a custom text `Element`
 (lines are plain divs now), UI trees described from Scheme beyond the
 modeline and picker.
+
+## License
+
+vmac is licensed under either of [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option.

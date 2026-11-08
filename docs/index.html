@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vmac: a modal editor you program in Scheme and Lua</title>
+<meta name="description" content="vmac is a modal, evil-style editor on GPUI whose behavior is written in Steel Scheme and Lua and can be redefined while it runs. Install it and configure it.">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0f14;
+    --surface: #141720;
+    --raised: #1b1f2a;
+    --border: #262b38;
+    --text: #e6e8ee;
+    --muted: #9aa1b2;
+    --dim: #6b7285;
+    --violet: #8b5cf6;
+    --violet-soft: #c4b5fd;
+    --teal: #5eead4;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--violet-soft); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, kbd, pre { font-family: var(--mono); }
+  code { font-size: .9em; background: var(--raised); border: 1px solid var(--border); padding: .08em .38em; border-radius: 5px; }
+  kbd {
+    font-size: .82em; background: var(--raised); border: 1px solid var(--border);
+    border-bottom-width: 2px; padding: .1em .45em; border-radius: 5px; white-space: nowrap;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+
+  /* Header */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(13, 15, 20, .82); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  header .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font: 700 18px var(--mono); }
+  .brand img { width: 28px; height: 28px; }
+  nav { display: flex; gap: 22px; font-size: 14px; }
+  nav a { color: var(--muted); }
+  nav a:hover { color: var(--text); text-decoration: none; }
+
+  /* Hero */
+  .hero { padding: 88px 0 56px; text-align: center; }
+  .hero img { width: 112px; height: 112px; }
+  .hero h1 { font: 700 clamp(40px, 7vw, 64px)/1.05 var(--mono); letter-spacing: -2px; margin: 22px 0 14px; }
+  .hero h1 span { color: var(--violet); }
+  .hero p.lead { color: var(--muted); font-size: 19px; max-width: 640px; margin: 0 auto 32px; }
+  .badges { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 18px; font-size: 13px; color: var(--dim); }
+  .badges span { border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; }
+
+  /* Command boxes */
+  .cmd {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 14px 14px 18px; text-align: left; max-width: 760px; margin: 0 auto;
+  }
+  .cmd pre { margin: 0; flex: 1; overflow-x: auto; font-size: 14px; color: var(--text); }
+  .cmd pre .p { color: var(--teal); user-select: none; }
+  .copy {
+    flex: none; font: 600 12px var(--sans); color: var(--muted); background: var(--raised);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; cursor: pointer;
+  }
+  .copy:hover { color: var(--text); border-color: var(--violet); }
+
+  /* Sections */
+  section { padding: 56px 0; border-top: 1px solid var(--border); }
+  section h2 { font: 700 28px var(--mono); letter-spacing: -.5px; margin: 0 0 8px; }
+  section h2 .n { color: var(--violet); margin-right: 10px; }
+  section > .wrap > p.sub { color: var(--muted); margin: 0 0 28px; max-width: 700px; }
+  h3 { font: 600 17px var(--sans); margin: 28px 0 10px; }
+
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
+  .card h3 { margin-top: 0; }
+  .card p { color: var(--muted); margin: 6px 0 14px; font-size: 15px; }
+  .card .cmd { max-width: none; padding: 10px 10px 10px 14px; }
+  .card .cmd pre { font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  pre.code {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; margin: 0 0 8px;
+  }
+  .c { color: var(--dim); }
+  .s { color: #86efac; }
+  .k { color: var(--violet-soft); }
+  .f { color: #93c5fd; }
+
+  table.keys { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  table.keys td { padding: 7px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.keys td:first-child { width: 42%; padding-right: 16px; }
+  table.keys tr:last-child td { border-bottom: 0; }
+
+  .note { color: var(--muted); font-size: 14.5px; border-left: 2px solid var(--violet); padding: 2px 0 2px 14px; margin: 18px 0 0; }
+
+  footer { border-top: 1px solid var(--border); padding: 36px 0 56px; color: var(--dim); font-size: 14px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  @media (max-width: 640px) {
+    nav { display: none; }
+    .hero { padding-top: 56px; }
+    table.keys td:first-child { width: 48%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="#"><img src="logo.svg" alt="">vmac</a>
+    <nav>
+      <a href="#install">Install</a>
+      <a href="#keys">Keys</a>
+      <a href="#configure">Configure</a>
+      <a href="#plugins">Plugins</a>
+      <a href="https://github.com/Super-Yojan/vmac">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="hero wrap">
+    <img src="logo.svg" alt="vmac logo">
+    <h1>v<span>mac</span></h1>
+    <p class="lead">A modal, evil-style editor on GPUI. Its behavior is written in Steel Scheme and
+      Lua, and every part of it can be redefined while it runs.</p>
+    <div class="cmd">
+      <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh</pre>
+      <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh">Copy</button>
+    </div>
+    <div class="badges"><span>v0.0.1</span><span>macOS</span><span>Rust · GPUI</span><span>Scheme + Lua</span></div>
+  </div>
+
+  <section id="install">
+    <div class="wrap">
+      <h2><span class="n">01</span>Install</h2>
+      <p class="sub">vmac builds from source with Rust's <code>cargo</code>. Get it from
+        <a href="https://rustup.rs">rustup.rs</a> if you don't have it; the build takes a few minutes.</p>
+      <div class="grid">
+        <div class="card">
+          <h3>The installer</h3>
+          <p>Builds the v0.0.1 release with cargo and makes <code>~/.config/vmac/</code>.</p>
+          <div class="cmd">
+            <pre>curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh</pre>
+            <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh">Copy</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>With cargo</h3>
+          <p>The same build, by hand. vmac lands in <code>~/.cargo/bin</code>.</p>
+          <div class="cmd">
+            <pre>cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.1 --locked</pre>
+            <button class="copy" data-copy="cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.1 --locked">Copy</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>From a checkout</h3>
+          <p>For hacking on vmac: edits to <code>lisp/core/</code> reload as you save.</p>
+          <div class="cmd">
+            <pre>git clone https://github.com/Super-Yojan/vmac && cd vmac && cargo run -- README.md</pre>
+            <button class="copy" data-copy="git clone https://github.com/Super-Yojan/vmac && cd vmac && cargo run -- README.md">Copy</button>
+          </div>
+        </div>
+      </div>
+      <p class="note">Then open a file with <code>vmac FILE</code>. Optional extras: a Nerd Font
+        (for terminal icons), language servers such as <code>rust-analyzer</code> or
+        <code>pyright</code>, and <code>fish</code>, which terminals use when it's installed.</p>
+    </div>
+  </section>
+
+  <section id="keys">
+    <div class="wrap">
+      <h2><span class="n">02</span>First steps</h2>
+      <p class="sub">It starts in normal state, like Vim. <kbd>SPC</kbd> is the leader, like Doom Emacs.</p>
+      <div class="grid">
+        <div class="card">
+          <h3>Editing</h3>
+          <table class="keys">
+            <tr><td><kbd>i</kbd> <kbd>a</kbd> <kbd>o</kbd> … <kbd>ESC</kbd></td><td>type, then back to normal</td></tr>
+            <tr><td><kbd>d</kbd> <kbd>c</kbd> <kbd>y</kbd> + motion</td><td><code>dw</code>, <code>ci"</code>, <code>y$</code>, <code>dap</code></td></tr>
+            <tr><td><kbd>v</kbd> <kbd>V</kbd> <kbd>C-v</kbd></td><td>visual, lines, block</td></tr>
+            <tr><td><kbd>/</kbd> <kbd>f</kbd> <kbd>t</kbd> <kbd>.</kbd></td><td>search, find a character, repeat</td></tr>
+            <tr><td><kbd>u</kbd> <kbd>C-r</kbd> <kbd>p</kbd></td><td>undo, redo, paste</td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Files, windows</h3>
+          <table class="keys">
+            <tr><td><kbd>SPC</kbd> <kbd>SPC</kbd></td><td>find a file (fuzzy, with preview)</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>,</kbd></td><td>switch buffer</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>o</kbd> <kbd>p</kbd></td><td>file tree</td></tr>
+            <tr><td><kbd>C-w</kbd> <kbd>v</kbd> / <kbd>s</kbd> / <kbd>hjkl</kbd></td><td>split, move between windows</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>o</kbd> <kbd>t</kbd></td><td>terminal</td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Code</h3>
+          <table class="keys">
+            <tr><td><kbd>g</kbd> <kbd>d</kbd> · <kbd>C-o</kbd></td><td>definition, back</td></tr>
+            <tr><td><kbd>K</kbd> · <kbd>g</kbd> <kbd>r</kbd></td><td>docs, references</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>c</kbd> <kbd>r</kbd> / <kbd>a</kbd> / <kbd>f</kbd></td><td>rename, actions, format</td></tr>
+            <tr><td><kbd>]</kbd> <kbd>d</kbd> · <kbd>SPC</kbd> <kbd>c</kbd> <kbd>x</kbd></td><td>next error, list errors</td></tr>
+            <tr><td><kbd>:</kbd> · <kbd>SPC</kbd> <kbd>:</kbd></td><td>ex commands, run any command</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="configure">
+    <div class="wrap">
+      <h2><span class="n">03</span>Configure</h2>
+      <p class="sub">Everything lives in <code>~/.config/vmac/</code>. Write Scheme, Lua, or both:
+        they share the same commands, keys and primitives, and vmac reloads as you save.</p>
+
+      <h3>In Lua: <code>~/.config/vmac/init.lua</code></h3>
+<pre class="code"><span class="c">-- A command, and a key for it (SPC i d).</span>
+vmac.<span class="f">command</span>(<span class="s">"insert-date"</span>, <span class="k">function</span>()
+  vmac.<span class="f">insert</span>(os.date(<span class="s">"%Y-%m-%d"</span>))
+<span class="k">end</span>)
+vmac.<span class="f">map</span>(<span class="s">"normal"</span>, <span class="s">"SPC i d"</span>, <span class="s">"insert-date"</span>)
+
+<span class="c">-- Replace the modeline: a list of {text, face}.</span>
+vmac.hooks.modeline = <span class="k">function</span>()
+  <span class="k">return</span> { { vmac.<span class="f">buffer_name</span>(), <span class="s">"strong"</span> }, { vmac.<span class="f">buffer_language</span>(), <span class="s">"dim"</span> } }
+<span class="k">end</span></pre>
+
+      <h3>In Scheme: <code>~/.config/vmac/init.scm</code></h3>
+<pre class="code">(<span class="k">defcommand</span> (<span class="f">insert-date</span>) (insert <span class="s">"2026-11-07"</span>))
+(<span class="k">define-key</span> normal-map <span class="s">"SPC i d"</span> 'insert-date)
+
+<span class="c">;; Bigger headings in Markdown.</span>
+(set-faces! (heading-faces 1 2.2 'magenta))</pre>
+
+      <div class="grid" style="margin-top:22px">
+        <div class="card">
+          <h3>Language servers</h3>
+          <p>rust-analyzer, pyright, typescript-language-server, clangd and gopls are set up.
+            Use others from your config:</p>
+<pre class="code">vmac.hooks.lsp_servers = <span class="k">function</span>()
+  <span class="k">return</span> { {<span class="s">"python"</span>, <span class="s">"pylsp"</span>} }
+<span class="k">end</span></pre>
+        </div>
+        <div class="card">
+          <h3>Font</h3>
+          <p>vmac starts with an installed Nerd Font, else the theme's. Pick another with
+            <code>:fonts</code>, or:</p>
+<pre class="code">vmac.<span class="f">set_font</span>(<span class="s">"Hack Nerd Font Mono"</span>)</pre>
+        </div>
+        <div class="card">
+          <h3>Terminal</h3>
+          <p>Terminals run fish when it's installed. Change the shell, or run them in herdr-core
+            with the <code>herdr-terminal</code> plugin:</p>
+<pre class="code">vmac.<span class="f">set_terminal_shell</span>(<span class="s">"/bin/zsh"</span>)
+vmac.<span class="f">set_terminal_backend</span>(<span class="s">"herdr"</span>)</pre>
+        </div>
+      </div>
+      <p class="note">Live, without saving anything: <code>:lua 1 + 2</code> evaluates Lua,
+        <kbd>SPC</kbd> <kbd>;</kbd> evaluates Scheme. The whole editor is in
+        <a href="https://github.com/Super-Yojan/vmac/tree/master/lisp/core"><code>lisp/core/</code></a>,
+        one file per area; anything there can be redefined from your config.</p>
+    </div>
+  </section>
+
+  <section id="plugins">
+    <div class="wrap">
+      <h2><span class="n">04</span>Plugins</h2>
+      <p class="sub">A plugin is config you can share: a folder in <code>~/.config/vmac/plugins/</code>
+        with an <code>init.scm</code> and/or <code>init.lua</code>. Plugins load after the core and
+        before your config, and a broken one is skipped without taking the rest down.</p>
+      <div class="grid">
+        <div class="card">
+          <h3>Install one</h3>
+          <p>From a git repository; vmac clones it and reloads.</p>
+          <div class="cmd">
+            <pre>:plugin-install https://github.com/someone/vmac-plugin</pre>
+            <button class="copy" data-copy=":plugin-install https://github.com/someone/vmac-plugin">Copy</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Manage them</h3>
+          <table class="keys">
+            <tr><td><kbd>SPC</kbd> <kbd>h</kbd> <kbd>p</kbd></td><td>list; <kbd>RET</kbd> turns one on or off</td></tr>
+            <tr><td><code>:plugin-update</code></td><td>pull them all</td></tr>
+            <tr><td><code>:plugin-remove NAME</code></td><td>delete one</td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Examples</h3>
+          <p>In <a href="https://github.com/Super-Yojan/vmac/tree/master/examples/plugins"><code>examples/plugins</code></a>:
+            <code>word-count</code> (Lua), <code>zen</code> (Scheme) and <code>herdr-terminal</code>,
+            a terminal backend.</p>
+          <div class="cmd">
+            <pre>cp -r examples/plugins/* ~/.config/vmac/plugins/</pre>
+            <button class="copy" data-copy="cp -r examples/plugins/* ~/.config/vmac/plugins/">Copy</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>vmac v0.0.1 · MIT or Apache-2.0</span>
+    <span><a href="https://github.com/Super-Yojan/vmac">github.com/Super-Yojan/vmac</a></span>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll(".copy").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy);
+        button.textContent = "Copied";
+      } catch {
+        button.textContent = "Select it";
+      }
+      setTimeout(() => (button.textContent = "Copy"), 1600);
+    });
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 200" width="640" height="200" role="img" aria-label="vmac">
+  <defs>
+    <linearGradient id="lam2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c4b5fd"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(10 10) scale(0.7)">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="#11131a"/>
+    <rect x="8.5" y="8.5" width="239" height="239" rx="55.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+    <path d="M74 60 L150 196" stroke="url(#lam2)" stroke-width="26" stroke-linecap="round" fill="none"/>
+    <path d="M114 132 L72 196" stroke="url(#lam2)" stroke-width="26" stroke-linecap="round" fill="none"/>
+    <rect x="168" y="150" width="30" height="46" rx="5" fill="#5eead4"/>
+  </g>
+  <text x="212" y="128" font-family="'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace" font-size="92" font-weight="700" fill="#8b5cf6" letter-spacing="-2">vmac</text>
+</svg>

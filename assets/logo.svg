@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="vmac">
+  <defs>
+    <linearGradient id="lam" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c4b5fd"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#11131a"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="55.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+  <!-- λ: the long leg, then the short one -->
+  <path d="M74 60 L150 196" stroke="url(#lam)" stroke-width="26" stroke-linecap="round" fill="none"/>
+  <path d="M114 132 L72 196" stroke="url(#lam)" stroke-width="26" stroke-linecap="round" fill="none"/>
+  <!-- a block cursor: a modal editor, waiting -->
+  <rect x="168" y="150" width="30" height="46" rx="5" fill="#5eead4"/>
+</svg>
