@@ -1352,6 +1352,10 @@
         (list "c" "clangd")
         (list "go" "gopls")))
 
+(defcommand (goto-definition) (lsp-goto-definition))
+(defcommand (hover-documentation) (lsp-hover))
+(defcommand (jump-back-command) (jump-back))
+
 (defcommand (diagnostic-next) (diagnostic-goto 1))
 (defcommand (diagnostic-previous) (diagnostic-goto -1))
 
@@ -1439,6 +1443,7 @@
         (list "SPC m a" 'table-align)
         ;; Language servers
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
+        (list "g d" 'goto-definition) (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
         (list "SPC c x" 'diagnostic-list)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)

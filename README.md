@@ -95,7 +95,9 @@ Opening a file starts its language's server for the project (from
 `(lsp-servers)` in core.scm: rust-analyzer, pyright, typescript-language-server,
 clangd, gopls). Errors and warnings get colored squiggles; the one under the
 cursor shows in the echo area, the modeline counts them (`E2 W1`), `]d`/`[d`
-jump between them and `SPC c x` lists them in the picker. A server that fails
+jump between them and `SPC c x` lists them in the picker. `gd` goes to the
+definition (opening its file), `C-o` comes back, and `K` shows the
+documentation for what's under the cursor in a popup (any key closes it). A server that fails
 to start or stops says why in the echo area. Set `GMACS_LSP_LOG=/tmp/lsp.log`
 to log every message to and from the servers.
 

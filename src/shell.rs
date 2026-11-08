@@ -22,6 +22,11 @@ const RELOAD_POLL: Duration = Duration::from_millis(400);
 const LSP_POLL: Duration = Duration::from_millis(100);
 /// How wide the sidebar (the file tree) is.
 const SIDEBAR_WIDTH: f32 = 260.;
+/// A monospace character's width, as a share of the font size (Menlo, SF Mono).
+const CHAR_WIDTH: f32 = 0.6;
+/// The documentation popup K shows.
+const HOVER_WIDTH: f32 = 560.;
+const HOVER_MAX_HEIGHT: f32 = 320.;
 
 pub struct Shell {
     editor: Editor,
@@ -490,6 +495,8 @@ impl Render for Shell {
         // Where each window ends up scrolled and how many lines it shows,
         // once line heights are known (headings are taller).
         let mut fitted: Vec<(crate::editor::WindowId, usize, usize)> = Vec::new();
+        // Where the cursor is on screen (x, line top, line height), for K's popup.
+        let mut cursor_at: Option<(f32, f32, f32)> = None;
 
         let windows: Vec<_> = rects
             .iter()
@@ -557,6 +564,16 @@ impl Render for Shell {
                 let room = (r.h * area - ROW_HEIGHT).max(ROW_HEIGHT);
                 let (top, last) = fit_lines(w.scroll_top.min(cur_line), cur_line, hi, room, height_of);
                 fitted.push((*id, top, last - top));
+                if is_selected && (top..last).contains(&cur_line) {
+                    let raw = text.line(cur_line).to_string();
+                    let col = display_columns(raw.trim_end_matches(['\n', '\r']))
+                        .get(cur_col)
+                        .copied()
+                        .unwrap_or(cur_col);
+                    let x = r.x * width + 8. + col as f32 * FONT_SIZE * CHAR_WIDTH;
+                    let y = r.y * area + (top..cur_line).map(height_of).sum::<f32>();
+                    cursor_at = Some((x, y, height_of(cur_line)));
+                }
 
                 let lines: Vec<_> = (top..last)
                     .map(|i| {
@@ -648,6 +665,31 @@ impl Render for Shell {
             }
         }
         syntax.retain(|id| st.buffer_by_id(id).is_some());
+        // K's documentation, by the cursor: below its line, or above when near the bottom.
+        let hover = st.hover.clone().zip(cursor_at).map(|(doc, (x, y, line_height))| {
+            let w = HOVER_WIDTH.min(width - 16.);
+            let left = x.min(width - w - 8.).max(8.);
+            let below = y + line_height + HOVER_MAX_HEIGHT < area;
+            div()
+                .absolute()
+                .left(px(left))
+                .when(below, |d| d.top(px(y + line_height + 4.)))
+                .when(!below, |d| d.bottom(px(height - y + 4.)))
+                .w(px(w))
+                .max_h(px(HOVER_MAX_HEIGHT))
+                .overflow_hidden()
+                .p(px(10.))
+                .bg(theme.popover)
+                .text_color(theme.popover_foreground)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius_lg)
+                .shadow_lg()
+                .font_family(theme.font_family.clone())
+                .text_size(px(13.))
+                .line_height(px(19.))
+                .child(gpui_kit::component::text::TextView::markdown("hover-doc", doc))
+        });
         // The picker draws its own query line; the echo area keeps the message.
         let overlay = st.picker.as_ref().map(|p| picker_element(p, &st.minibuffer, bar, height, cx));
         let echo = match &st.minibuffer_prompt {
@@ -688,6 +730,7 @@ impl Render for Shell {
             .line_height(px(ROW_HEIGHT))
             .child(div().relative().w_full().h(px(area)).children(windows))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
+            .children(hover)
             .children(overlay)
     }
 }

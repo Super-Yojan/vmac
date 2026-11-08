@@ -190,6 +190,8 @@ impl Lisp {
     /// Hands a keystroke to Scheme's `dispatch-key`. `key` is Emacs notation
     /// (`"C-x"`, `"M-:"`, `"RET"`); `text` is what it would type, or "".
     pub fn dispatch_key(&mut self, key: &str, text: &str) {
+        // Any key closes the documentation K showed.
+        self.editor.lock().hover = None;
         let args = vec![SteelVal::from(key.to_string()), SteelVal::from(text.to_string())];
         if let Err(e) = self.engine.call_function_by_name_with_args("dispatch-key", args) {
             self.editor.lock().message = format!("{key}: {e}");
@@ -587,6 +589,13 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
 
     // Language servers.
     prim!(engine, editor, "lsp-status", |s| s.lsp.status().to_string());
+    prim!(engine, editor, "lsp-goto-definition", |s| s.lsp_request(crate::lsp::RequestKind::Definition));
+    prim!(engine, editor, "lsp-hover", |s| s.lsp_request(crate::lsp::RequestKind::Hover));
+    prim!(engine, editor, "jump-back", |s| {
+        if !s.jump_back() {
+            s.message = "No earlier position".into();
+        }
+    });
     prim!(engine, editor, "lsp-servers-here", |s| s
         .buffer()
         .file()
@@ -728,6 +737,7 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::EditorState;
 
     fn lisp_with(text: &str) -> (Lisp, Editor) {
         let mut buf = Buffer::new("test");
@@ -1905,6 +1915,72 @@ mod tests {
         lisp.dispatch_key("RET", "");
         assert_eq!(editor.lock().buffer().point(), 0, "picking goes to it");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// gmacs on a file served by the fake language server (lsp.rs's tests).
+    fn with_fake_server(tag: &str, text: &str) -> (Lisp, Editor, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gmacs-lsp-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("server.py");
+        std::fs::write(&server, crate::lsp::tests::FAKE_SERVER).unwrap();
+        let file = dir.join("main.rs");
+        std::fs::write(&file, text).unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval(&format!(r#"(define (lsp-servers) (list (list "rust" "python3" "{}")))"#, server.display())).unwrap();
+        editor.lock().open_file(&file).unwrap();
+        (lisp, editor, dir)
+    }
+
+    /// Pumps the language servers until `done`, for up to four seconds.
+    fn pump_until(lisp: &mut Lisp, editor: &Editor, done: impl Fn(&EditorState) -> bool) -> bool {
+        for _ in 0..200 {
+            let configs = lisp.lsp_servers();
+            editor.lock().lsp_pump(configs);
+            if done(&editor.lock()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn gd_jumps_to_the_definition_and_ctrl_o_comes_back() {
+        let (mut lisp, editor, dir) = with_fake_server("gd", "fn main() {}\nlet x = 1;\nx\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "jj");
+        typed(&mut lisp, "gd");
+        assert!(
+            pump_until(&mut lisp, &editor, |st| st.buffer().line() == 1),
+            "went to line 2, where the fake server says it's defined"
+        );
+        assert_eq!(editor.lock().buffer().column(), 4);
+        lisp.dispatch_key("C-o", "");
+        let st = editor.lock();
+        assert_eq!((st.buffer().line(), st.buffer().column()), (2, 0), "back where gd was pressed");
+        drop(st);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn k_shows_documentation_until_the_next_key() {
+        let (mut lisp, editor, dir) = with_fake_server("hover", "fn main() {}\nlet x = 1;\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "jK");
+        assert!(pump_until(&mut lisp, &editor, |st| st.hover.is_some()), "the hover arrived");
+        assert_eq!(editor.lock().hover.as_deref(), Some("**doc** for line 1"));
+        typed(&mut lisp, "l");
+        assert!(editor.lock().hover.is_none(), "the next key closes it");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gd_without_a_server_says_so() {
+        let (mut lisp, editor) = lisp_with("abc");
+        typed(&mut lisp, "gd");
+        assert_eq!(editor.lock().message, "This buffer has no file");
+        typed(&mut lisp, "K");
+        assert_eq!(editor.lock().message, "This buffer has no file");
     }
 
     #[test]

@@ -70,6 +70,74 @@ pub fn utf16_to_char(rope: &Rope, (line, col): (usize, usize)) -> usize {
     rope.utf16_cu_to_char((base + col).min(end))
 }
 
+/// A question for a server about a place in a file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RequestKind {
+    Definition,
+    Hover,
+}
+
+/// A place in a file, as (line, UTF-16 column).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub position: (usize, usize),
+}
+
+/// A server's answer to a request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    /// Where something is defined (empty when the server found nothing).
+    Definition(Vec<Location>),
+    /// Documentation for what's under the cursor, as Markdown.
+    Hover(Option<String>),
+}
+
+/// A (line, UTF-16 column) for a character offset.
+pub fn char_to_utf16(rope: &Rope, pos: usize) -> (usize, usize) {
+    let pos = pos.min(rope.len_chars());
+    let line = rope.char_to_line(pos);
+    let col = rope.char_to_utf16_cu(pos) - rope.char_to_utf16_cu(rope.line_to_char(line));
+    (line, col)
+}
+
+fn parse_locations(result: &Value) -> Vec<Location> {
+    let one = |v: &Value| -> Option<Location> {
+        // A Location has uri/range; a LocationLink has targetUri/targetSelectionRange.
+        let uri = v["uri"].as_str().or(v["targetUri"].as_str())?;
+        let range = if v["targetSelectionRange"].is_object() { &v["targetSelectionRange"] } else { &v["range"] };
+        Some(Location { path: uri_to_path(uri)?, position: position(&range["start"]) })
+    };
+    match result {
+        Value::Array(items) => items.iter().filter_map(one).collect(),
+        Value::Object(_) => one(result).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Hover contents as Markdown: MarkupContent, a MarkedString, or a list of them.
+fn parse_hover(result: &Value) -> Option<String> {
+    fn marked(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) if o.contains_key("language") => Some(format!(
+                "```{}\n{}\n```",
+                o["language"].as_str().unwrap_or(""),
+                o["value"].as_str().unwrap_or("")
+            )),
+            Value::Object(o) => o.get("value").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        }
+    }
+    let contents = &result["contents"];
+    let text = match contents {
+        Value::Array(items) => items.iter().filter_map(marked).collect::<Vec<_>>().join("\n\n"),
+        other => marked(other)?,
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// A document the editor has open, as the client needs to see it.
 pub struct Doc {
     pub path: PathBuf,
@@ -170,6 +238,9 @@ struct Client {
     queued: Vec<Value>,
     /// Open documents: the revision and save count the server last heard, and the version sent.
     open: HashMap<PathBuf, (u64, u64, i32)>,
+    next_id: i64,
+    /// Requests waiting for an answer, by id.
+    pending: HashMap<i64, RequestKind>,
 }
 
 impl Client {
@@ -215,6 +286,8 @@ impl Client {
             ready: false,
             queued: Vec::new(),
             open: HashMap::new(),
+            next_id: 1,
+            pending: HashMap::new(),
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let initialize = json!({
@@ -245,6 +318,24 @@ impl Client {
     /// Sends a notification, holding it until the server is initialized.
     fn notify(&mut self, method: &str, params: Value) {
         let message = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        if self.ready {
+            self.write(&message);
+        } else {
+            self.queued.push(message);
+        }
+    }
+
+    fn request(&mut self, kind: RequestKind, path: &Path, position: (usize, usize)) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let method = match kind {
+            RequestKind::Definition => "textDocument/definition",
+            RequestKind::Hover => "textDocument/hover",
+        };
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {
+            "textDocument": { "uri": path_to_uri(path) },
+            "position": { "line": position.0, "character": position.1 } } });
+        self.pending.insert(id, kind);
         if self.ready {
             self.write(&message);
         } else {
@@ -303,6 +394,8 @@ pub struct Lsp {
     failed: HashSet<(String, PathBuf)>,
     /// What the servers are doing (progress), for the modeline.
     status: String,
+    /// Answers to requests, for the editor to act on.
+    replies: Vec<Reply>,
     /// Something worth telling the person (a server failed), taken once.
     notice: Option<String>,
 }
@@ -331,6 +424,21 @@ impl Lsp {
     #[cfg(test)]
     pub fn set_diagnostics(&mut self, path: PathBuf, list: Vec<Diagnostic>) {
         self.diagnostics.insert(path, list);
+    }
+
+    /// Asks the server that has `path` open. Err when no server does.
+    pub fn request(&mut self, kind: RequestKind, path: &Path, position: (usize, usize)) -> Result<(), String> {
+        let client = self
+            .clients
+            .iter_mut()
+            .find(|c| c.open.contains_key(path))
+            .ok_or_else(|| "No language server for this file".to_string())?;
+        client.request(kind, path, position);
+        Ok(())
+    }
+
+    pub fn take_replies(&mut self) -> Vec<Reply> {
+        std::mem::take(&mut self.replies)
     }
 
     pub fn take_notice(&mut self) -> Option<String> {
@@ -391,7 +499,9 @@ impl Lsp {
         for (i, client) in self.clients.iter_mut().enumerate() {
             loop {
                 match client.incoming.try_recv() {
-                    Ok(message) => changed |= handle(client, message, &mut self.diagnostics, &mut self.status),
+                    Ok(message) => {
+                        changed |= handle(client, message, &mut self.diagnostics, &mut self.status, &mut self.replies)
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         exited.push(i);
@@ -427,9 +537,22 @@ fn handle(
     message: Value,
     diagnostics: &mut HashMap<PathBuf, Vec<Diagnostic>>,
     status: &mut String,
+    replies: &mut Vec<Reply>,
 ) -> bool {
     let method = message["method"].as_str().unwrap_or_default().to_string();
     let id = message.get("id").cloned();
+
+    // The answer to one of our requests.
+    if method.is_empty()
+        && let Some(kind) = id.as_ref().and_then(Value::as_i64).and_then(|n| client.pending.remove(&n))
+    {
+        let result = &message["result"];
+        replies.push(match kind {
+            RequestKind::Definition => Reply::Definition(parse_locations(result)),
+            RequestKind::Hover => Reply::Hover(if result.is_null() { None } else { parse_hover(result) }),
+        });
+        return true;
+    }
 
     // The answer to `initialize`: say we're ready and send what waited.
     if method.is_empty() && id == Some(json!(0)) {
@@ -551,6 +674,14 @@ while True:
     if method == "initialize":
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"capabilities": {"textDocumentSync": 1}}})
         send({"jsonrpc": "2.0", "id": 99, "method": "workspace/configuration", "params": {"items": [{}]}})
+    elif method == "textDocument/definition":
+        uri = m["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": m["id"], "result": [{"uri": uri,
+              "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 5}}}]})
+    elif method == "textDocument/hover":
+        line = m["params"]["position"]["line"]
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown",
+              "value": "**doc** for line %d" % line}}})
     elif method in ("textDocument/didOpen", "textDocument/didChange"):
         doc = m["params"]["textDocument"]
         text = m["params"]["textDocument"].get("text") or m["params"]["contentChanges"][0]["text"]
@@ -636,6 +767,42 @@ while True:
         assert!(found, "pyright's diagnostics: {:?}", lsp.diagnostics(&file));
     }
 
+    /// Against the real pyright: `cargo test -- --ignored pyright`.
+    #[test]
+    #[ignore]
+    fn pyright_answers_definition_and_hover() {
+        let dir = std::env::temp_dir().join(format!("gmacs-pyright-nav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.py");
+        let text = "def greet(name):\n    \"\"\"Say hello.\"\"\"\n    return name\n\ngreet('x')\n";
+        std::fs::write(&file, text).unwrap();
+        let mut lsp = Lsp::default();
+        lsp.set_configs(vec![ServerConfig {
+            language: "python".into(),
+            command: "pyright-langserver".into(),
+            args: vec!["--stdio".into()],
+        }]);
+        let docs = vec![Doc { path: file.clone(), language: "python", revision: 0, saves: 0, text: Rope::from_str(text) }];
+        lsp.pump(&docs, |_| dir.clone());
+        lsp.request(RequestKind::Definition, &file, (4, 1)).unwrap();
+        lsp.request(RequestKind::Hover, &file, (4, 1)).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..200 {
+            lsp.pump(&docs, |_| dir.clone());
+            replies.extend(lsp.take_replies());
+            if replies.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            replies.iter().any(|r| matches!(r, Reply::Definition(l) if l.first().is_some_and(|l| l.position.0 == 0))),
+            "{replies:?}"
+        );
+        assert!(replies.iter().any(|r| matches!(r, Reply::Hover(Some(t)) if t.contains("Say hello"))), "{replies:?}");
+    }
+
     /// Against the real rust-analyzer: `cargo test -- --ignored rust_analyzer`.
     #[test]
     #[ignore]
@@ -660,6 +827,27 @@ while True:
         }
         std::fs::remove_dir_all(&dir).ok();
         assert!(found, "no diagnostics from rust-analyzer");
+    }
+
+    #[test]
+    fn replies_are_parsed_in_every_shape() {
+        let link = json!([{ "targetUri": "file:///a.rs",
+            "targetRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 9, "character": 0 } },
+            "targetSelectionRange": { "start": { "line": 3, "character": 7 }, "end": { "line": 3, "character": 9 } } }]);
+        assert_eq!(parse_locations(&link), vec![Location { path: "/a.rs".into(), position: (3, 7) }]);
+        let single = json!({ "uri": "file:///b.rs", "range": { "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 3 } } });
+        assert_eq!(parse_locations(&single)[0].position, (1, 2));
+        assert!(parse_locations(&Value::Null).is_empty());
+
+        assert_eq!(parse_hover(&json!({ "contents": { "kind": "markdown", "value": " doc " } })).as_deref(), Some("doc"));
+        assert_eq!(
+            parse_hover(&json!({ "contents": [{ "language": "rust", "value": "fn f()" }, "text"] })).as_deref(),
+            Some("```rust\nfn f()\n```\n\ntext")
+        );
+        assert_eq!(parse_hover(&json!({ "contents": "" })), None);
+        let rope = Rope::from_str("a😀b\nxyz");
+        assert_eq!(char_to_utf16(&rope, 2), (0, 3), "b comes after two UTF-16 units of emoji");
+        assert_eq!(char_to_utf16(&rope, 5), (1, 1));
     }
 
     #[test]

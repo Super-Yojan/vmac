@@ -6,7 +6,7 @@
 //! is never contended; it is only there to satisfy the bounds.
 
 use crate::buffer::Buffer;
-use crate::lsp::{Diagnostic, Doc, Lsp, ServerConfig};
+use crate::lsp::{Diagnostic, Doc, Lsp, Reply, RequestKind, ServerConfig};
 use crate::picker::Picker;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -146,6 +146,10 @@ pub struct EditorState {
     pub picker: Option<Picker>,
     /// Language servers and what they report.
     pub lsp: Lsp,
+    /// Documentation shown by K, until the next key.
+    pub hover: Option<String>,
+    /// Where gd and other jumps came from, for C-o: (buffer, point).
+    jumps: Vec<(BufferId, usize)>,
     search_cache: Option<(String, Regex)>,
 }
 
@@ -169,6 +173,8 @@ impl EditorState {
             quit_requested: false,
             picker: None,
             lsp: Lsp::default(),
+            hover: None,
+            jumps: Vec::new(),
             search_cache: None,
         }
     }
@@ -551,6 +557,16 @@ impl EditorState {
     /// back. Returns whether anything visible changed.
     pub fn lsp_pump(&mut self, configs: Vec<ServerConfig>) -> bool {
         self.lsp.set_configs(configs);
+        let mut changed = self.lsp_sync();
+        for reply in self.lsp.take_replies() {
+            self.act_on(reply);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Sends servers the files' latest text and reads what they sent.
+    fn lsp_sync(&mut self) -> bool {
         let docs: Vec<Doc> = self
             .buffers
             .iter()
@@ -566,6 +582,56 @@ impl EditorState {
             changed = true;
         }
         changed
+    }
+
+    /// Asks the selected buffer's server about the point (gd, K). The answer
+    /// comes back later, through `lsp_pump`.
+    pub fn lsp_request(&mut self, kind: RequestKind) {
+        let Some(path) = self.buffer().file().cloned() else {
+            self.message = "This buffer has no file".into();
+            return;
+        };
+        self.lsp_sync(); // so the server answers about the text as it is now
+        let position = crate::lsp::char_to_utf16(self.buffer().text(), self.buffer().point());
+        if let Err(e) = self.lsp.request(kind, &path, position) {
+            self.message = e;
+        }
+    }
+
+    fn act_on(&mut self, reply: Reply) {
+        match reply {
+            Reply::Definition(locations) => match locations.first() {
+                None => self.message = "No definition found".into(),
+                Some(loc) => {
+                    let from = (self.window().buffer, self.buffer().point());
+                    match self.open_file(&loc.path) {
+                        Ok(()) => {
+                            self.jumps.push(from);
+                            let pos = crate::lsp::utf16_to_char(self.buffer().text(), loc.position);
+                            self.buffer_mut().goto_char(pos);
+                            if locations.len() > 1 {
+                                self.message = format!("{} definitions; went to the first", locations.len());
+                            }
+                        }
+                        Err(e) => self.message = format!("{}: {e}", loc.path.display()),
+                    }
+                }
+            },
+            Reply::Hover(Some(text)) => self.hover = Some(text),
+            Reply::Hover(None) => self.message = "No documentation here".into(),
+        }
+    }
+
+    /// Goes back to where the last jump (gd) came from.
+    pub fn jump_back(&mut self) -> bool {
+        while let Some((buffer, point)) = self.jumps.pop() {
+            if self.buffer_by_id(buffer).is_some() {
+                self.show_buffer(buffer);
+                self.buffer_mut().goto_char(point);
+                return true;
+            }
+        }
+        false
     }
 
     /// The selected buffer's diagnostics, with their character ranges, in order.
