@@ -118,7 +118,9 @@ to log every message to and from the servers.
 
 `SPC o t` opens a terminal below (or closes it, from the terminal; the
 running one is reused), `SPC o T` one in this window, `:term CMD` runs a
-command. It's a buffer: in insert state every key goes to the program
+command. Terminals run fish (as a login shell) when it's installed, else
+`$SHELL`; `:terminal-shell /bin/zsh`, or `(set-terminal-shell ...)` /
+`gmacs.set_terminal_shell(...)` in your config, changes it. It's a buffer: in insert state every key goes to the program
 (`ESC` returns to normal state, `C-\` sends the program an `ESC`); in normal
 state its screen is text, so motions, search and yank work, and `p` pastes
 into the program. Local terminals run on Ghostty's terminal engine

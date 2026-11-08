@@ -763,9 +763,15 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
     // key to the selected one. Plugin backends run Lua, so no lock is held.
     let (ed, l) = (editor.clone(), lua.clone());
     engine.register_fn("terminal-open", move |backend: String, command: String| -> bool {
-        let (backend, cwd, rows, cols) = {
+        let (backend, cwd, rows, cols, command) = {
             let st = ed.lock();
             let backend = if backend.is_empty() { st.terminal_backend.clone() } else { backend };
+            // No command: the terminal shell, as a login shell (its config and PATH load).
+            let command = if command.trim().is_empty() && !st.terminal_shell.is_empty() {
+                format!("{} -l", st.terminal_shell)
+            } else {
+                command
+            };
             let cwd = st
                 .buffer()
                 .file()
@@ -773,7 +779,7 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
                 .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from("/"));
             let (rows, cols) = st.selected_size();
-            (backend, cwd, rows, cols)
+            (backend, cwd, rows, cols, command)
         };
         if backend == "local" {
             return match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
@@ -1451,6 +1457,8 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "set-terminal-backend", |s, name: String| s.terminal_backend = name);
     prim!(reg, editor, "terminal-backend", |s| s.terminal_backend.clone());
+    prim!(reg, editor, "set-terminal-shell", |s, shell: String| s.terminal_shell = shell);
+    prim!(reg, editor, "terminal-shell", |s| s.terminal_shell.clone());
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
     pure!(reg, "exec", |command: String, args: Vec<String>| {
         std::process::Command::new(&command)
@@ -3322,6 +3330,25 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
         lisp.pump_terminals();
         assert_eq!(lisp.eval_lua("killed[1]").unwrap(), "t7", "closing it asks the backend to end it");
+    }
+
+    #[test]
+    fn fish_is_the_default_shell_when_installed() {
+        let shell = crate::editor::default_shell();
+        if std::path::Path::new("/opt/homebrew/bin/fish").exists() || shell.ends_with("/fish") {
+            assert!(shell.ends_with("/fish"), "{shell}");
+        }
+        let (mut lisp, editor) = lisp_with("");
+        assert_eq!(lisp.eval_lua("gmacs.terminal_shell()").unwrap(), shell);
+        // A shell with no config to load, so the test doesn't depend on yours.
+        lisp.eval_lua(r#"gmacs.set_terminal_shell("/bin/sh")"#).unwrap();
+        typed(&mut lisp, ":term\n");
+        typed(&mut lisp, "echo $0\n");
+        assert!(
+            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().lines().any(|l| l.contains("sh") && !l.contains("echo"))),
+            "{}",
+            editor.lock().buffer().text()
+        );
     }
 
     #[test]

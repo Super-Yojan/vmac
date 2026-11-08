@@ -111,6 +111,21 @@ impl Completion {
     }
 }
 
+/// fish if it's installed (on PATH or where Homebrew puts it), else $SHELL.
+pub fn default_shell() -> String {
+    let on_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join("fish"));
+    let known = ["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/usr/bin/fish"].map(PathBuf::from);
+    on_path
+        .chain(known)
+        .find(|p| p.is_file())
+        .map(|p| p.display().to_string())
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
 /// A window's text size (rows, columns) for a terminal: 24x80 before it is
 /// laid out, and never under 2x10.
 fn window_size(w: &Window) -> (u16, u16) {
@@ -265,6 +280,9 @@ pub struct EditorState {
     /// plugin's). Plugin terminals to end, for the Lisp side (it runs Lua).
     pub terminals: Vec<Terminal>,
     pub terminal_backend: String,
+    /// The shell a terminal runs when given no command: fish when it's
+    /// installed, else the login shell ($SHELL).
+    pub terminal_shell: String,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
@@ -304,6 +322,7 @@ impl EditorState {
             code_actions: Vec::new(),
             terminals: Vec::new(),
             terminal_backend: "local".into(),
+            terminal_shell: default_shell(),
             terminals_to_kill: Vec::new(),
             events: Vec::new(),
             search_cache: None,
