@@ -18,6 +18,8 @@ use std::time::Duration;
 const ROW_HEIGHT: f32 = 20.;
 const FONT_SIZE: f32 = 14.;
 const RELOAD_POLL: Duration = Duration::from_millis(400);
+/// How often language servers are synced and read.
+const LSP_POLL: Duration = Duration::from_millis(100);
 /// How wide the sidebar (the file tree) is.
 const SIDEBAR_WIDTH: f32 = 260.;
 
@@ -33,6 +35,7 @@ impl Shell {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         Self::watch_sources(cx);
+        Self::drive_language_servers(cx);
         Self { editor, lisp, focus, syntax: Syntax::default() }
     }
 
@@ -43,6 +46,25 @@ impl Shell {
                 cx.background_executor().timer(RELOAD_POLL).await;
                 let alive = this.update(cx, |shell, cx| {
                     if shell.lisp.reload_if_changed() {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Syncs files with their language servers and reads what they report.
+    fn drive_language_servers(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(LSP_POLL).await;
+                let alive = this.update(cx, |shell, cx| {
+                    let configs = shell.lisp.lsp_servers();
+                    if shell.editor.lock().lsp_pump(configs) {
                         cx.notify();
                     }
                 });
@@ -130,6 +152,17 @@ fn face_color(face: &str, cx: &App) -> Hsla {
     }
 }
 
+/// A diagnostic's color by severity: error, warning, information, hint.
+fn severity_color(severity: u8, cx: &App) -> Hsla {
+    let t = cx.theme();
+    match severity {
+        1 => t.danger,
+        2 => t.warning,
+        3 => t.info,
+        _ => t.muted_foreground,
+    }
+}
+
 /// How a run of text looks: a face resolved against the theme.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Style {
@@ -176,6 +209,8 @@ struct Cell {
     matched: bool,
     cursor: bool,
     style: Option<Style>,
+    /// A diagnostic's squiggle color.
+    diagnostic: Option<Hsla>,
 }
 
 /// Column ranges where the search pattern matches in a line of text.
@@ -191,15 +226,29 @@ fn match_columns(text: &str, re: Option<&regex::Regex>) -> Vec<(usize, usize)> {
 /// One line of text. `cursor` is a column; `selected` a column range, which
 /// may include the line break (one past the last character), drawn as a
 /// space like Vim does.
-fn line_element(
+/// What one line shows, all in screen columns.
+#[derive(Default)]
+struct LineView {
     text: String,
     cursor: Option<usize>,
+    /// The selected columns; may include the line break (one past the end).
     selected: Option<(usize, usize)>,
+    /// Search matches.
     matches: Vec<(usize, usize)>,
     styles: Vec<(usize, usize, Style)>,
-    bar: bool,
-    cx: &App,
-) -> impl IntoElement {
+    /// Diagnostic squiggles.
+    diagnostics: Vec<(usize, usize, Hsla)>,
+}
+
+impl LineView {
+    /// Just text with a cursor (the minibuffer, the picker's query).
+    fn input(text: String, cursor: usize) -> Self {
+        Self { text, cursor: Some(cursor), ..Default::default() }
+    }
+}
+
+fn line_element(view: LineView, bar: bool, cx: &App) -> impl IntoElement {
+    let LineView { text, cursor, selected, matches, styles, diagnostics } = view;
     let height = ROW_HEIGHT * line_scale(&styles);
     let t = cx.theme();
     let chars: Vec<char> = text.chars().collect();
@@ -212,6 +261,7 @@ fn line_element(
         matched: in_match(col),
         cursor: cursor == Some(col),
         style: style(col),
+        diagnostic: diagnostics.iter().find(|&&(a, b, _)| col >= a && col < b).map(|d| d.2),
     };
     // The cell after the last character exists when it is drawn.
     let end = chars.len();
@@ -242,6 +292,9 @@ fn line_element(
             .when(st.is_some_and(|s| s.italic), |d| d.italic())
             .when(st.is_some_and(|s| s.underline), |d| d.underline())
             .when(st.is_some_and(|s| s.sans), |d| d.font_family(sans.clone()))
+            .when_some(c.diagnostic, |d, color| {
+                d.text_decoration_1().text_decoration_wavy().text_decoration_color(color)
+            })
             .when(c.matched, |d| d.bg(t.warning.opacity(0.35)))
             .when(c.selected, |d| d.bg(t.selection))
             .child(text);
@@ -330,15 +383,7 @@ fn picker_element(
                     .border_b_1()
                     .border_color(t.border)
                     .child(div().text_color(t.primary).child("> "))
-                    .child(line_element(
-                        display_line(query.text().slice(..)),
-                        Some(query.column()),
-                        None,
-                        vec![],
-                        vec![],
-                        bar,
-                        cx,
-                    )),
+                    .child(line_element(LineView::input(display_line(query.text().slice(..)), query.column()), bar, cx)),
             )
             .child(
                 h_flex()
@@ -493,6 +538,20 @@ impl Render for Shell {
                     out
                 };
                 let styles: Vec<_> = (lo..hi).map(styles_of).collect();
+                // Language server diagnostics, as character ranges and squiggle colors.
+                let diagnostics: Vec<(usize, usize, Hsla)> = buffer
+                    .file()
+                    .map(|f| {
+                        st.lsp
+                            .diagnostics(f)
+                            .iter()
+                            .map(|d| {
+                                let (a, b) = d.to_chars(text);
+                                (a, b, severity_color(d.severity, cx))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
 
                 let room = (r.h * area - ROW_HEIGHT).max(ROW_HEIGHT);
@@ -523,7 +582,22 @@ impl Render for Shell {
                             .collect();
                         let line = display_line(text.line(i));
                         let matches = match_columns(&line, search.as_ref());
-                        let row = line_element(line, cursor, selected, matches, line_styles, bar, cx);
+                        let line_diagnostics = diagnostics
+                            .iter()
+                            .filter(|&&(a, b, _)| a < start + line_len.max(1) && b > start)
+                            .map(|&(a, b, color)| {
+                                (to_screen(a.saturating_sub(start)), to_screen(b.saturating_sub(start)), color)
+                            })
+                            .collect();
+                        let view = LineView {
+                            text: line,
+                            cursor,
+                            selected,
+                            matches,
+                            styles: line_styles,
+                            diagnostics: line_diagnostics,
+                        };
+                        let row = line_element(view, bar, cx);
                         let current = is_sidebar && i == cur_line;
                         div().when(current, |d| {
                             d.bg(if is_selected { theme.list_active } else { theme.list_hover })
@@ -581,7 +655,21 @@ impl Render for Shell {
                 let mb = &st.minibuffer;
                 h_flex()
                     .child(div().text_color(theme.primary).child(prompt.clone()))
-                    .child(line_element(display_line(mb.text().slice(..)), Some(mb.column()), None, vec![], vec![], true, cx))
+                    .child(line_element(LineView::input(display_line(mb.text().slice(..)), mb.column()), true, cx))
+            }
+            _ if st.message.is_empty() && st.minibuffer_prompt.is_none() => {
+                // With nothing else to say, the diagnostic under the cursor.
+                let point = st.buffer().point();
+                let here = st.buffer_diagnostics().into_iter().find(|((a, b), _)| point >= *a && point < *b);
+                match here {
+                    Some((_, d)) => h_flex()
+                        .gap(px(6.))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(div().text_color(severity_color(d.severity, cx)).child(format!("{}:", d.severity_name())))
+                        .child(div().text_color(theme.foreground).child(d.message.lines().next().unwrap_or("").to_string())),
+                    None => h_flex(),
+                }
             }
             _ => h_flex().text_color(theme.muted_foreground).child(st.message.clone()),
         };

@@ -39,6 +39,8 @@ pub struct Buffer {
     /// Changes whenever the text does (edits, undo, redo): what syntax
     /// highlighting checks before parsing again.
     revision: u64,
+    /// How many times it was saved (language servers hear about each save).
+    saves: u64,
 }
 
 impl Buffer {
@@ -57,6 +59,7 @@ impl Buffer {
             undo: Vec::new(),
             redo: Vec::new(),
             revision: 0,
+            saves: 0,
         }
     }
 
@@ -87,6 +90,7 @@ impl Buffer {
             undo: Vec::new(),
             redo: Vec::new(),
             revision: 0,
+            saves: 0,
         })
     }
 
@@ -97,6 +101,7 @@ impl Buffer {
             .ok_or_else(|| std::io::Error::other("buffer has no file"))?;
         std::fs::write(&path, self.text.to_string())?;
         self.modified = false;
+        self.saves += 1;
         Ok(path)
     }
 
@@ -120,6 +125,10 @@ impl Buffer {
     }
     pub fn faces(&self) -> &[(usize, usize, String)] {
         &self.faces
+    }
+
+    pub fn saves(&self) -> u64 {
+        self.saves
     }
 
     pub fn revision(&self) -> u64 {

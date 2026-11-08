@@ -266,6 +266,25 @@ impl Lisp {
         }
     }
 
+    /// Calls Scheme's `(lsp-servers)`: `(language command arg ...)` lists.
+    pub fn lsp_servers(&mut self) -> Vec<crate::lsp::ServerConfig> {
+        let Ok(SteelVal::ListV(items)) = self.engine.call_function_by_name_with_args("lsp-servers", vec![]) else {
+            return vec![];
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let SteelVal::ListV(parts) = item else { return None };
+                let mut words = parts.iter().filter_map(symbol_text);
+                Some(crate::lsp::ServerConfig {
+                    language: words.next()?,
+                    command: words.next()?,
+                    args: words.collect(),
+                })
+            })
+            .collect()
+    }
+
     /// Calls Scheme's `(face-specs)`: how named faces look.
     pub fn face_specs(&mut self) -> Vec<FaceSpec> {
         match self.engine.call_function_by_name_with_args("face-specs", vec![]) {
@@ -566,6 +585,66 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     });
     prim!(engine, editor, "align-table", |s, move_cells: isize| align_table_at_point(s.current(), move_cells));
 
+    // Language servers.
+    prim!(engine, editor, "lsp-status", |s| s.lsp.status().to_string());
+    prim!(engine, editor, "lsp-servers-here", |s| s
+        .buffer()
+        .file()
+        .map(|f| s.lsp.servers_for(f).join(" "))
+        .unwrap_or_default());
+    prim!(engine, editor, "diagnostic-summary", |s| {
+        let list = s.buffer_diagnostics();
+        let count = |sev: u8| list.iter().filter(|(_, d)| d.severity == sev).count();
+        let (errors, warnings) = (count(1), count(2));
+        let mut parts = Vec::new();
+        if errors > 0 {
+            parts.push(format!("E{errors}"));
+        }
+        if warnings > 0 {
+            parts.push(format!("W{warnings}"));
+        }
+        parts.join(" ")
+    });
+    // Jumps to the next (1) or previous (-1) diagnostic, wrapping, and shows it.
+    prim!(engine, editor, "diagnostic-goto", |s, dir: isize| {
+        let list = s.buffer_diagnostics();
+        let point = s.buffer().point();
+        let found = if dir >= 0 {
+            list.iter().find(|((a, _), _)| *a > point).or(list.first())
+        } else {
+            list.iter().rev().find(|((a, _), _)| *a < point).or(list.last())
+        };
+        match found.cloned() {
+            Some(((a, _), d)) => {
+                s.buffer_mut().goto_char(a);
+                s.message = format!("{}: {}", d.severity_name(), d.message);
+                true
+            }
+            None => {
+                s.message = "No diagnostics".into();
+                false
+            }
+        }
+    });
+    // "line:col  severity: message" for each, for the picker.
+    prim!(engine, editor, "diagnostic-items", |s| {
+        let rope = s.buffer().text().clone();
+        s.buffer_diagnostics()
+            .into_iter()
+            .map(|((a, _), d)| {
+                let line = rope.char_to_line(a);
+                let col = a - rope.line_to_char(line);
+                format!("{}:{}  {}: {}", line + 1, col + 1, d.severity_name(), d.message.lines().next().unwrap_or(""))
+            })
+            .collect::<Vec<_>>()
+    });
+    prim!(engine, editor, "goto-line-column", |s, line: isize, col: isize| {
+        let b = s.buffer_mut();
+        let pos = b.line_to_pos((line - 1).max(0) as usize) + (col - 1).max(0) as usize;
+        let end = b.line_end(pos.min(b.len()));
+        b.goto_char(pos.min(end));
+    });
+
     // The echo area and minibuffer.
     prim!(engine, editor, "message", |s, text: String| s.message = text);
     prim!(engine, editor, "current-message", |s| s.message.clone());
@@ -657,12 +736,6 @@ mod tests {
         let editor = Editor::new(buf);
         let core = Source { label: "core.scm".into(), path: None };
         (Lisp::new(editor.clone(), vec![core]), editor)
-    }
-
-    fn keys(lisp: &mut Lisp, seq: &[(&str, &str)]) {
-        for (k, t) in seq {
-            lisp.dispatch_key(k, t);
-        }
     }
 
     fn text(editor: &Editor) -> String {
@@ -1155,7 +1228,7 @@ mod tests {
         let mut lisp = Lisp::new(editor.clone(), sources);
         std::fs::write(&init, "(define (broken) (no-such-function))").unwrap();
         lisp.reload();
-        assert!(editor.lock().message.contains("kept the last version"), "{}", editor.lock().message);
+        { let m = editor.lock().message.clone(); assert!(m.contains("kept the last version"), "{m}"); }
         typed(&mut lisp, ":hi\n");
         assert_eq!(text(&editor), "hi", "keys and the old init still work");
         assert!(!lisp.modeline().is_empty());
@@ -1249,7 +1322,7 @@ mod tests {
         assert_eq!(editor.lock().buffer().name(), "test");
         typed(&mut lisp, "x");
         typed(&mut lisp, ":bd\n");
-        assert!(editor.lock().message.contains("unsaved"), "{}", editor.lock().message);
+        { let m = editor.lock().message.clone(); assert!(m.contains("unsaved"), "{m}"); }
         typed(&mut lisp, ":bd!\n");
         assert_eq!(editor.lock().buffer_names(), vec!["Cargo.toml", "README.md"]);
     }
@@ -1729,6 +1802,109 @@ mod tests {
         typed(&mut lisp, "A x");
         lisp.dispatch_key("ESC", "");
         assert_eq!(text(&editor), "| a | bb | x");
+    }
+
+    fn with_diagnostics(text: &str) -> (Lisp, Editor) {
+        let (lisp, editor) = lisp_with("");
+        let path = std::env::temp_dir().join(format!("gmacs-diag-{}.rs", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        editor.lock().open_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let d = |line, col, severity: u8, message: &str| crate::lsp::Diagnostic {
+            start: (line, col),
+            end: (line, col + 3),
+            severity,
+            message: message.into(),
+            source: None,
+        };
+        let abs = std::path::absolute(&path).unwrap();
+        editor
+            .lock()
+            .lsp
+            .set_diagnostics(abs, vec![d(2, 4, 2, "unused variable"), d(0, 3, 1, "mismatched types")]);
+        (lisp, editor)
+    }
+
+    #[test]
+    fn bracket_d_jumps_between_diagnostics() {
+        let (mut lisp, editor) = with_diagnostics("fn main() {\n    let a = 1;\n    let b = 2;\n}\n");
+        typed(&mut lisp, "]d");
+        assert_eq!(editor.lock().buffer().point(), 3);
+        assert_eq!(editor.lock().message, "error: mismatched types");
+        typed(&mut lisp, "]d");
+        {
+            // One lock at a time: a second lock in the same expression would wait forever.
+            let st = editor.lock();
+            assert_eq!((st.buffer().line(), st.buffer().column()), (2, 4));
+        }
+        typed(&mut lisp, "]d");
+        assert_eq!(editor.lock().buffer().point(), 3, "wraps around");
+        typed(&mut lisp, "[d");
+        assert_eq!(editor.lock().buffer().line(), 2, "and back");
+    }
+
+    #[test]
+    fn diagnostics_show_in_the_modeline_and_picker() {
+        let (mut lisp, editor) = with_diagnostics("fn main() {\n    let a = 1;\n    let b = 2;\n}\n");
+        assert!(lisp.modeline().iter().any(|s| s.text == "E1 W1"), "{:?}", lisp.modeline());
+        typed(&mut lisp, " cx");
+        {
+            let st = editor.lock();
+            let p = st.picker.as_ref().expect("diagnostics picker");
+            assert_eq!(p.title(), "Diagnostics");
+            assert_eq!(p.selection(), Some("1:4  error: mismatched types"));
+        }
+        lisp.dispatch_key("C-n", "");
+        lisp.dispatch_key("RET", "");
+        let st = editor.lock();
+        assert_eq!((st.buffer().line(), st.buffer().column()), (2, 4));
+    }
+
+    #[test]
+    fn lsp_servers_come_from_scheme() {
+        let (mut lisp, _editor) = lisp_with("");
+        let servers = lisp.lsp_servers();
+        let rust = servers.iter().find(|s| s.language == "rust").unwrap();
+        assert_eq!(rust.command, "rust-analyzer");
+        let py = servers.iter().find(|s| s.language == "python").unwrap();
+        assert_eq!(py.args, vec!["--stdio"]);
+    }
+
+    #[test]
+    fn diagnostics_jump_list_and_count_from_scheme() {
+        let dir = std::env::temp_dir().join(format!("gmacs-lsp-scheme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("server.py");
+        std::fs::write(&server, crate::lsp::tests::FAKE_SERVER).unwrap();
+        let file = dir.join("main.rs");
+        std::fs::write(&file, "fn main() {}\nlet x = 1;\n").unwrap();
+
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval(&format!(r#"(define (lsp-servers) (list (list "rust" "python3" "{}")))"#, server.display())).unwrap();
+        editor.lock().open_file(&file).unwrap();
+        let mut got = false;
+        for _ in 0..200 {
+            let configs = lisp.lsp_servers();
+            editor.lock().lsp_pump(configs);
+            if !editor.lock().buffer_diagnostics().is_empty() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got, "the fake server published a diagnostic");
+        assert!(lisp.modeline().iter().any(|s| s.text == "E1"), "{:?}", lisp.modeline());
+
+        typed(&mut lisp, "jw]d");
+        assert_eq!(editor.lock().buffer().point(), 0, "]d wraps around to the diagnostic at the top");
+        { let m = editor.lock().message.clone(); assert!(m.starts_with("error: length"), "{m}"); }
+
+        typed(&mut lisp, "j");
+        typed(&mut lisp, " cx");
+        assert!(editor.lock().picker.is_some());
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().point(), 0, "picking goes to it");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

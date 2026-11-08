@@ -1336,6 +1336,39 @@
         (list "a" 'tree-add) (list "r" 'tree-rename) (list "d" 'tree-delete)
         (list "R" 'tree-refresh) (list "q" 'tree-close)))
 
+;;;; Language servers (LSP)
+;;
+;; Which server runs for which language: (language command arg ...). A
+;; server starts when a file of its language opens, one per project.
+;; Errors and warnings are underlined; ]d and [d jump between them, SPC c x
+;; lists them. Change this list to use other servers.
+
+(define (lsp-servers)
+  (list (list "rust" "rust-analyzer")
+        (list "python" "pyright-langserver" "--stdio")
+        (list "typescript" "typescript-language-server" "--stdio")
+        (list "tsx" "typescript-language-server" "--stdio")
+        (list "javascript" "typescript-language-server" "--stdio")
+        (list "c" "clangd")
+        (list "go" "gopls")))
+
+(defcommand (diagnostic-next) (diagnostic-goto 1))
+(defcommand (diagnostic-previous) (diagnostic-goto -1))
+
+;; "12:5  error: ..." -> goes to line 12, column 5.
+(define (goto-diagnostic-item item)
+  (let* ((colon (let loop ((i 0)) (if (equal? (substring item i (+ i 1)) ":") i (loop (+ i 1)))))
+         (rest (substring item (+ colon 1) (string-length item)))
+         (space (space-index rest)))
+    (goto-line-column (string->number (substring item 0 colon))
+                      (string->number (substring rest 0 space)))))
+
+(defcommand (diagnostic-list)
+  (let ((items (diagnostic-items)))
+    (if (null? items)
+        (message "No diagnostics")
+        (pick "Diagnostics" items "" goto-diagnostic-item))))
+
 ;;;; Default bindings
 
 ;; Motions move in normal and visual state, and complete an operator.
@@ -1404,6 +1437,9 @@
         (list "SPC f f" 'find-file-command) (list "SPC SPC" 'find-file-command)
         (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
         (list "SPC m a" 'table-align)
+        ;; Language servers
+        (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
+        (list "SPC c x" 'diagnostic-list)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)
         (list "SPC b n" 'buffer-next) (list "SPC b p" 'buffer-previous)
@@ -1563,4 +1599,6 @@
                              (number->string (column-number)))
               'dim)
         (list (buffer-language) 'dim)
+        (list (diagnostic-summary) 'error)
+        (list (lsp-status) 'dim)
         (list (string-append pending-count pending-keys) 'dim)))

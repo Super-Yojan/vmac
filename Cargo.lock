@@ -2157,6 +2157,7 @@ dependencies = [
  "ignore",
  "regex",
  "ropey 1.6.1",
+ "serde_json",
  "steel-core",
  "tree-sitter",
  "tree-sitter-bash",

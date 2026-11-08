@@ -4,6 +4,7 @@
 mod buffer;
 mod editor;
 mod lisp;
+mod lsp;
 mod markdown;
 mod picker;
 mod shell;

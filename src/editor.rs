@@ -6,6 +6,7 @@
 //! is never contended; it is only there to satisfy the bounds.
 
 use crate::buffer::Buffer;
+use crate::lsp::{Diagnostic, Doc, Lsp, ServerConfig};
 use crate::picker::Picker;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -143,6 +144,8 @@ pub struct EditorState {
     pub quit_requested: bool,
     /// The open fuzzy picker, if any; its query is the minibuffer's text.
     pub picker: Option<Picker>,
+    /// Language servers and what they report.
+    pub lsp: Lsp,
     search_cache: Option<(String, Regex)>,
 }
 
@@ -165,6 +168,7 @@ impl EditorState {
             pending_eval: Vec::new(),
             quit_requested: false,
             picker: None,
+            lsp: Lsp::default(),
             search_cache: None,
         }
     }
@@ -539,6 +543,38 @@ impl EditorState {
         } else if rows > 0 && line >= w.scroll_top + rows {
             w.scroll_top = line + 1 - rows;
         }
+    }
+
+    // ---- Language servers
+
+    /// Syncs open files with their language servers and reads what came
+    /// back. Returns whether anything visible changed.
+    pub fn lsp_pump(&mut self, configs: Vec<ServerConfig>) -> bool {
+        self.lsp.set_configs(configs);
+        let docs: Vec<Doc> = self
+            .buffers
+            .iter()
+            .filter_map(|(_, b)| {
+                let path = b.file()?.clone();
+                let language = crate::syntax::language_for_path(&path)?;
+                Some(Doc { path, language, revision: b.revision(), saves: b.saves(), text: b.text().clone() })
+            })
+            .collect();
+        let mut changed = self.lsp.pump(&docs, crate::picker::project_root);
+        if let Some(notice) = self.lsp.take_notice() {
+            self.message = notice;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The selected buffer's diagnostics, with their character ranges, in order.
+    pub fn buffer_diagnostics(&self) -> Vec<((usize, usize), Diagnostic)> {
+        let Some(path) = self.buffer().file() else { return vec![] };
+        let rope = self.buffer().text();
+        let mut list: Vec<_> = self.lsp.diagnostics(path).iter().map(|d| (d.to_chars(rope), d.clone())).collect();
+        list.sort_by_key(|(range, d)| (range.0, d.severity));
+        list
     }
 
     // ---- Search
