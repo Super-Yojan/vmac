@@ -1,6 +1,6 @@
 [package]
 name = "vmac"
-version = "0.0.1"
+version = "0.0.2"
 description = "A modal (evil-style) editor on GPUI, programmable in Steel Scheme and Lua"
 repository = "https://github.com/Super-Yojan/vmac"
 homepage = "https://super-yojan.dev/vmac/"

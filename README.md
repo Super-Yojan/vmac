@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh 
 or, the same thing by hand:
 
 ```sh
-cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.1 --locked
+cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.2 --locked
 ```
 
 Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.scm`,

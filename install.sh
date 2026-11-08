@@ -4,12 +4,12 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh
 #
-# VMAC_VERSION picks a release tag (default: v0.0.1); VMAC_VERSION=master
-# builds the latest code.
+# The latest release by default; VMAC_VERSION=master builds the latest code,
+# VMAC_VERSION=v0.0.1 (another tag) that release.
 set -eu
 
 repo="https://github.com/Super-Yojan/vmac"
-version="${VMAC_VERSION:-v0.0.1}"
+version="${VMAC_VERSION:-v0.0.2}"
 
 say() { printf 'vmac: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
