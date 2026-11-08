@@ -171,31 +171,45 @@ pub struct DiffComment {
 pub struct FrameLine {
     /// Its buffer line, top and height in pixels, and the screen column
     /// each character starts at (one more past the end): for the mouse.
+    /// Empty when that's just 0, 1, 2... (see `columns`).
     pub line: usize,
     pub top: f32,
     pub height: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cols: Vec<usize>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<usize>,
     /// The selected columns; may include the line break (one past the end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<(usize, usize)>,
     /// Search matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matches: Vec<(usize, usize)>,
     /// Faces over columns; later ones win.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub styles: Vec<(usize, usize, Face)>,
     /// Diagnostic squiggles, by severity (1 error ... 4 hint).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<(usize, usize, u8)>,
     /// The line number beside it (when they're on), and whether it's the cursor's line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<String>,
+    #[serde(default, skip_serializing_if = "no")]
     pub number_current: bool,
     /// The sidebar's cursor line.
+    #[serde(default, skip_serializing_if = "no")]
     pub current: bool,
     /// Agent changes not reviewed yet: an added line, deleted lines above it.
+    #[serde(default, skip_serializing_if = "no")]
     pub added: bool,
+    #[serde(default, skip_serializing_if = "no")]
     pub deleted_above: bool,
     /// One of your comments is on it.
+    #[serde(default, skip_serializing_if = "no")]
     pub comment: bool,
     /// Inside a Markdown code block.
+    #[serde(default, skip_serializing_if = "no")]
     pub code_block: bool,
 }
 
@@ -203,13 +217,39 @@ pub struct FrameLine {
 /// its theme ("accent", "dim", "red"...) or "#rrggbb".
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Face {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
+    #[serde(default = "default_scale", skip_serializing_if = "one")]
     pub scale: f32,
+    #[serde(default, skip_serializing_if = "no")]
     pub bold: bool,
+    #[serde(default, skip_serializing_if = "no")]
     pub italic: bool,
+    #[serde(default, skip_serializing_if = "no")]
     pub underline: bool,
+    #[serde(default, skip_serializing_if = "no")]
     pub sans: bool,
+}
+
+fn no(b: &bool) -> bool {
+    !*b
+}
+
+fn one(x: &f32) -> bool {
+    *x == 1.
+}
+
+fn default_scale() -> f32 {
+    1.
+}
+
+impl FrameLine {
+    /// The screen column each character starts at (one more past the end).
+    pub fn columns(&self) -> Vec<usize> {
+        if self.cols.is_empty() { (0..=self.text.chars().count()).collect() } else { self.cols.clone() }
+    }
 }
 
 /// What the bottom row says.

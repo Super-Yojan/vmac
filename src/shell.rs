@@ -75,7 +75,7 @@ struct WindowHit {
 impl WindowHit {
     fn of(w: &FrameWindow) -> Self {
         let lines = match &w.content {
-            Content::Text(lines) => lines.iter().map(|l| (l.line, l.top, l.height, l.cols.clone())).collect(),
+            Content::Text(lines) => lines.iter().map(|l| (l.line, l.top, l.height, l.columns())).collect(),
             _ => Vec::new(),
         };
         Self {

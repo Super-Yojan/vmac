@@ -47,6 +47,8 @@ pub enum ToServer {
     /// session of that name (made if there's none, a project's for a folder).
     Foreign(Vec<String>),
     Switch(String),
+    /// A patch didn't fit the frame the window has: send it whole.
+    Resync,
     /// Ask for the sessions' names (and then the server hangs up).
     List,
     KillServer,
@@ -57,6 +59,8 @@ pub enum ToServer {
 pub enum ToClient {
     /// The screen, and how many of this client's inputs it reflects.
     Frame { frame: Box<Frame>, acks: usize },
+    /// What changed since the last frame sent (see patch.rs).
+    Patch { patch: crate::patch::Patch, acks: usize },
     Unchanged { acks: usize },
     /// The active session first, then all of them in order.
     Sessions { active: String, all: Vec<String> },
@@ -75,7 +79,7 @@ pub enum ToClient {
 /// Bumped when the messages change in a way older servers can't read: each
 /// version has its own socket, so a newer window never talks to an older
 /// server (stop that one with its own `vmac kill-server`).
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 5;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.
@@ -126,8 +130,9 @@ struct Attached {
     /// stops reading never holds up the others.
     out: Sender<String>,
     viewport: Viewport,
-    /// The last frame it got, so an unchanged screen isn't sent again.
+    /// The last frame it got (and as JSON, to send what changed since).
     shown: Option<Frame>,
+    shown_value: Option<serde_json::Value>,
     /// Inputs it sent that no frame has answered yet.
     acks: usize,
     hello: bool,
@@ -220,7 +225,7 @@ fn run(
         };
         while let Ok((id, out)) = new_rx.try_recv() {
             let viewport = Viewport { width: 800., height: 600. };
-            clients.insert(id, Attached { out, viewport, shown: None, acks: 0, hello: false });
+            clients.insert(id, Attached { out, viewport, shown: None, shown_value: None, acks: 0, hello: false });
         }
         let mut changed = false;
         for (id, message) in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
@@ -245,6 +250,7 @@ fn run(
                     client.acks += 1;
                     client.hello = true;
                     client.shown = None;
+                    client.shown_value = None;
                     // No folder (a window on another machine): the home folder.
                     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
                     let cwd = if cwd.as_os_str().is_empty() { home } else { cwd };
@@ -261,10 +267,16 @@ fn run(
                     client.viewport = viewport;
                     client.acks += 1;
                     client.shown = None;
+                    client.shown_value = None;
                     changed = true;
                 }
                 Some(ToServer::Clipboard(text)) => crate::clipboard::relay_from_window(text),
                 Some(ToServer::AgentOut { id: agent, line }) => crate::remote_agent::deliver(agent, &line),
+                Some(ToServer::Resync) => {
+                    client.shown = None;
+                    client.shown_value = None;
+                    changed = true;
+                }
                 Some(ToServer::Foreign(names)) => {
                     server.set_foreign(names);
                     changed = true;
@@ -344,10 +356,18 @@ fn run(
                 let acks = std::mem::take(&mut client.acks);
                 if client.shown.as_ref() == Some(&frame) {
                     client.send(&ToClient::Unchanged { acks });
-                } else {
-                    client.send(&ToClient::Frame { frame: Box::new(frame.clone()), acks });
-                    client.shown = Some(frame);
+                    continue;
                 }
+                let value = serde_json::to_value(&frame).unwrap_or_default();
+                // What changed since the last frame it got; the whole frame
+                // when it has none.
+                match client.shown_value.as_ref().map(|old| crate::patch::diff(old, &value)) {
+                    Some(Some(patch)) => client.send(&ToClient::Patch { patch, acks }),
+                    Some(None) => client.send(&ToClient::Unchanged { acks }),
+                    None => client.send(&ToClient::Frame { frame: Box::new(frame.clone()), acks }),
+                }
+                client.shown = Some(frame);
+                client.shown_value = Some(value);
             }
         }
     }
@@ -374,12 +394,31 @@ pub struct Client {
     window_requests: Vec<crate::server::WindowRequest>,
     foreign: Vec<String>,
     frame: Option<Frame>,
+    /// The frame as JSON, for patches to apply to.
+    frame_value: Option<serde_json::Value>,
     viewport: Option<Viewport>,
     /// Messages sent (Hello, inputs, sizes) and not answered yet: drawing
     /// waits (briefly) for them, so typing shows at once.
     waiting: usize,
     /// Why the server hung up, once it has.
     gone: Option<String>,
+    /// Makes the connection again (over ssh), and while it's lost, how
+    /// trying to goes.
+    redial: Option<Redial>,
+    reconnecting: Option<Reconnecting>,
+}
+
+/// A new connection to the server: what it reads, what it writes, what
+/// carries it.
+pub type Transport = (Box<dyn std::io::Read + Send>, Box<dyn Write + Send>, Option<std::process::Child>);
+pub type Redial = Arc<dyn Fn() -> std::io::Result<Transport> + Send + Sync>;
+
+struct Reconnecting {
+    attempts: u32,
+    next_try: Instant,
+    /// A try under way, in the background (ssh can take a while).
+    trying: Option<Receiver<std::io::Result<Transport>>>,
+    why: String,
 }
 
 /// How long drawing waits for the server to answer what was typed.
@@ -421,9 +460,12 @@ impl Client {
             window_requests: Vec::new(),
             foreign: Vec::new(),
             frame: None,
+            frame_value: None,
             viewport: Some(viewport),
             waiting: 0,
             gone: None,
+            redial: None,
+            reconnecting: None,
         };
         // The first frame, so the window has something to draw (over ssh,
         // the server may have to start first).
@@ -439,9 +481,80 @@ impl Client {
     }
 
     fn send(&mut self, message: &ToServer) {
-        if self.gone.is_none() && send_to(&self.writer, message).is_err() {
-            self.gone = Some("Lost the server".into());
+        if self.gone.is_none() && self.reconnecting.is_none() && send_to(&self.writer, message).is_err() {
+            self.lost("the connection broke");
         }
+    }
+
+    /// Makes the connection again with `redial` when it's lost (rather
+    /// than closing the window).
+    pub fn set_redial(&mut self, redial: Redial) {
+        self.redial = Some(redial);
+    }
+
+    /// The connection is gone (not a goodbye): try again, when it can.
+    fn lost(&mut self, why: &str) {
+        self.waiting = 0;
+        if self.redial.is_none() {
+            self.gone.get_or_insert_with(|| "Lost the server".into());
+            return;
+        }
+        if self.reconnecting.is_none() {
+            // The server stops agents run for it; theirs here go too.
+            self.agents.clear();
+            if let Some(mut carrier) = self.carrier.take() {
+                let _ = carrier.kill();
+                let _ = carrier.wait();
+            }
+            self.reconnecting = Some(Reconnecting { attempts: 0, next_try: Instant::now(), trying: None, why: why.into() });
+        }
+    }
+
+    /// While the connection is lost: starts a try when it's time, and takes
+    /// up a new connection when one works. True when it did.
+    fn tend_reconnect(&mut self) -> bool {
+        let Some(r) = self.reconnecting.as_mut() else { return false };
+        if let Some(trying) = &r.trying {
+            match trying.try_recv() {
+                Ok(Ok(transport)) => return self.reconnected(transport),
+                Ok(Err(e)) => {
+                    r.trying = None;
+                    r.attempts += 1;
+                    r.why = e.to_string();
+                    // 1, 2, 4, 8, then every 10 seconds.
+                    r.next_try = Instant::now() + Duration::from_secs((1u64 << r.attempts.min(4)).min(10));
+                }
+                Err(_) => {}
+            }
+        } else if Instant::now() >= r.next_try
+            && let Some(redial) = self.redial.clone()
+        {
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(redial());
+            });
+            r.trying = Some(rx);
+        }
+        false
+    }
+
+    fn reconnected(&mut self, (reader, writer, carrier): Transport) -> bool {
+        self.reconnecting = None;
+        self.writer = Arc::new(Mutex::new(writer));
+        self.carrier = carrier;
+        let (tx, incoming) = channel();
+        read_lines(reader, (), tx);
+        self.incoming = incoming;
+        // Back on the session it showed.
+        let target = self.frame.as_ref().map(|f| f.session.clone()).filter(|s| !s.is_empty());
+        let viewport = self.viewport.unwrap_or(Viewport { width: 1320., height: 840. });
+        let hello =
+            ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd: PathBuf::new(), viewport, agents: self.remote };
+        self.frame_value = None;
+        self.foreign.clear();
+        self.waiting = 1;
+        self.send(&hello);
+        true
     }
 
     /// Takes what the server sent; waits up to `wait` while inputs are
@@ -461,9 +574,24 @@ impl Client {
             let Some(((), message)) = message else { break };
             match message {
                 Some(ToClient::Frame { frame, acks }) => {
+                    self.frame_value = serde_json::to_value(&*frame).ok();
                     self.frame = Some(*frame);
                     self.waiting = self.waiting.saturating_sub(acks);
                     news = true;
+                }
+                Some(ToClient::Patch { patch, acks }) => {
+                    self.waiting = self.waiting.saturating_sub(acks);
+                    let patched = self.frame_value.as_mut().is_some_and(|v| crate::patch::apply(v, patch));
+                    match self.frame_value.clone().filter(|_| patched).and_then(|v| serde_json::from_value::<Frame>(v).ok()) {
+                        Some(frame) => {
+                            self.frame = Some(frame);
+                            news = true;
+                        }
+                        None => {
+                            self.frame_value = None;
+                            self.send(&ToServer::Resync);
+                        }
+                    }
                 }
                 Some(ToClient::Unchanged { acks }) => self.waiting = self.waiting.saturating_sub(acks),
                 Some(ToClient::Bye(why)) => {
@@ -495,8 +623,7 @@ impl Client {
                     }
                 }
                 None => {
-                    self.gone.get_or_insert_with(|| "Lost the server".into());
-                    self.waiting = 0;
+                    self.lost("the connection closed");
                     return true;
                 }
             }
@@ -598,6 +725,14 @@ impl Drop for Client {
 
 impl Host for Client {
     fn handle(&mut self, input: Input) {
+        if self.reconnecting.is_some() {
+            // Nothing to type into; q stops trying.
+            if matches!(&input, Input::Key { key, .. } if key == "q") {
+                self.reconnecting = None;
+                self.gone = Some("Gave up reconnecting".into());
+            }
+            return;
+        }
         self.waiting += 1;
         self.send(&ToServer::Input(input));
     }
@@ -611,7 +746,12 @@ impl Host for Client {
         if self.waiting > 0 {
             self.receive(ANSWER_WAIT);
         }
-        self.frame.clone().expect("attach waits for the first frame")
+        let mut frame = self.frame.clone().expect("attach waits for the first frame");
+        if let Some(r) = &self.reconnecting {
+            let tries = if r.attempts > 0 { format!(" ({}, tried {} times)", r.why, r.attempts) } else { String::new() };
+            frame.echo = crate::frame::Echo::Message(format!("Lost the server: reconnecting...{tries}  q gives up"));
+        }
+        frame
     }
 
     fn quit_requested(&self) -> bool {
@@ -619,6 +759,12 @@ impl Host for Client {
     }
 
     fn pump_terminals(&mut self) -> bool {
+        if self.reconnecting.is_some() {
+            self.tend_reconnect();
+            self.receive(Duration::ZERO);
+            // Drawn again either way: the echo area says how it goes.
+            return true;
+        }
         self.receive(Duration::ZERO)
     }
 
@@ -880,6 +1026,63 @@ mod tests {
         let (shown, ran_here) = windows.join().unwrap();
         assert!(ran_here, "the agent ran in the window's process");
         assert!(shown.contains("You said: hello there"), "{shown}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The connection drops (a network change): the window makes it again
+    /// and is back on its session, what was typed still there.
+    #[test]
+    fn a_lost_connection_is_made_again() {
+        let dir = std::env::temp_dir().join(format!("vmac-daemon-redial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("socket");
+        let windows = {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                while UnixStream::connect(&socket).is_err() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let stream = UnixStream::connect(&socket).unwrap();
+                let cable = stream.try_clone().unwrap();
+                let mut client =
+                    Client::over(Box::new(stream.try_clone().unwrap()), Box::new(stream), Some("work".into()), PathBuf::new(), None)
+                        .unwrap();
+                let again = socket.clone();
+                client.set_redial(Arc::new(move || {
+                    let s = UnixStream::connect(&again)?;
+                    Ok((Box::new(s.try_clone()?) as Box<dyn std::io::Read + Send>, Box::new(s) as Box<dyn Write + Send>, None))
+                }));
+                keys(&mut client, &["SPC", "b", "N", "i", "o", "n", "e", "ESC"]);
+                let _ = client.frame(VIEW);
+                cable.shutdown(std::net::Shutdown::Both).unwrap();
+                let mut lost_said = String::new();
+                for _ in 0..200 {
+                    client.pump_terminals();
+                    if let crate::frame::Echo::Message(m) = client.frame(VIEW).echo
+                        && m.contains("reconnecting")
+                    {
+                        lost_said = m;
+                    }
+                    if client.reconnecting.is_none() && !lost_said.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                keys(&mut client, &["A", "t", "w", "o", "ESC"]);
+                let shown = text(&client.frame(VIEW));
+                let session = client.frame(VIEW).session;
+                let gone = client.gone().map(String::from);
+                drop(client);
+                kill(&socket).unwrap();
+                (lost_said, shown, session, gone)
+            })
+        };
+        serve(|| Server::new(fresh(), Box::new(fresh)), &socket).unwrap();
+        let (lost_said, shown, session, gone) = windows.join().unwrap();
+        assert!(lost_said.contains("reconnecting"), "{lost_said}");
+        assert_eq!(gone, None, "the window stayed");
+        assert_eq!(session, "work", "back on its session");
+        assert!(shown.starts_with("onetwo"), "typed before and after: {shown:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

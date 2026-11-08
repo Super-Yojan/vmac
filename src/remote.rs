@@ -181,14 +181,25 @@ pub fn connect(host: &str, target: Option<String>, restart: bool) -> Result<Clie
              `vmac connect --restart {host}` replaces it, closing them"
         ));
     }
+    let (reader, writer, ssh) = dial(host, &path)?;
+    let mut client = Client::over(reader, writer, target, PathBuf::new(), ssh)?;
+    // A dropped connection (sleep, a network change) is made again.
+    let (host, path) = (host.to_string(), path.clone());
+    client.set_redial(std::sync::Arc::new(move || dial(&host, &path)));
+    Ok(client)
+}
+
+/// A connection to the server on `host`: `ssh HOST PATH proxy`. ssh gives
+/// up on a connection that stops answering for 45 seconds.
+fn dial(host: &str, path: &str) -> Result<crate::daemon::Transport> {
     let mut ssh = Command::new("ssh")
-        .args(["-C", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", host, &path, "proxy"])
+        .args(["-C", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", host, path, "proxy"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()?;
     let (reader, writer) = (ssh.stdout.take().expect("piped"), ssh.stdin.take().expect("piped"));
-    Client::over(Box::new(reader), Box::new(writer), target, PathBuf::new(), Some(ssh))
+    Ok((Box::new(reader), Box::new(writer), Some(ssh)))
 }
 
 #[cfg(test)]
@@ -241,6 +252,38 @@ mod tests {
         eprintln!("{shown}");
         assert!(shown.contains(&format!("HOST={remote_name}")), "the command ran on {remote_name}");
         assert!(shown.contains("main.rs"));
+    }
+
+    /// The ssh connection to VMAC_TEST_HOST dies (its proxy killed there):
+    /// the window reconnects, on the same session.
+    #[test]
+    #[ignore]
+    fn a_dropped_connection_comes_back() {
+        use crate::frame::{Echo, Viewport};
+        use crate::server::Host;
+        let host = std::env::var("VMAC_TEST_HOST").expect("VMAC_TEST_HOST=user@host");
+        let mut client = connect(&host, Some("drop-test".into()), true).unwrap();
+        let view = Viewport { width: 1000., height: 700. };
+        assert_eq!(client.frame(view).session, "drop-test");
+        ssh(&host, "pkill -f '[v]mac proxy'; true").unwrap();
+        let (mut lost, mut back) = (false, false);
+        for _ in 0..300 {
+            client.pump_terminals();
+            let frame = client.frame(view);
+            match &frame.echo {
+                Echo::Message(m) if m.contains("reconnecting") => lost = true,
+                _ if lost && frame.session == "drop-test" && client.gone().is_none() => {
+                    back = true;
+                }
+                _ => {}
+            }
+            if back {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(lost, "it noticed");
+        assert!(back, "and came back on drop-test");
     }
 
     #[test]

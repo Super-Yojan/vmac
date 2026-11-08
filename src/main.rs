@@ -13,6 +13,7 @@ mod lisp;
 mod lsp;
 mod markdown;
 mod packages;
+mod patch;
 mod picker;
 mod frame;
 mod hosts;

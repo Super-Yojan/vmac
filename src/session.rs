@@ -461,8 +461,13 @@ impl Session {
                                     && spans
                                         .get(i.wrapping_sub(lo))
                                         .is_some_and(|l| l.iter().any(|sp| sp.capture == "markup.raw.block")),
+                                // 0, 1, 2... is left for the window to know.
+                                cols: if cols.len() == line.chars().count() + 1 && cols.iter().enumerate().all(|(i, c)| i == *c) {
+                                    Vec::new()
+                                } else {
+                                    cols
+                                },
                                 text: line,
-                                cols,
                             };
                             y += height;
                             out

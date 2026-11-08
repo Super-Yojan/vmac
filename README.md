@@ -272,7 +272,10 @@ checkout with `cargo-zigbuild` it builds one, else it uses
 the release's download. ssh needs to log in without asking (a key, or an agent).
 
 Closing the window detaches; the remote sessions keep running, and the
-next `connect` finds them. What you yank there lands on this machine's
+next `connect` finds them. If the connection drops (the laptop sleeps, the
+network changes), the window says so and connects again, back on the same
+session; `q` gives up. The server sends only what changed on screen, so a
+keystroke costs tens to hundreds of bytes. What you yank there lands on this machine's
 clipboard, and `p` there pastes what you copied here. From inside vmac,
 `SPC S c` or `:connect HOST [TARGET]` adds the machine's sessions to the
 window you're in, beside yours. After updating
