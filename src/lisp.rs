@@ -3861,6 +3861,7 @@ for line in sys.stdin:
         assert_eq!(state(&mut lisp), "normal", "a click ends the selection");
         lisp.eval("(mouse-click 13 2)").unwrap();
         assert_eq!(lisp.selection(), vec![(11, 16)], "a double click selects the word");
+        assert!(editor.lock().whichkey.is_none(), "and leaves no which-key popup open");
         lisp.eval("(mouse-click 13 3)").unwrap();
         assert_eq!(state(&mut lisp), "visual-line", "a triple click, the line");
         // Typing: a click moves the cursor and keeps inserting.

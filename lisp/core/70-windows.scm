@@ -35,13 +35,19 @@
 
 (define (mouse-click pos clicks)
   (completion-close)
+  ;; A click cancels a key sequence half typed (SPC ...).
+  (set! pending-keys "")
+  (set! pending-count "")
   (when (visual?) (set! evil-state 'normal))
   (goto-char pos)
   (cond ((inserting?) #t)
         ((and (= clicks 2) (equal? (buffer-name) tree-buffer)) (call-binding 'tree-activate))
         ((= clicks 2) (for-each (lambda (k) (dispatch-key k k)) '("v" "i" "w")))
         ((>= clicks 3) (dispatch-key "V" "V"))
-        (else (clamp-to-line!))))
+        (else (clamp-to-line!)))
+  ;; Keys typed for it (v i w) open which-key on the i; close it, and any open before.
+  (whichkey-hide)
+  (message ""))
 
 (define (mouse-drag pos)
   (when (not (visual?))
