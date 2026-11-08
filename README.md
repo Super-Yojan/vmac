@@ -273,6 +273,25 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   conversation, `SPC a k` stops the agent, `SPC a o` shows `*agent*`.
   `:agent PROMPT` asks from the command line.
 
+**Two kinds of agent.** ACP agents (`claude`, `codex`, `gemini`) answer
+in `*agent*`, as above. CLI agents run their own interface in a terminal
+beside your code, exactly as in your shell: `claude-cli`, `codex-cli`,
+`gemini-cli` are built in, and you can add any (pi, aider...):
+
+```lua
+vmac.agent_backend("pi", { terminal = "pi" })
+vmac.agent_backend("claude-cli", { terminal = "claude", resume = "claude --resume {id}" })
+```
+
+`SPC a b` picks either kind, and the agent keys work with both: `SPC a a`
+opens it, `SPC a t` shows or hides its pane, `SPC a s` and `SPC a e` send
+it your question with the file and line numbers (a CLI agent reads the
+file itself), `SPC a h` reopens a session (with `resume`). A CLI agent
+writes to disk itself, so vmac reloads the open files it changes and keeps
+what they were: its changes wait for review too (`ga`, `gx`, `SPC a r`).
+Open files that change on disk otherwise (git, another editor) reload too,
+unless you have unsaved edits in them.
+
 **Which agent.** `claude` (Claude Code through
 [claude-code-acp](https://www.npmjs.com/package/@zed-industries/claude-code-acp),
 installed or run with `npx`, using your `claude` login) is the default;
@@ -391,6 +410,10 @@ it uses the theme's monospace font. `:font NAME` changes it, `:fonts` or
 `vmac.set_font("...")` sets it from your config.
 
 ## Customizing
+
+Newer features are written in Lua, in `lua/core/` (built in, loaded
+before plugins and your config, so either can change them); the older core
+is Scheme, in `lisp/core/`. Both call the same primitives.
 
 The core, init.scm and init.lua are watched: save any of them and vmac
 reloads, keeping your buffers. If a save doesn't load, vmac shows the error and keeps running

@@ -21,11 +21,17 @@ use std::sync::{Arc, Mutex};
 pub const PROTOCOL_VERSION: u64 = 1;
 
 /// How to start an agent: a program and its arguments.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// A CLI agent with its own interface (claude, codex, pi...), run in a
+    /// terminal beside your code, rather than an ACP agent in *agent*.
+    pub terminal: bool,
+    /// For a CLI agent: the command that reopens a past session, `{id}`
+    /// standing for its id ("claude --resume {id}"). Empty: it can't.
+    pub resume: String,
 }
 
 impl AgentConfig {
@@ -33,7 +39,15 @@ impl AgentConfig {
     pub fn parse(name: &str, line: &str) -> Option<Self> {
         let mut words = line.split_whitespace().map(str::to_string);
         let command = words.next()?;
-        Some(Self { name: name.to_string(), command, args: words.collect() })
+        Some(Self { name: name.to_string(), command, args: words.collect(), ..Default::default() })
+    }
+
+    /// A CLI agent: `line` runs it in a terminal; `resume` reopens a session.
+    pub fn cli(name: &str, line: &str, resume: &str) -> Option<Self> {
+        let mut config = Self::parse(name, line)?;
+        config.terminal = true;
+        config.resume = resume.trim().to_string();
+        Some(config)
     }
 
     /// The agents vmac knows: Claude Code, Codex and Gemini CLI.
@@ -54,12 +68,13 @@ impl AgentConfig {
     /// Claude Code: the adapter when it's installed, else through npx.
     pub fn claude() -> Self {
         if on_path("claude-code-acp") {
-            Self { name: "claude".into(), command: "claude-code-acp".into(), args: vec![] }
+            Self { name: "claude".into(), command: "claude-code-acp".into(), ..Default::default() }
         } else {
             Self {
                 name: "claude".into(),
                 command: "npx".into(),
                 args: vec!["-y".into(), "@zed-industries/claude-code-acp".into()],
+                ..Default::default()
             }
         }
     }
@@ -1235,7 +1250,7 @@ while True:
         std::fs::create_dir_all(dir).unwrap();
         let script = dir.join("agent.py");
         std::fs::write(&script, FAKE_AGENT).unwrap();
-        AgentConfig { name: "fake".into(), command: "python3".into(), args: vec![script.display().to_string()] }
+        AgentConfig { name: "fake".into(), command: "python3".into(), args: vec![script.display().to_string()], ..Default::default() }
     }
 
     fn wait_until(agent: &mut Agent, done: impl Fn(&Agent) -> bool) -> bool {
@@ -1271,12 +1286,13 @@ while True:
     fn a_missing_or_crashing_agent_says_so() {
         let dir = std::env::temp_dir().join(format!("vmac-agent-gone-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let config = AgentConfig { name: "x".into(), command: "vmac-no-such-agent".into(), args: vec![] };
+        let config = AgentConfig { name: "x".into(), command: "vmac-no-such-agent".into(), ..Default::default() };
         assert!(Agent::start(config, &dir).is_err());
         let config = AgentConfig {
             name: "crash".into(),
             command: "sh".into(),
             args: vec!["-c".into(), "echo broken >&2; exit 1".into()],
+            ..Default::default()
         };
         let mut agent = Agent::start(config, &dir).unwrap();
         assert!(wait_until(&mut agent, |a| a.state == State::Exited));

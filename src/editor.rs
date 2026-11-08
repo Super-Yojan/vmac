@@ -350,6 +350,10 @@ pub struct EditorState {
     agent_lines: Vec<crate::agent::Target>,
     /// Terminals the agent asked for (terminal/create), by its ids.
     agent_terms: Vec<AgentTerm>,
+    /// The CLI agent's terminal (a CLI backend: claude, codex, pi...).
+    agent_cli: Option<BufferId>,
+    /// When each open file last changed on disk, to notice others' changes.
+    file_stamps: std::collections::HashMap<PathBuf, std::time::SystemTime>,
     /// Where Claude Code keeps its sessions; the sessions last offered to
     /// reopen, and whether they came from there.
     pub claude_dir: Option<PathBuf>,
@@ -497,6 +501,8 @@ impl EditorState {
             agent_asked: 0,
             agent_lines: Vec::new(),
             agent_terms: Vec::new(),
+            agent_cli: None,
+            file_stamps: Default::default(),
             claude_dir: crate::sessions::claude_dir(),
             session_choices: Vec::new(),
             sessions_from_claude: false,
@@ -560,6 +566,12 @@ impl EditorState {
             Some(id) => id,
             None => self.add_buffer(Buffer::new(name)),
         }
+    }
+
+    /// The text of the buffer called `name`, if there is one.
+    #[cfg(test)]
+    pub fn buffer_text_named(&self, name: &str) -> Option<String> {
+        self.buffers.iter().find(|(_, b)| b.name() == name).map(|(_, b)| b.text().to_string())
     }
 
     pub fn buffer_ids(&self) -> Vec<BufferId> {
@@ -1180,6 +1192,10 @@ impl EditorState {
     /// Shows the agent buffer: in the window already showing it, else in a
     /// new window on the right.
     pub fn agent_show(&mut self) {
+        if self.agent_config.terminal {
+            self.agent_cli_open(None, None);
+            return;
+        }
         let id = self.agent_buffer_id();
         self.agent_refresh();
         if let Some(w) = self.windows.iter().find(|w| w.buffer == id && !self.is_sidebar(w.id)).map(|w| w.id) {
@@ -1194,6 +1210,10 @@ impl EditorState {
 
     /// Sends the agent a prompt, starting it if needed.
     pub fn agent_prompt(&mut self, text: &str) {
+        if self.agent_config.terminal {
+            self.agent_cli_send(text);
+            return;
+        }
         if text.trim().is_empty() {
             return;
         }
@@ -1238,6 +1258,26 @@ impl EditorState {
     /// SPC a e: asks about the selected file's problems (the language
     /// server's diagnostics), with the file attached.
     pub fn agent_ask_about_problems(&mut self, question: &str) {
+        if self.agent_config.terminal {
+            let Some(path) = self.buffer().file().cloned() else {
+                self.message = "This buffer has no file".into();
+                return;
+            };
+            let diagnostics = self.lsp.diagnostics(&path).to_vec();
+            if diagnostics.is_empty() {
+                self.message = "No problems reported in this file".into();
+                return;
+            }
+            let root = self.agent_root();
+            let name = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+            let list: Vec<String> = diagnostics
+                .iter()
+                .map(|d| format!("line {}: {}: {}", d.start.0 + 1, d.severity_name(), d.message.lines().next().unwrap_or("")))
+                .collect();
+            let question = if question.trim().is_empty() { "Fix these problems." } else { question.trim() };
+            self.agent_cli_send(&format!("{question} The language server reports in {name}: {}", list.join("; ")));
+            return;
+        }
         let Some(path) = self.buffer().file().cloned() else {
             self.message = "This buffer has no file".into();
             return;
@@ -1278,6 +1318,11 @@ impl EditorState {
 
     /// Stops the agent; the next prompt starts a new one.
     pub fn agent_stop(&mut self) {
+        if self.agent_config.terminal {
+            self.agent_cli_kill();
+            self.message = "Agent stopped".into();
+            return;
+        }
         self.agent_kill_terminals();
         if self.agent.take().is_some() {
             self.message = "Agent stopped".into();
@@ -1286,6 +1331,13 @@ impl EditorState {
 
     pub fn agent_status(&self) -> String {
         use crate::agent::State;
+        if self.agent_config.terminal {
+            return match self.agent_cli.and_then(|id| self.terminals.iter().find(|t| t.buffer == id)) {
+                Some(t) if !t.exited => "running".into(),
+                Some(_) => "stopped".into(),
+                None => "off".into(),
+            };
+        }
         match self.agent.as_ref().map(|a| a.state) {
             None => "off".into(),
             Some(State::Starting) => "starting".into(),
@@ -1370,6 +1422,20 @@ impl EditorState {
         }
     }
 
+    /// Adds (or replaces) a CLI agent backend: run in a terminal beside
+    /// your code; `resume` reopens a session (`{id}` for its id).
+    pub fn agent_define_cli(&mut self, name: &str, command: &str, resume: &str) -> bool {
+        let Some(config) = crate::agent::AgentConfig::cli(name, command, resume) else { return false };
+        if self.agent_config.name == name {
+            self.agent_config = config.clone();
+        }
+        match self.agent_backends.iter_mut().find(|b| b.name == name) {
+            Some(b) => *b = config,
+            None => self.agent_backends.push(config),
+        }
+        true
+    }
+
     /// Adds (or replaces) an agent backend: a name and its command line.
     pub fn agent_define(&mut self, name: &str, command: &str) -> bool {
         let Some(config) = crate::agent::AgentConfig::parse(name, command) else { return false };
@@ -1393,7 +1459,8 @@ impl EditorState {
     /// Reads what the agent sent, answers its requests, and redraws its
     /// buffer. Returns whether anything changed.
     pub fn agent_pump(&mut self) -> bool {
-        let Some(agent) = self.agent.as_mut() else { return false };
+        let watched = self.watch_files();
+        let Some(agent) = self.agent.as_mut() else { return watched | self.review_refresh(false) };
         let mut changed = agent.pump();
         let requests = agent.take_requests();
         for request in requests {
@@ -1626,6 +1693,127 @@ impl EditorState {
         b.undo_boundary();
         b.save()?;
         Ok(())
+    }
+
+    // ---- CLI agents: their own interface, in a terminal beside your code
+
+    /// The CLI agent's terminal, while its program runs.
+    fn agent_cli_alive(&mut self) -> Option<BufferId> {
+        let id = self.agent_cli?;
+        let alive = self.terminals.iter_mut().find(|t| t.buffer == id).is_some_and(|t| match &mut t.backend {
+            TermBackend::Local(pty) => pty.alive(),
+            _ => false,
+        });
+        alive.then_some(id)
+    }
+
+    pub fn agent_cli_here(&self) -> bool {
+        self.agent_cli.is_some() && self.agent_cli == Some(self.window().buffer)
+    }
+
+    /// Shows the CLI agent in a window on the right, starting it (its own
+    /// command, or `command`, in the project or `cwd`) unless it runs.
+    pub fn agent_cli_open(&mut self, command: Option<String>, cwd: Option<PathBuf>) -> bool {
+        let id = match self.agent_cli_alive() {
+            Some(id) if command.is_none() => id,
+            _ => {
+                self.agent_cli_kill();
+                let line = command.unwrap_or_else(|| self.agent_config.line());
+                let cwd = cwd.unwrap_or_else(|| self.agent_root());
+                match crate::terminal::LocalPty::start(&line, &cwd, 40, 100) {
+                    Ok(pty) => {
+                        let mut buffer = Buffer::new(format!("*{}*", self.agent_config.name));
+                        buffer.set_read_only(true);
+                        let id = self.add_buffer(buffer);
+                        self.terminals.push(Terminal { buffer: id, backend: TermBackend::Local(pty), exited: false });
+                        self.agent_cli = Some(id);
+                        id
+                    }
+                    Err(e) => {
+                        self.message = format!("{line}: {e}");
+                        return false;
+                    }
+                }
+            }
+        };
+        match self.windows.iter().find(|w| w.buffer == id && !self.is_sidebar(w.id)).map(|w| w.id) {
+            Some(w) => self.select_window(w),
+            None if self.window().buffer != id => {
+                self.split_window(Axis::Row);
+                self.show_buffer(id);
+            }
+            None => {}
+        }
+        true
+    }
+
+    /// Types a line to the CLI agent and presses return, starting it first.
+    pub fn agent_cli_send(&mut self, text: &str) {
+        if !self.agent_cli_open(None, None) {
+            return;
+        }
+        let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let Some(id) = self.agent_cli else { return };
+        if let Some(TermBackend::Local(pty)) = self.terminals.iter_mut().find(|t| t.buffer == id).map(|t| &mut t.backend) {
+            pty.send(line.as_bytes());
+            pty.send(b"\r");
+        }
+        self.message = format!("Sent to {}", self.agent_config.name);
+    }
+
+    /// Stops the CLI agent (its buffer stays, to read).
+    fn agent_cli_kill(&mut self) {
+        let Some(id) = self.agent_cli.take() else { return };
+        if let Some(t) = self.terminals.iter_mut().find(|t| t.buffer == id) {
+            if let TermBackend::Local(pty) = &mut t.backend {
+                pty.kill();
+            }
+            t.exited = true;
+        }
+    }
+
+    /// Files changed on disk by something else (a CLI agent, git, another
+    /// editor): an open buffer without unsaved edits takes the new text,
+    /// keeping its cursor. While a CLI agent runs, its changes wait for
+    /// review, as an ACP agent's do. Returns whether a buffer changed.
+    fn watch_files(&mut self) -> bool {
+        let cli = self.agent_config.terminal && self.agent_cli_alive().is_some();
+        let files: Vec<(BufferId, PathBuf)> = self
+            .buffers
+            .iter()
+            .filter(|(_, b)| !b.is_read_only())
+            .filter_map(|(id, b)| Some((*id, b.file()?.clone())))
+            .collect();
+        let mut changed = false;
+        for (id, path) in files {
+            let Ok(stamp) = std::fs::metadata(&path).and_then(|m| m.modified()) else { continue };
+            match self.file_stamps.insert(path.clone(), stamp) {
+                None => continue,
+                Some(before) if before == stamp => continue,
+                Some(_) => {}
+            }
+            let Ok(disk) = std::fs::read_to_string(&path) else { continue };
+            let review = cli && self.agent_review && !self.reviews.iter().any(|r| r.path == path);
+            let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("listed above").1;
+            if *b.text() == disk.as_str() {
+                continue;
+            }
+            if b.is_modified() {
+                self.message = format!("{} changed on disk; your unsaved edits are kept", b.name());
+                continue;
+            }
+            if review {
+                let base = b.text().to_string();
+                self.reviews.push(crate::review::Review::new(path.clone(), base));
+            }
+            let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("listed above").1;
+            b.undo_boundary();
+            replace_changed(b, &disk);
+            b.undo_boundary();
+            b.mark_saved();
+            changed = true;
+        }
+        changed
     }
 
     // ---- Reviewing the agent's changes
@@ -1964,6 +2152,10 @@ impl EditorState {
 
     /// Shows the agent buffer with the point at the end of the prompt.
     pub fn agent_focus_prompt(&mut self) {
+        if self.agent_config.terminal {
+            self.agent_cli_open(None, None);
+            return;
+        }
         self.agent_show();
         let b = self.buffer_mut();
         let end = b.len();
@@ -2047,6 +2239,19 @@ impl EditorState {
     /// Asks about lines of the selected buffer: sends the question with the
     /// file, the line numbers and the text.
     pub fn agent_ask_about(&mut self, start: usize, end: usize, question: &str) {
+        if self.agent_config.terminal {
+            let b = self.buffer();
+            let (first, last) = (b.line_of(start), b.line_of(end.saturating_sub(1).max(start)));
+            let root = self.agent_root();
+            let name = match b.file() {
+                Some(f) => f.strip_prefix(&root).unwrap_or(f).display().to_string(),
+                None => b.name().to_string(),
+            };
+            let place = if first == last { format!("{name} line {}", first + 1) } else { format!("{name} lines {}-{}", first + 1, last + 1) };
+            let question = if question.trim().is_empty() { "Explain this code." } else { question.trim() };
+            self.agent_cli_send(&format!("{question} (in {place})"));
+            return;
+        }
         let b = self.buffer();
         let (first, last) = (b.line_of(start), b.line_of(end.saturating_sub(1).max(start)));
         let code = b.substring(b.line_to_pos(first), b.line_end(b.line_to_pos(last)));
@@ -2077,11 +2282,15 @@ impl EditorState {
     pub fn agent_sessions(&mut self, all: bool) {
         let project = self.agent_root();
         let filter = (!all).then_some(project.as_path());
-        if self.agent_config.name == "claude"
+        if self.agent_config.name.starts_with("claude")
             && let Some(dir) = self.claude_dir.clone()
         {
             let list = crate::sessions::claude_sessions(&dir, filter);
             self.offer_sessions(list, true);
+            return;
+        }
+        if self.agent_config.terminal {
+            self.message = format!("{} can't list its sessions here", self.agent_config.name);
             return;
         }
         if let Err(e) = self.agent_start() {
@@ -2129,6 +2338,17 @@ impl EditorState {
             self.message = format!("{} is gone", session.cwd.display());
             return;
         }
+        // A CLI agent reopens it with its own resume command, in its folder.
+        if self.agent_config.terminal {
+            if self.agent_config.resume.is_empty() {
+                self.message = format!("{} has no resume command", self.agent_config.name);
+                return;
+            }
+            let command = self.agent_config.resume.replace("{id}", &session.id);
+            self.agent_cli_kill();
+            self.agent_cli_open(Some(command), Some(session.cwd.clone()));
+            return;
+        }
         let config = if self.sessions_from_claude {
             self.agent_backends.iter().find(|b| b.name == "claude").cloned().unwrap_or_else(crate::agent::AgentConfig::claude)
         } else {
@@ -2156,6 +2376,11 @@ impl EditorState {
 
     /// A new conversation: stops the agent and starts it again.
     pub fn agent_new_session(&mut self) {
+        if self.agent_config.terminal {
+            self.agent_cli_kill();
+            self.agent_cli_open(None, None);
+            return;
+        }
         self.agent_kill_terminals();
         self.agent = None;
         if let Err(e) = self.agent_start() {

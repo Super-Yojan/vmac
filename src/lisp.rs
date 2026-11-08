@@ -16,6 +16,31 @@ use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 
+/// The Lua core (lua/core/): newer features, written in Lua. Built in, like
+/// the Scheme core; read from the repo's lua/core/ when running from a
+/// checkout, so edits there load on the next start.
+const LUA_CORE_FILES: &[(&str, &str)] = &[
+    ("agents.lua", include_str!("../lua/core/agents.lua")),
+];
+
+/// The Lua core's files, in name order: (name, code).
+fn lua_core_files() -> Vec<(String, String)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/core");
+    let mut from_disk: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "lua"))
+        .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), std::fs::read_to_string(&p).ok()?)))
+        .collect();
+    if from_disk.is_empty() {
+        return LUA_CORE_FILES.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect();
+    }
+    from_disk.sort();
+    from_disk
+}
+
 /// The core, one file per area (lisp/core/), built into the binary for
 /// running outside a checkout. They load as one program, in name order, so
 /// a function may call one defined in a later file.
@@ -238,6 +263,17 @@ impl Lisp {
             .filter_map(|p| Some((Some(p.name.clone()), p.lua.clone()?, Some(p.lua_root()))));
         for (i, path) in self.lua_sources.clone().iter().enumerate() {
             self.lua_stamps[i] = path.metadata().ok().and_then(|m| m.modified().ok());
+        }
+        // The Lua core first (lua/core/), so plugins and your config can change it.
+        for (name, code) in lua_core_files() {
+            let result = {
+                let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+                lua.load(code.as_str()).set_name(&name).exec()
+            };
+            self.run_pending_scheme();
+            if let Err(e) = result {
+                errors.push((None, format!("{name}: {}", first_line(&e))));
+            }
         }
         let user_files = self.lua_sources.clone().into_iter().map(|p| (None, p, None));
         for (plugin, path, root) in plugin_files.chain(user_files).collect::<Vec<_>>() {
@@ -981,8 +1017,14 @@ end
 --   alive(handle) -> bool     (optional)
 --   kill(handle)              (optional; also called for attached terminals)
 -- Agent backends: vmac.agent_backend("codex", { command = "codex-acp" })
--- (or just the command line), then vmac.agent_use("codex") or SPC a b.
+-- (or just the command line) for an ACP agent in *agent*, or
+-- { terminal = "pi", resume = "pi --resume {id}" } for a CLI agent in a
+-- terminal beside your code; then vmac.agent_use("codex") or SPC a b.
 function vmac.agent_backend(name, spec)
+  if type(spec) == "table" and spec.terminal then
+    vmac.agent_define_cli(name, spec.terminal, spec.resume or "")
+    return
+  end
   local command = type(spec) == "table" and spec.command or spec
   vmac.agent_define(name, command)
 end
@@ -1675,6 +1717,16 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         }
     });
     prim!(reg, editor, "agent-use", |s, name: String| s.agent_use(&name));
+    // CLI agents: (agent-define-cli "pi" "pi" "") — run in a terminal beside your code.
+    prim!(reg, editor, "agent-define-cli", |s, name: String, line: String, resume: String| {
+        if !s.agent_define_cli(&name, &line, &resume) {
+            s.message = format!("agent-define-cli {name}: needs a command");
+        }
+    });
+    prim!(reg, editor, "agent-kind", |s| if s.agent_config.terminal { "cli".to_string() } else { "acp".to_string() });
+    prim!(reg, editor, "agent-cli-open", |s| s.agent_cli_open(None, None));
+    prim!(reg, editor, "agent-cli-here?", |s| s.agent_cli_here());
+    prim!(reg, editor, "agent-cli-send", |s, text: String| s.agent_cli_send(&text));
     prim!(reg, editor, "agent-backends", |s| s.agent_backends.iter().map(|b| b.name.clone()).collect::<Vec<_>>());
     prim!(reg, editor, "agent-backend", |s| s.agent_config.name.clone());
     prim!(reg, editor, "agent-permit-kind", |s, kind: String| s.agent_permit_kind(&kind));
@@ -3530,6 +3582,102 @@ mod tests {
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("earlier question cli-session-7"))),
             "the agent was asked to load Claude's session by its id: {:?}", editor.lock().agent.as_ref().map(|a| a.transcript()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cli_agents_run_beside_the_code_and_their_edits_wait_for_review() {
+        let dir = std::env::temp_dir().join(format!("vmac-cli-agent-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        // A CLI agent: says what it got; "edit F" rewrites F; --resume ID says so.
+        let script = dir.join("cli.py");
+        std::fs::write(&script, r#"
+import sys
+if len(sys.argv) > 2 and sys.argv[1] == "--resume":
+    print("resumed " + sys.argv[2], flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    print("got: " + line, flush=True)
+    if line.startswith("edit "):
+        open(line[5:], "w").write("EDITED\n")
+"#).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&file).unwrap();
+
+        // The Lua core defines the CLI agents.
+        let names = lisp.eval("(agent-backends)").unwrap();
+        assert!(names.contains("claude-cli") && names.contains("codex-cli"), "{names}");
+        lisp.eval_lua(&format!("vmac.agent_backend('fakecli', {{ terminal = 'python3 {}' }})", script.display())).unwrap();
+        lisp.eval("(agent-use \"fakecli\")").unwrap();
+        assert_eq!(lisp.eval("(agent-kind)").unwrap(), "\"cli\"");
+
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
+            for _ in 0..250 {
+                lisp.pump_terminals();
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&mut editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let cli_text = |s: &mut EditorState| s.buffer_text_named("*fakecli*").unwrap_or_default();
+
+        // SPC a a: its pane on the right, typing to it.
+        typed(&mut lisp, " aa");
+        assert_eq!(editor.lock().buffer().name(), "*fakecli*");
+        assert_eq!(lisp.eval("(terminal-insert?)").unwrap(), "#true");
+        assert_eq!(editor.lock().agent_status(), "running");
+        lisp.dispatch_key("ESC", "");
+
+        // SPC a s on a line of a.txt: the question and the place, in one line.
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, "j as");
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| cli_text(s).contains("got: Explain this code. (in a.txt line 2)")), "{}", cli_text(&mut editor.lock()));
+
+        // It edits a.txt on disk: the buffer follows, and the change waits for review.
+        editor.lock().agent_cli_send("edit a.txt");
+        assert!(pump(&mut lisp, &|s| s.buffer_text_named("a.txt").as_deref() == Some("EDITED\n")), "{:?}", editor.lock().buffer_text_named("a.txt"));
+        assert!(editor.lock().review_count() > 0, "its change waits for review");
+        editor.lock().open_file(&file).unwrap();
+        assert!(!editor.lock().buffer().is_modified(), "reloaded, not an unsaved edit");
+        typed(&mut lisp, "gg]h");
+        typed(&mut lisp, "gx");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n", "rejected: the old text is back");
+
+        // SPC a t hides its pane (from it), and shows it again.
+        lisp.eval("(agent-cli-open)").unwrap();
+        assert!(editor.lock().agent_cli_here());
+        typed(&mut lisp, " at");
+        assert!(!editor.lock().agent_cli_here());
+        typed(&mut lisp, " at");
+        assert!(editor.lock().agent_cli_here());
+        typed(&mut lisp, " ak");
+        assert_eq!(editor.lock().agent_status(), "off", "stopped, as an ACP agent's stop reads");
+
+        // A Claude-style CLI reopens a session with its resume command.
+        let projects = dir.join("claude-projects");
+        std::fs::create_dir_all(projects.join("-p")).unwrap();
+        std::fs::write(
+            projects.join("-p").join("sess-42.jsonl"),
+            format!("{}\n", serde_json::json!({ "type": "user", "cwd": dir.display().to_string(), "message": { "content": "earlier" } })),
+        )
+        .unwrap();
+        editor.lock().claude_dir = Some(projects);
+        let line = format!("python3 {}", script.display());
+        lisp.eval_lua(&format!("vmac.agent_backend('claude-cli', {{ terminal = '{line}', resume = '{line} --resume {{id}}' }})")).unwrap();
+        lisp.eval("(agent-use \"claude-cli\")").unwrap();
+        lisp.eval("(call-binding 'agent-history-all)").unwrap();
+        lisp.run_events();
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.buffer_text_named("*claude-cli*").is_some_and(|t| t.contains("resumed sess-42"))),
+            "{:?}", editor.lock().buffer_text_named("*claude-cli*"));
+        typed(&mut lisp, " ak");
         std::fs::remove_dir_all(&dir).ok();
     }
 

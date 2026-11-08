@@ -115,6 +115,12 @@ impl Buffer {
         Ok(path)
     }
 
+    /// The text now matches the file (it was reloaded from it).
+    pub fn mark_saved(&mut self) {
+        self.modified = false;
+        self.saves += 1;
+    }
+
     pub fn set_name(&mut self, name: String) {
         self.name = name;
     }
