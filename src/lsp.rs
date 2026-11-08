@@ -5,7 +5,7 @@
 //! reads its output into a channel, and the editor drains it (`pump`) on a
 //! timer. Documents are synced whole (open, change, save, close).
 //!
-//! Which server runs for which language comes from Scheme's `(lsp-servers)`.
+//! Which server runs for which language comes from Lua's `core.lsp_servers()`.
 
 use ropey::Rope;
 use serde_json::{Value, json};

@@ -46,11 +46,15 @@ impl Session {
         &self.editor
     }
 
-    /// Runs a command by name (Scheme's or Lua's), as a key bound to it would.
+    /// Evaluates Lua in this session.
+    #[cfg(test)]
+    pub fn eval(&mut self, code: &str) -> Result<String, String> {
+        self.lisp.eval(code)
+    }
+
+    /// Runs a command by name, as a key bound to it would.
     pub fn run_command(&mut self, name: &str) {
-        if let Err(e) = self.lisp.eval(&format!("(call-binding '{name})")) {
-            self.editor.lock().message = format!("{name}: {}", e.lines().next().unwrap_or(""));
-        }
+        self.lisp.run_command(name);
     }
 
     // ---- Work that happens on its own (the window calls these on timers)
@@ -132,9 +136,9 @@ impl Session {
         }
     }
 
-    /// Runs a mouse call in Scheme; its error, if any, in the echo area.
-    fn mouse_call(&mut self, code: &str) {
-        if let Err(e) = self.lisp.eval(code) {
+    /// Runs a mouse call in Lua (`core[name]`); its error, if any, in the echo area.
+    fn mouse_call(&mut self, name: &str, args: impl mlua::IntoLuaMulti) {
+        if let Err(e) = self.lisp.call::<()>(name, args) {
             self.editor.lock().message = format!("mouse: {}", e.lines().next().unwrap_or(""));
         }
     }
@@ -155,7 +159,7 @@ impl Session {
             if taken {
                 self.drag = Some(Drag { window, terminal: Some(button), last: (line, col) });
                 // Typing goes to the program you clicked in.
-                self.mouse_call("(set! evil-state 'insert)");
+                self.mouse_call("enter_state", "insert");
                 return;
             }
         }
@@ -173,7 +177,7 @@ impl Session {
             return;
         }
         self.drag = Some(Drag { window, terminal: None, last: (pos, 0) });
-        self.mouse_call(&format!("(mouse-click {pos} {})", clicks.max(1)));
+        self.mouse_call("mouse_click", (pos, clicks.max(1)));
     }
 
     fn mouse_drag(&mut self, window: WindowId, (line, col, ch): (usize, usize, usize), mods: Mods) {
@@ -199,7 +203,7 @@ impl Session {
         };
         if pos != drag.last.0 {
             self.drag = Some(Drag { last: (pos, 0), ..drag });
-            self.mouse_call(&format!("(mouse-drag {pos})"));
+            self.mouse_call("mouse_drag", pos);
         }
     }
 
@@ -344,7 +348,7 @@ impl Session {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // Faces Scheme put on the text (the tree's folders, ...).
+                    // Faces Lua put on the text (the tree's folders, ...).
                     out.extend(buffer.faces().iter().filter(|f| f.0 < start + line_len && f.1 > start).map(
                         |(a, b, face)| (a.saturating_sub(start), b.saturating_sub(start), resolve_face(face, &face_specs)),
                     ));
@@ -469,7 +473,7 @@ impl Session {
                 if is_custom {
                     custom.insert(*id);
                 }
-                // The selected window's modeline comes from Scheme; others show their buffer.
+                // The selected window's modeline comes from Lua; others show their buffer.
                 let modeline = match is_selected.then(|| modeline.take()).flatten() {
                     Some(segments) => segments.into_iter().map(|s| Segment { text: s.text, face: s.face }).collect(),
                     None => vec![Segment { text: buffer.name().to_string(), face: "dim".into() }],
@@ -743,8 +747,7 @@ mod tests {
         buf.insert(text);
         buf.goto_char(0);
         let editor = Editor::new(buf);
-        let core = crate::lisp::Source { label: "core".into(), path: None };
-        Session::new(editor.clone(), Lisp::new(editor, vec![core]))
+        Session::new(editor.clone(), Lisp::new(editor))
     }
 
     fn key(s: &mut Session, k: &str) {

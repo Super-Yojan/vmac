@@ -599,7 +599,7 @@ fn line_element(view: LineView, bar: bool, cx: &App) -> impl IntoElement {
     let chars: Vec<char> = text.chars().collect();
     let in_sel = |col: usize| selected.is_some_and(|(a, b)| col >= a && col < b);
     let in_match = |col: usize| matches.iter().any(|&(a, b)| col >= a && col < b);
-    // Later styles win: Scheme's faces over syntax.
+    // Later styles win: Lua's faces over syntax.
     let style = |col: usize| styles.iter().rev().find(|&&(a, b, _)| col >= a && col < b).map(|s| s.2);
     let cell = |col: usize| Cell {
         selected: in_sel(col),

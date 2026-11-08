@@ -399,22 +399,23 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::editor::Editor;
     use crate::frame::Content;
-    use crate::lisp::{Lisp, Source};
+    use crate::lisp::Lisp;
 
     fn fresh() -> Session {
         let editor = Editor::new(Buffer::new("*scratch*"));
-        Session::new(editor.clone(), Lisp::new(editor, vec![Source { label: "core".into(), path: None }]))
+        Session::new(editor.clone(), Lisp::new(editor))
     }
 
     fn server() -> Server {
         Server::new(fresh(), Box::new(fresh))
     }
 
+    /// Runs Lua in the active session, after a harmless key (as a command
+    /// would run it), then what it asked of the server.
     fn eval_lua(server: &mut Server, code: &str) {
-        let editor = server.active_session().editor().clone();
-        editor.lock().pending_scheme.push(format!("(lua-eval {code:?})"));
-        // Queued Scheme runs after the next command; a harmless key runs it.
         server.handle(Input::Key { key: "ESC".into(), text: String::new() });
+        server.active_session().eval(code).unwrap();
+        server.serve_requests();
     }
 
     fn project(dir: &std::path::Path, name: &str) -> PathBuf {

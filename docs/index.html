@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>vmac: the editor for people who write code</title>
-<meta name="description" content="vmac is a modal, Vim-style editor on GPUI for people who enjoy writing code, with just enough assistant beside it that you never leave for the browser. Every key and panel is Scheme or Lua you can change while it runs.">
+<meta name="description" content="vmac is a modal, Vim-style editor on GPUI for people who enjoy writing code, with just enough assistant beside it that you never leave for the browser. Every key and panel is Lua you can change while it runs.">
 <link rel="icon" href="logo.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -435,11 +435,11 @@
       <div class="bar"><span class="label">Core / Modal</span><span class="label"><i class="dot"></i> Open source</span></div>
       <div class="intro">
         <h2>Vim's keys. A GPU underneath. Yours to rewrite.</h2>
-        <p>The core is small Rust: buffers, windows, language servers and drawing, on GPUI. Every command, key and panel is Scheme or Lua in <code>lisp/core/</code>, and you can redefine any of it while vmac runs.</p>
+        <p>The core is small Rust: buffers, windows, language servers and drawing, on GPUI. Every command, key and panel is Lua in <code>lua/core/</code>, and you can redefine any of it while vmac runs.</p>
         <p class="side">Save your config and it reloads. A mistake keeps the last version that worked.</p>
       </div>
       <div class="cells">
-        <div><span class="label">Configure in</span><div class="v">Scheme or Lua</div></div>
+        <div><span class="label">Configure in</span><div class="v">Lua</div></div>
         <div><span class="label">Reloads</span><div class="v">On save</div></div>
         <div><span class="label">Runs on</span><div class="v">macOS · GPUI</div></div>
         <a class="go" href="https://github.com/Super-Yojan/vmac/tree/master/lisp/core">Read the core <span>↗</span></a>
@@ -534,7 +534,7 @@
           <div class="card-head"><div class="num"><b>05</b><span>Never leave it</span></div></div>
           <div class="rows">
             <div><span class="label">Terminals</span><span>searchable scrollback</span></div>
-            <div><span class="label">Plugins</span><span>from git, in Scheme or Lua</span></div>
+            <div><span class="label">Plugins</span><span>from git, in Lua</span></div>
             <div><span class="label">Mac app</span><span>Spotlight, Dock</span></div>
           </div>
         </article>
@@ -578,7 +578,7 @@
           <div class="bar"><span class="label">Series / 07</span><span class="label"><i class="dot"></i> Review</span></div>
           <div class="shot"><pre><span class="c-d">*agent-review*</span>
 <span class="c-d">────────────────────────────────────────</span>
-src/modeline.scm  <span class="c-d">(2 changes)</span>
+src/modeline.lua  <span class="c-d">(2 changes)</span>
 <span class="c-f">@@ line 12</span>
 <span class="c-r">- (list mode name position)</span>
 <span class="c-s">+ (list mode name (word-count) position)</span>
@@ -596,7 +596,7 @@ src/modeline.scm  <span class="c-d">(2 changes)</span>
             <div><span class="label">Accept · reject</span><span><kbd>ga</kbd> <kbd>gx</kbd>, one <kbd>u</kbd> undoes</span></div>
             <div><span class="label">Permission</span><span>asked, with the plan shown</span></div>
             <div><span class="label">Its commands</span><span>in terminals you can watch</span></div>
-            <div><span class="label">Rules · hooks</span><span>in Scheme or Lua</span></div>
+            <div><span class="label">Rules · hooks</span><span>in Lua</span></div>
           </div>
         </article>
       </div>
@@ -624,7 +624,7 @@ src/modeline.scm  <span class="c-d">(2 changes)</span>
       <div class="steps">
         <div class="step"><span class="label">Step / 01</span><h3>Install</h3><p>Run the installer, or the cargo line yourself.</p></div>
         <div class="step"><span class="label">Step / 02</span><h3>Open a file</h3><p><code>vmac FILE</code> starts in normal state; plain <code>vmac</code> opens the dashboard. <kbd>SPC</kbd> is the leader, as in Doom Emacs.</p></div>
-        <div class="step"><span class="label">Step / 03</span><h3>Configure</h3><p>Write <code>init.lua</code> or <code>init.scm</code> in <code>~/.config/vmac/</code>: commands, keys, the modeline, faces, themes, servers.</p></div>
+        <div class="step"><span class="label">Step / 03</span><h3>Configure</h3><p>Write <code>init.lua</code> in <code>~/.config/vmac/</code>: commands, keys, the modeline, faces, themes, servers.</p></div>
         <div class="step"><span class="label">Step / 04</span><h3>Extend</h3><p>Plugins from git, or a folder of your own in <code>plugins/</code>. <kbd>SPC h p</kbd> manages them.</p></div>
       </div>
       <div class="cards">
@@ -645,20 +645,21 @@ vmac.hooks.agent_permission = <span class="c-k">function</span>(title, kind)
 <span class="c-k">end</span></pre></div>
         </article>
         <article class="card">
-          <div class="bar"><span class="label">Config / Scheme</span><span class="label">~/.config/vmac/init.scm</span></div>
-          <div class="shot" style="aspect-ratio: auto"><pre><span class="c-d">;; SPC t z: just this window.</span>
-(<span class="c-k">defcommand</span> (<span class="c-f">zen</span>)
-  (delete-other-windows))
-(define-key normal-map <span class="c-s">"SPC t z"</span> 'zen)
+          <div class="bar"><span class="label">Config / Lua</span><span class="label">~/.config/vmac/init.lua</span></div>
+          <div class="shot" style="aspect-ratio: auto"><pre><span class="c-d">-- SPC t z: just this window.</span>
+vmac.<span class="c-f">command</span>(<span class="c-s">"zen"</span>, <span class="c-k">function</span>() vmac.delete_other_windows() <span class="c-k">end</span>)
+vmac.<span class="c-f">map</span>(<span class="c-s">"normal"</span>, <span class="c-s">"SPC t z"</span>, <span class="c-s">"zen"</span>)
 
-<span class="c-d">;; Your own dashboard items.</span>
-(<span class="c-k">define</span> (<span class="c-f">dashboard-items</span>)
-  (cons (list <span class="c-s">"t"</span> <span class="c-s">"Terminal"</span> 'terminal-toggle)
-        (default-dashboard-items)))
+<span class="c-d">-- Your own dashboard items.</span>
+<span class="c-k">function</span> core.<span class="c-f">dashboard_items</span>()
+  <span class="c-k">local</span> items = core.default_dashboard_items()
+  table.insert(items, 1, { <span class="c-s">"t"</span>, <span class="c-s">"Terminal"</span>, <span class="c-s">"terminal-toggle"</span> })
+  <span class="c-k">return</span> items
+<span class="c-k">end</span>
 
-<span class="c-d">;; Optional: a Nerd Font, a language server.</span>
-<span class="c-d">;;   brew install --cask font-jetbrains-mono-nerd-font</span>
-<span class="c-d">;;   rustup component add rust-analyzer</span></pre></div>
+<span class="c-d">-- Optional: a Nerd Font, a language server.</span>
+<span class="c-d">--   brew install --cask font-jetbrains-mono-nerd-font</span>
+<span class="c-d">--   rustup component add rust-analyzer</span></pre></div>
         </article>
       </div>
     </div>

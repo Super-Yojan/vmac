@@ -1,12 +1,12 @@
 [package]
 name = "vmac"
 version = "0.0.2"
-description = "A modal (evil-style) editor on GPUI, programmable in Steel Scheme and Lua"
+description = "A modal (evil-style) editor on GPUI, programmable in Lua"
 repository = "https://github.com/Super-Yojan/vmac"
 homepage = "https://super-yojan.dev/vmac/"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-keywords = ["editor", "vim", "emacs", "gpui", "scheme"]
+keywords = ["editor", "vim", "emacs", "gpui", "lua"]
 categories = ["text-editors"]
 edition = "2024"
 
@@ -24,7 +24,6 @@ ropey = "1.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
-steel-core = "0.8"
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.2"

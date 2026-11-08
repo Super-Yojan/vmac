@@ -2,7 +2,7 @@
 //!
 //! Rust parses (once per change) and runs the language's highlight query over
 //! the lines on screen; what each capture (`keyword`, `function.method`, ...)
-//! looks like is decided in Scheme by `(syntax-theme)`.
+//! looks like is decided in Lua by `core.syntax_theme()`.
 
 use crate::editor::BufferId;
 use ropey::Rope;

@@ -1,35 +1,52 @@
-//! The Steel interpreter and the primitives it gets from the Rust core.
+//! The Lua interpreter and the primitives it gets from the Rust core.
 //!
-//! Rust exposes small, fast primitives (`insert`, `forward-char`, ...). Every
-//! command, keymap and the modeline are defined in Scheme (`lisp/core/*.scm`,
-//! then the user's `~/.config/vmac/init.scm`) and can be redefined while the
-//! editor runs.
+//! Rust exposes small, fast primitives in the `vmac` table (`vmac.insert`,
+//! `vmac.forward_char`, ...). Every command, keymap and the modeline are
+//! defined in Lua (`lua/core/*.lua`, then plugins, then the user's
+//! `~/.config/vmac/init.lua`) and can be redefined while the editor runs.
 
 use crate::buffer::Buffer;
 use crate::editor::{Editor, SessionRequest};
 use crate::picker::Picker;
 use mlua::Lua;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use steel::SteelVal;
-use steel::steel_vm::engine::Engine;
-use steel::steel_vm::register_fn::RegisterFn;
 
-/// The Lua core (lua/core/): newer features, written in Lua. Built in, like
-/// the Scheme core; read from the repo's lua/core/ when running from a
-/// checkout, so edits there load on the next start.
+/// The core (lua/core/), one file per area, built into the binary for
+/// running outside a checkout. They load in name order; a checkout's
+/// lua/core/ is read instead, so edits there load on save.
 const LUA_CORE_FILES: &[(&str, &str)] = &[
+    ("00-core.lua", include_str!("../lua/core/00-core.lua")),
+    ("10-motions.lua", include_str!("../lua/core/10-motions.lua")),
+    ("20-editing.lua", include_str!("../lua/core/20-editing.lua")),
+    ("30-commands.lua", include_str!("../lua/core/30-commands.lua")),
+    ("40-tree.lua", include_str!("../lua/core/40-tree.lua")),
+    ("50-dashboard.lua", include_str!("../lua/core/50-dashboard.lua")),
+    ("60-lsp.lua", include_str!("../lua/core/60-lsp.lua")),
+    ("70-agent.lua", include_str!("../lua/core/70-agent.lua")),
+    ("80-looks.lua", include_str!("../lua/core/80-looks.lua")),
+    ("90-bindings.lua", include_str!("../lua/core/90-bindings.lua")),
     ("agents.lua", include_str!("../lua/core/agents.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
     ("sessions.lua", include_str!("../lua/core/sessions.lua")),
 ];
 
-/// The Lua core's files, in name order: (name, code).
-fn lua_core_files() -> Vec<(String, String)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/core");
-    let mut from_disk: Vec<(String, String)> = std::fs::read_dir(&dir)
+/// The checkout's lua/core/, when running from one.
+fn core_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/core")).filter(|d| d.is_dir())
+}
+
+/// The built-in core's files, in name order: (name, code).
+fn built_in_core() -> Vec<(String, String)> {
+    LUA_CORE_FILES.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect()
+}
+
+/// The core's files in `dir` (a checkout's lua/core/, so edits there
+/// load), in name order: (name, code); else the ones built in.
+fn lua_core_files(dir: Option<&Path>) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = dir
+        .and_then(|dir| std::fs::read_dir(dir).ok())
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
@@ -37,100 +54,23 @@ fn lua_core_files() -> Vec<(String, String)> {
         .filter(|p| p.extension().is_some_and(|x| x == "lua"))
         .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), std::fs::read_to_string(&p).ok()?)))
         .collect();
-    if from_disk.is_empty() {
-        return LUA_CORE_FILES.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect();
+    if files.is_empty() {
+        return built_in_core();
     }
-    from_disk.sort();
-    from_disk
-}
-
-/// The core, one file per area (lisp/core/), built into the binary for
-/// running outside a checkout. They load as one program, in name order, so
-/// a function may call one defined in a later file.
-const CORE_FILES: &[(&str, &str)] = &[
-    ("00-helpers.scm", include_str!("../lisp/core/00-helpers.scm")),
-    ("05-commands.scm", include_str!("../lisp/core/05-commands.scm")),
-    ("10-keymaps.scm", include_str!("../lisp/core/10-keymaps.scm")),
-    ("15-states.scm", include_str!("../lisp/core/15-states.scm")),
-    ("20-dispatch.scm", include_str!("../lisp/core/20-dispatch.scm")),
-    ("30-motions.scm", include_str!("../lisp/core/30-motions.scm")),
-    ("35-search.scm", include_str!("../lisp/core/35-search.scm")),
-    ("40-text-objects.scm", include_str!("../lisp/core/40-text-objects.scm")),
-    ("45-operators.scm", include_str!("../lisp/core/45-operators.scm")),
-    ("50-visual.scm", include_str!("../lisp/core/50-visual.scm")),
-    ("55-editing.scm", include_str!("../lisp/core/55-editing.scm")),
-    ("60-minibuffer.scm", include_str!("../lisp/core/60-minibuffer.scm")),
-    ("65-picker.scm", include_str!("../lisp/core/65-picker.scm")),
-    ("70-windows.scm", include_str!("../lisp/core/70-windows.scm")),
-    ("72-terminal.scm", include_str!("../lisp/core/72-terminal.scm")),
-    ("75-file-tree.scm", include_str!("../lisp/core/75-file-tree.scm")),
-    ("78-dashboard.scm", include_str!("../lisp/core/78-dashboard.scm")),
-    ("80-lsp.scm", include_str!("../lisp/core/80-lsp.scm")),
-    ("82-agent.scm", include_str!("../lisp/core/82-agent.scm")),
-    ("84-whichkey.scm", include_str!("../lisp/core/84-whichkey.scm")),
-    ("85-bindings.scm", include_str!("../lisp/core/85-bindings.scm")),
-    ("90-tables.scm", include_str!("../lisp/core/90-tables.scm")),
-    ("92-syntax.scm", include_str!("../lisp/core/92-syntax.scm")),
-    ("95-modeline.scm", include_str!("../lisp/core/95-modeline.scm")),
-    ("97-lua.scm", include_str!("../lisp/core/97-lua.scm")),
-    ("98-plugins.scm", include_str!("../lisp/core/98-plugins.scm")),
-];
-
-/// The core files joined, each under a comment naming it (errors show the
-/// line in the joined program).
-fn join_core(files: impl Iterator<Item = (String, String)>) -> String {
-    files.map(|(name, text)| format!(";;;; ==== {name} ====\n{text}")).collect::<Vec<_>>().join("\n")
-}
-
-/// The `.scm` files in a folder, by name.
-fn scheme_files(dir: &std::path::Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
-        .unwrap_or_default();
-    files.retain(|p| p.extension().is_some_and(|e| e == "scm"));
     files.sort();
     files
 }
 
-/// Scheme the editor loads, in order, at start and on every reload: a file,
-/// a folder of files (loaded as one program), or the built-in core.
-#[derive(Debug, Clone)]
-pub struct Source {
-    pub label: String,
-    pub path: Option<PathBuf>,
+/// When a folder's newest file changed.
+fn newest_in(dir: &Path) -> Option<SystemTime> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max()
 }
 
-impl Source {
-    /// The built-in core's text.
-    fn built_in_core() -> String {
-        join_core(CORE_FILES.iter().map(|(n, t)| (n.to_string(), t.to_string())))
-    }
-
-    fn read(&self) -> Option<String> {
-        match &self.path {
-            Some(p) if p.is_dir() => Some(join_core(scheme_files(p).into_iter().filter_map(|f| {
-                let name = f.file_name()?.to_string_lossy().into_owned();
-                Some((name, std::fs::read_to_string(&f).ok()?))
-            }))),
-            Some(p) => std::fs::read_to_string(p).ok(),
-            None => Some(Self::built_in_core()),
-        }
-    }
-
-    /// When it last changed: for a folder, its newest file (or the folder
-    /// itself, when a file is added or removed).
-    fn mtime(&self) -> Option<SystemTime> {
-        let path = self.path.as_ref()?;
-        let modified = |p: &std::path::Path| p.metadata().ok()?.modified().ok();
-        if path.is_dir() {
-            scheme_files(path).iter().filter_map(|f| modified(f)).chain(modified(path)).max()
-        } else {
-            modified(path)
-        }
-    }
-}
-
-/// How a face looks, from Scheme's `(face-specs)`. Colors are face/theme
+/// How a face looks, from Lua's `core.face_specs()`. Colors are face/theme
 /// color names (`accent`, `blue`, `muted`, ...).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FaceSpec {
@@ -146,44 +86,21 @@ pub struct FaceSpec {
     pub sans: bool,
 }
 
-fn symbol_text(v: &SteelVal) -> Option<String> {
-    match v {
-        SteelVal::SymbolV(s) | SteelVal::StringV(s) => Some(s.to_string()),
-        _ => None,
-    }
+/// `{ "name", color = ..., background = ..., scale = 1.2, bold = true,
+/// italic = true, underline = true, sans = true }`.
+fn parse_face_spec(t: &mlua::Table) -> Option<FaceSpec> {
+    Some(FaceSpec {
+        name: t.get::<String>(1).ok()?,
+        color: t.get("color").ok().flatten(),
+        background: t.get("background").ok().flatten(),
+        scale: t.get::<Option<f32>>("scale").ok().flatten(),
+        bold: t.get::<Option<bool>>("bold").ok().flatten().unwrap_or(false),
+        italic: t.get::<Option<bool>>("italic").ok().flatten().unwrap_or(false),
+        underline: t.get::<Option<bool>>("underline").ok().flatten().unwrap_or(false),
+        sans: t.get::<Option<bool>>("sans").ok().flatten().unwrap_or(false),
+    })
 }
 
-/// `("name" key value key value ...)`: keys `color`, `background`, `scale`,
-/// `weight` (bold), `slant` (italic), `underline` (#t), `family` (sans).
-fn parse_face_spec(v: &SteelVal) -> Option<FaceSpec> {
-    let SteelVal::ListV(items) = v else { return None };
-    let items: Vec<&SteelVal> = items.iter().collect();
-    let mut spec = FaceSpec { name: symbol_text(items.first()?)?, ..Default::default() };
-    for pair in items[1..].chunks(2) {
-        let [key, value] = pair else { break };
-        let key = symbol_text(key).unwrap_or_default();
-        let text = symbol_text(value).unwrap_or_default();
-        match key.as_str() {
-            "color" => spec.color = Some(text),
-            "background" => spec.background = Some(text),
-            "scale" => {
-                spec.scale = match value {
-                    SteelVal::NumV(n) => Some(*n as f32),
-                    SteelVal::IntV(n) => Some(*n as f32),
-                    _ => None,
-                }
-            }
-            "weight" => spec.bold = text == "bold",
-            "slant" => spec.italic = text == "italic",
-            "underline" => spec.underline = matches!(value, SteelVal::BoolV(true)),
-            "family" => spec.sans = text == "sans",
-            _ => {}
-        }
-    }
-    Some(spec)
-}
-
-/// One modeline segment: text plus a face name the view maps to a theme color.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
     pub text: String,
@@ -191,56 +108,61 @@ pub struct Segment {
 }
 
 pub struct Lisp {
-    engine: Engine,
-    /// Lua, beside Scheme: same primitives, its own commands, keys and hooks.
-    lua: Arc<Mutex<Lua>>,
+    lua: Lua,
     editor: Editor,
-    sources: Vec<Source>,
-    stamps: Vec<Option<SystemTime>>,
-    /// Lua files loaded after the Scheme (init.lua), and when they last changed.
+    /// Where the core is read from (a checkout's lua/core/; None: the one
+    /// built in), and when it last changed.
+    core_dir: Option<PathBuf>,
+    core_stamp: Option<SystemTime>,
+    /// Each plugin's and init file's last text that loaded, to fall back on.
+    last_good: std::collections::HashMap<String, String>,
+    /// Lua files loaded after the core and plugins (init.lua), and when
+    /// they last changed.
     lua_sources: Vec<PathBuf>,
     lua_stamps: Vec<Option<SystemTime>>,
     /// Where plugins live (~/.config/vmac/plugins), and their files' state.
     plugin_dir: Option<PathBuf>,
     plugin_signature: Vec<(PathBuf, Option<SystemTime>)>,
-    /// Each source's last text that loaded, by label, to fall back on.
-    last_good: std::collections::HashMap<String, String>,
     /// When plugin-backed terminals were last read.
     last_terminal_poll: std::time::Instant,
 }
 
 impl Lisp {
+    /// The built-in core alone.
     #[cfg(test)]
-    pub fn new(editor: Editor, sources: Vec<Source>) -> Self {
-        Self::with_lua(editor, sources, Vec::new())
+    pub fn new(editor: Editor) -> Self {
+        Self::with_lua(editor, Vec::new())
     }
 
     #[cfg(test)]
-    pub fn with_lua(editor: Editor, sources: Vec<Source>, lua_sources: Vec<PathBuf>) -> Self {
-        Self::with_config(editor, sources, lua_sources, None)
+    pub fn with_lua(editor: Editor, lua_sources: Vec<PathBuf>) -> Self {
+        Self::load(editor, None, lua_sources, None)
     }
 
-    /// `sources[0]` is the core; plugins load after it, then the rest
-    /// (init.scm), then plugins' Lua, then `lua_sources` (init.lua).
-    pub fn with_config(
-        editor: Editor,
-        sources: Vec<Source>,
-        lua_sources: Vec<PathBuf>,
-        plugin_dir: Option<PathBuf>,
-    ) -> Self {
+    /// The core in `dir` (as a checkout's), alone.
+    #[cfg(test)]
+    pub fn with_core_dir(editor: Editor, dir: PathBuf) -> Self {
+        Self::load(editor, Some(dir), Vec::new(), None)
+    }
+
+    /// The core (the checkout's, when running from one), plugins from
+    /// `plugin_dir`, then `lua_sources` (init.lua).
+    pub fn with_config(editor: Editor, lua_sources: Vec<PathBuf>, plugin_dir: Option<PathBuf>) -> Self {
+        Self::load(editor, core_dir(), lua_sources, plugin_dir)
+    }
+
+    fn load(editor: Editor, core_dir: Option<PathBuf>, lua_sources: Vec<PathBuf>, plugin_dir: Option<PathBuf>) -> Self {
         editor.lock().plugin_dir = plugin_dir.clone();
-        let lua = Arc::new(Mutex::new(fresh_lua(&editor)));
         let mut lisp = Self {
-            engine: fresh_engine(&editor, &lua),
-            lua,
+            lua: fresh_lua(&editor),
             editor,
-            stamps: vec![None; sources.len()],
-            sources,
+            core_dir,
+            core_stamp: None,
+            last_good: Default::default(),
             lua_stamps: vec![None; lua_sources.len()],
             lua_sources,
             plugin_dir,
             plugin_signature: Vec::new(),
-            last_good: Default::default(),
             last_terminal_poll: std::time::Instant::now(),
         };
         lisp.reload();
@@ -257,220 +179,117 @@ impl Lisp {
         config_dir().map(|dir| vec![dir.join("init.lua")]).unwrap_or_default()
     }
 
-    /// Loads Lua into a fresh Lua (so a reload starts clean, like Scheme's):
-    /// the plugins' first, each able to `require` from its own folder, then
-    /// `lua_sources`. Runs the Scheme they queue. Returns what loaded, and
-    /// errors (a plugin's name with its error) without stopping.
-    fn load_lua(&mut self, plugins: &[crate::plugins::Plugin]) -> (Vec<String>, Vec<(Option<String>, String)>) {
-        *self.lua.lock().unwrap_or_else(|e| e.into_inner()) = fresh_lua(&self.editor);
-        let mut loaded = Vec::new();
-        let mut errors = Vec::new();
-        let plugin_files = plugins
-            .iter()
-            .filter(|p| !p.disabled)
-            .filter_map(|p| Some((Some(p.name.clone()), p.lua.clone()?, Some(p.lua_root()))));
-        for (i, path) in self.lua_sources.clone().iter().enumerate() {
-            self.lua_stamps[i] = path.metadata().ok().and_then(|m| m.modified().ok());
-        }
-        // The Lua core first (lua/core/), so plugins and your config can change it.
-        for (name, code) in lua_core_files() {
-            let result = {
-                let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-                lua.load(code.as_str()).set_name(&name).exec()
-            };
-            self.run_pending_scheme();
-            if let Err(e) = result {
-                // A checkout's file this binary can't run: the built-in one, if it has it.
-                let built_in = LUA_CORE_FILES.iter().find(|(n, c)| *n == name && *c != code).map(|(_, c)| *c);
-                let fell_back = built_in.is_some_and(|c| {
-                    let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-                    lua.load(c).set_name(&name).exec().is_ok()
-                });
-                self.run_pending_scheme();
-                let note = if fell_back { " (using the one built into vmac)" } else { "" };
-                errors.push((None, format!("{name}: {}{note}", first_line(&e))));
-            }
-        }
-        let user_files = self.lua_sources.clone().into_iter().map(|p| (None, p, None));
-        for (plugin, path, root) in plugin_files.chain(user_files).collect::<Vec<_>>() {
-            let Ok(code) = std::fs::read_to_string(&path) else { continue };
-            let label = plugin.clone().unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-            let result = {
-                let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(root) = &root {
-                    // require("x") finds x.lua in the plugin's folder or its lua/.
-                    let root = root.display().to_string().replace('\\', "/");
-                    let _ = lua
-                        .load(format!("package.path = {root:?} .. '/?.lua;' .. {root:?} .. '/lua/?.lua;' .. package.path"))
-                        .exec();
-                }
-                lua.load(code).set_name(&label).exec()
-            };
-            self.run_pending_scheme();
-            match result {
-                Ok(()) => loaded.push(label),
-                Err(e) => errors.push((plugin, format!("{label}: {}", first_line(&e)))),
-            }
-        }
-        (loaded, errors)
-    }
-
-    /// Runs the Scheme Lua queued (vmac.scheme), quietly unless it fails.
-    fn run_pending_scheme(&mut self) {
-        let pending = std::mem::take(&mut self.editor.lock().pending_scheme);
-        for code in pending {
-            if let Err(e) = self.engine.run(code.clone()) {
-                self.editor.lock().message = format!("{code}: {e}");
-            }
-        }
-    }
-
-    /// Evaluates Lua and returns what it shows.
-    #[cfg(test)]
-    pub fn eval_lua(&mut self, code: &str) -> Result<String, String> {
-        let result = {
-            let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-            eval_lua_in(&lua, code).map_err(|e| first_line(&e))
-        };
-        self.run_pending_scheme();
-        result
-    }
-
-    /// A function Lua put in `vmac.hooks` to replace Scheme's, if any.
-    fn lua_hook<R: mlua::FromLuaMulti>(&self, name: &str) -> Option<mlua::Result<R>> {
-        let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-        let hook = lua
-            .globals()
-            .get::<mlua::Table>("vmac")
-            .and_then(|g| g.get::<mlua::Table>("hooks"))
-            .and_then(|h| h.get::<mlua::Function>(name))
-            .ok()?;
-        Some(hook.call::<R>(()))
-    }
-
-    /// The default sources: the core (the repo's `lisp/core/` when running
-    /// from a checkout, so it live-reloads; else the copy built in), then the
-    /// user's init file.
-    pub fn default_sources() -> Vec<Source> {
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lisp/core");
-        let core = Source {
-            label: "core".into(),
-            path: dev.is_dir().then_some(dev),
-        };
-        let mut out = vec![core];
-        if let Some(dir) = config_dir() {
-            out.push(Source { label: "init.scm".into(), path: Some(dir.join("init.scm")) });
-        }
-        out
-    }
-
-    /// Loads everything again, in order: the core, plugins, the user's
-    /// Scheme, then plugins' Lua and the user's Lua. Buffers are untouched.
-    /// When something fails to load, the interpreter is rebuilt from what
-    /// loaded before it (so the failure leaves nothing half-defined) and that
-    /// source's last version that loaded is used, if there is one; the rest
-    /// still load, and the error is shown. A failing plugin is marked failed.
+    /// Loads everything again into a fresh Lua (buffers are untouched): the
+    /// core, then plugins, each able to `require` from its own folder, then
+    /// `lua_sources`. A checkout's core that fails to load gives way to the
+    /// one built in (it may call primitives added since this binary was
+    /// built). A plugin or init file that fails leaves nothing half-defined:
+    /// Lua is rebuilt from what loaded before it, and its last version that
+    /// loaded is used, if there is one; a failing plugin is marked failed.
+    /// The rest still load, and the first error is shown.
     pub fn reload(&mut self) {
         use crate::plugins::Status;
         let plugins = self.plugin_dir.as_deref().map(crate::plugins::discover).unwrap_or_default();
         self.plugin_signature = self.plugin_dir.as_deref().map(crate::plugins::signature).unwrap_or_default();
-        for (i, src) in self.sources.iter().enumerate() {
-            self.stamps[i] = src.mtime();
+        self.core_stamp = self.core_dir.as_deref().and_then(newest_in);
+        for (i, path) in self.lua_sources.clone().iter().enumerate() {
+            self.lua_stamps[i] = path.metadata().ok().and_then(|m| m.modified().ok());
         }
-
-        // The Scheme to load, in order: (label, text, plugin name).
-        let mut items: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-        // The checkout's lisp/core, read live: it can be newer than this binary.
-        let core_on_disk = self.sources.first().is_some_and(|c| c.path.is_some());
-        let core_label = self.sources.first().map(|c| c.label.clone());
-        if let Some(core) = self.sources.first() {
-            items.push((core.label.clone(), core.read(), None));
-        }
-        for p in plugins.iter().filter(|p| !p.disabled) {
-            if let Some(file) = &p.scheme {
-                items.push((p.name.clone(), std::fs::read_to_string(file).ok(), Some(p.name.clone())));
+        self.lua = fresh_lua(&self.editor);
+        let mut errors: Vec<String> = Vec::new();
+        let mut loaded = vec!["core".to_string()];
+        // What loaded, in order (name, code): run again to rebuild after a failure.
+        let mut ran: Vec<(String, String)> = Vec::new();
+        for (name, code) in lua_core_files(self.core_dir.as_deref()) {
+            match self.lua.load(code.as_str()).set_name(&name).exec() {
+                Ok(()) => ran.push((name, code)),
+                Err(e) => {
+                    let note = if self.core_dir.is_some() {
+                        " (using the core built into vmac; rebuild it to use the checkout's)"
+                    } else {
+                        ""
+                    };
+                    errors.push(format!("{name}: {}{note}", first_line(&e)));
+                    self.lua = fresh_lua(&self.editor);
+                    ran.clear();
+                    for (name, code) in built_in_core() {
+                        if self.lua.load(code.as_str()).set_name(&name).exec().is_ok() {
+                            ran.push((name, code));
+                        }
+                    }
+                    break;
+                }
             }
         }
-        for src in self.sources.iter().skip(1) {
-            items.push((src.label.clone(), src.read(), None));
-        }
-
         let mut statuses: std::collections::HashMap<String, Status> = plugins
             .iter()
             .map(|p| (p.name.clone(), if p.disabled { Status::Disabled } else { Status::Loaded }))
             .collect();
-        let mut errors: Vec<String> = Vec::new();
-        let mut good: Vec<String> = Vec::new();
-        let mut loaded: Vec<String> = Vec::new();
-        for (label, text, plugin) in items {
-            let Some(text) = text else { continue };
-            match self.engine.run(text.clone()) {
-                Ok(_) => {
-                    good.push(text.clone());
-                    self.last_good.insert(label.clone(), text);
+        let plugin_files = plugins
+            .iter()
+            .filter(|p| !p.disabled)
+            .filter_map(|p| Some((Some(p.name.clone()), p.lua.clone()?, Some(p.lua_root()))));
+        let user_files = self.lua_sources.clone().into_iter().map(|p| (None, p, None));
+        for (plugin, path, root) in plugin_files.chain(user_files).collect::<Vec<_>>() {
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            let label = plugin.clone().unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            if let Some(root) = &root {
+                // require("x") finds x.lua in the plugin's folder or its lua/.
+                let root = root.display().to_string().replace('\\', "/");
+                let paths = format!("package.path = {root:?} .. '/?.lua;' .. {root:?} .. '/lua/?.lua;' .. package.path");
+                if self.lua.load(paths.as_str()).exec().is_ok() {
+                    ran.push(("package.path".into(), paths));
+                }
+            }
+            match self.lua.load(code.as_str()).set_name(&label).exec() {
+                Ok(()) => {
                     if plugin.is_none() {
-                        loaded.push(label);
+                        loaded.push(label.clone());
                     }
+                    self.last_good.insert(label.clone(), code.clone());
+                    ran.push((label, code));
                 }
                 Err(e) => {
-                    let error = format!("{label}: {e}");
-                    self.engine = fresh_engine(&self.editor, &self.lua);
-                    for t in &good {
-                        let _ = self.engine.run(t.clone());
+                    let mut error = format!("{label}: {}", first_line(&e));
+                    self.lua = fresh_lua(&self.editor);
+                    for (name, code) in &ran {
+                        let _ = self.lua.load(code.as_str()).set_name(name).exec();
                     }
-                    let kept = self.last_good.get(&label).cloned().filter(|old| self.engine.run(old.clone()).is_ok());
-                    // A checkout's core that this binary can't run (it calls
-                    // primitives added since the binary was built): the
-                    // core built into the binary, rather than none at all.
-                    let built_in = (kept.is_none() && core_on_disk && plugin.is_none() && Some(&label) == core_label.as_ref())
-                        .then(Source::built_in_core)
-                        .filter(|core| self.engine.run(core.clone()).is_ok());
-                    match (kept, built_in) {
-                        (Some(old), _) => {
-                            good.push(old);
-                            errors.push(format!("{error} (kept the last version that loaded)"));
-                        }
-                        (None, Some(core)) => {
-                            good.push(core);
-                            errors.push(format!("{error} (using the core built into vmac; rebuild it to use the checkout's)"));
-                        }
-                        (None, None) => errors.push(error),
+                    let kept = self.last_good.get(&label).filter(|old| **old != code).cloned();
+                    if let Some(old) = kept.filter(|old| self.lua.load(old.as_str()).set_name(&label).exec().is_ok()) {
+                        error.push_str(" (kept the last version that loaded)");
+                        ran.push((label, old));
                     }
                     if let Some(name) = plugin {
-                        statuses.insert(name, Status::Failed(first_line(&e)));
+                        statuses.insert(name, Status::Failed(error.clone()));
                     }
+                    errors.push(error);
                 }
             }
         }
-
-        let (lua_loaded, lua_errors) = self.load_lua(&plugins);
-        for (plugin, error) in lua_errors {
-            if let Some(name) = plugin {
-                statuses.insert(name, Status::Failed(error.clone()));
-            }
-            errors.push(error);
-        }
-        loaded.extend(lua_loaded.into_iter().filter(|l| !plugins.iter().any(|p| &p.name == l)));
-
         let enabled = plugins.iter().filter(|p| matches!(statuses.get(&p.name), Some(Status::Loaded))).count();
         let mut st = self.editor.lock();
-        st.plugins = plugins.into_iter().map(|p| {
-            let status = statuses.remove(&p.name).unwrap_or(Status::Loaded);
-            (p, status)
-        }).collect();
+        st.plugins = plugins
+            .into_iter()
+            .map(|p| {
+                let status = statuses.remove(&p.name).unwrap_or(Status::Loaded);
+                (p, status)
+            })
+            .collect();
         st.message = match errors.first() {
             Some(first) if errors.len() > 1 => format!("{first} (and {} more)", errors.len() - 1),
             Some(first) => first.clone(),
             None => {
                 if enabled > 0 {
-                    loaded.insert(1.min(loaded.len()), format!("{enabled} plugin{}", if enabled == 1 { "" } else { "s" }));
+                    loaded.insert(1, format!("{enabled} plugin{}", if enabled == 1 { "" } else { "s" }));
                 }
                 format!("loaded {}", loaded.join(", "))
             }
         };
     }
 
-    /// Reloads when any source file changed since the last load.
+    /// Reloads when the core, a plugin or the user's Lua changed since the
+    /// last load (or a reload was asked for).
     pub fn reload_if_changed(&mut self) -> bool {
         let lua_changed = self
             .lua_sources
@@ -481,23 +300,49 @@ impl Lisp {
             .plugin_dir
             .as_deref()
             .is_some_and(|dir| crate::plugins::signature(dir) != self.plugin_signature);
+        let core_changed = self.core_dir.is_some() && self.core_dir.as_deref().and_then(newest_in) != self.core_stamp;
         let requested = std::mem::take(&mut self.editor.lock().reload_requested);
-        let changed = requested
-            || lua_changed
-            || plugins_changed
-            || self.sources.iter().zip(&self.stamps).any(|(s, old)| s.mtime() != *old);
+        let changed = requested || lua_changed || plugins_changed || core_changed;
         if changed {
             self.reload();
         }
         changed
     }
 
+    /// Calls `core[name](args)`; an error as its first line.
+    pub fn call<R: mlua::FromLuaMulti>(&self, name: &str, args: impl mlua::IntoLuaMulti) -> Result<R, String> {
+        let core: mlua::Table = self.lua.globals().get("core").map_err(|e| first_line(&e))?;
+        let f: mlua::Function = core.get(name).map_err(|_| format!("core.{name} is missing"))?;
+        f.call::<R>(args).map_err(|e| first_line(&e))
+    }
+
+    /// `vmac.hooks[name]()` when there's such a hook, else `core[name]()`.
+    fn hooked<R: mlua::FromLuaMulti>(&self, name: &str) -> Result<R, String> {
+        let hook = self
+            .lua
+            .globals()
+            .get::<mlua::Table>("vmac")
+            .and_then(|g| g.get::<mlua::Table>("hooks"))
+            .and_then(|h| h.get::<mlua::Function>(name));
+        match hook {
+            Ok(f) => f.call::<R>(()).map_err(|e| first_line(&e)),
+            Err(_) => self.call(name, ()),
+        }
+    }
+
+    /// Runs a command by name; an error goes to the echo area.
+    pub fn run_command(&mut self, name: &str) {
+        if let Err(e) = self.call::<()>("call_binding", name) {
+            self.editor.lock().message = format!("{name}: {e}");
+        }
+    }
+
     /// Reads terminals into their buffers: local ones every call, plugin
     /// ones (which run Lua, often a process) every 150 ms. Returns whether
     /// a screen changed.
     pub fn pump_terminals(&mut self) -> bool {
-        let follow = match self.engine.call_function_by_name_with_args("terminal-insert?", vec![]) {
-            Ok(SteelVal::BoolV(true)) => Some(self.editor.lock().window().buffer),
+        let follow = match self.call::<bool>("terminal_insert", ()) {
+            Ok(true) => Some(self.editor.lock().window().buffer),
             _ => None,
         };
         let mut changed = self.editor.lock().pump_local_terminals(follow);
@@ -519,12 +364,8 @@ impl Lisp {
             (plugins, std::mem::take(&mut st.terminals_to_kill))
         };
         for (buffer, backend, handle) in plugins {
-            let (text, alive) = {
-                let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-                let text = call_backend::<String>(&lua, &backend, "read", handle.clone());
-                let alive = call_backend::<bool>(&lua, &backend, "alive", handle.clone()).unwrap_or(Ok(true));
-                (text, alive)
-            };
+            let text = call_backend::<String>(&self.lua, &backend, "read", handle.clone());
+            let alive = call_backend::<bool>(&self.lua, &backend, "alive", handle.clone()).unwrap_or(Ok(true));
             let mut st = self.editor.lock();
             match text {
                 Some(Ok(text)) => {
@@ -545,342 +386,223 @@ impl Lisp {
             }
         }
         for (backend, handle) in kills {
-            let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = call_backend::<()>(&lua, &backend, "kill", handle);
+            let _ = call_backend::<()>(&self.lua, &backend, "kill", handle);
         }
         changed
     }
 
-    /// Hands a keystroke to Scheme's `dispatch-key`. `key` is Emacs notation
-    /// (`"C-x"`, `"M-:"`, `"RET"`); `text` is what it would type, or "".
+    /// Hands a keystroke to Lua's `core.dispatch_key`. `key` is Emacs
+    /// notation (`"C-x"`, `"M-:"`, `"RET"`); `text` is what it would type, or "".
     pub fn dispatch_key(&mut self, key: &str, text: &str) {
         // Any key closes the documentation K showed and the which-key popup.
         self.editor.lock().hover = None;
         self.editor.lock().whichkey = None;
-        let args = vec![SteelVal::from(key.to_string()), SteelVal::from(text.to_string())];
-        if let Err(e) = self.engine.call_function_by_name_with_args("dispatch-key", args) {
+        if let Err(e) = self.call::<()>("dispatch_key", (key, text)) {
             self.editor.lock().message = format!("{key}: {e}");
         }
-        self.run_pending_scheme();
-        self.run_pending_evals();
     }
 
-    /// Runs what Rust queued for Scheme (server replies that need Scheme,
-    /// like the references picker): each calls the Scheme function of that
-    /// name with a list of strings.
+    /// Runs what Rust raised for Lua (server replies, the agent asking):
+    /// each calls `core.events[name]` with a list of strings.
     pub fn run_events(&mut self) -> bool {
         let events = self.editor.lock().take_events();
         let any = !events.is_empty();
         for (name, args) in events {
-            let list = SteelVal::ListV(args.into_iter().map(SteelVal::from).collect());
-            if let Err(e) = self.engine.call_function_by_name_with_args(&name, vec![list]) {
+            let handler = self
+                .lua
+                .globals()
+                .get::<mlua::Table>("core")
+                .and_then(|c| c.get::<mlua::Table>("events"))
+                .and_then(|e| e.get::<mlua::Function>(name.as_str()));
+            let result = match handler {
+                Ok(f) => f.call::<()>(args).map_err(|e| first_line(&e)),
+                Err(_) => Err("nothing handles it".into()),
+            };
+            if let Err(e) = result {
                 self.editor.lock().message = format!("{name}: {e}");
             }
-            // What the handler queued (a Lua prompt's minibuffer) happens now,
-            // not on the next key.
-            self.run_pending_scheme();
-            self.run_pending_evals();
         }
         any
     }
 
-    /// Evaluates source and returns its printed result.
+    /// Evaluates Lua and returns what it shows: an expression's value, else "".
     pub fn eval(&mut self, code: &str) -> Result<String, String> {
-        self.engine
-            .run(code.to_string())
-            .map(|vals| vals.last().map(|v| v.to_string()).unwrap_or_default())
-            .map_err(|e| e.to_string())
+        eval_lua_in(&self.lua, code).map_err(|e| first_line(&e))
     }
 
-    fn run_pending_evals(&mut self) {
-        let pending = std::mem::take(&mut self.editor.lock().pending_eval);
-        for code in pending {
-            let msg = match self.eval(&code) {
-                Ok(v) => v,
-                Err(e) => format!("error: {e}"),
-            };
-            self.editor.lock().message = msg;
-        }
+    /// Evaluates Lua (as eval does).
+    #[cfg(test)]
+    pub fn eval_lua(&mut self, code: &str) -> Result<String, String> {
+        self.eval(code)
     }
 
-    /// Calls Scheme's `(cursor-shape)`: "box" or "bar".
-    /// Calls Scheme's `(markdown-raw?)`: whether the selected window shows
-    /// Markdown as typed (insert state) rather than with its markup hidden.
+    /// Whether the selected window shows Markdown as typed (insert state)
+    /// rather than rendered or with its markup hidden.
     pub fn markdown_raw(&mut self) -> bool {
-        matches!(self.engine.call_function_by_name_with_args("markdown-raw?", vec![]), Ok(SteelVal::BoolV(true)))
+        self.call::<bool>("markdown_raw", ()).unwrap_or(false)
     }
 
+    /// "box" or "bar".
     pub fn cursor_shape(&mut self) -> String {
-        match self.engine.call_function_by_name_with_args("cursor-shape", vec![]) {
-            Ok(SteelVal::SymbolV(s)) | Ok(SteelVal::StringV(s)) => s.to_string(),
-            _ => "box".into(),
-        }
+        self.call::<String>("cursor_shape", ()).unwrap_or_else(|_| "box".into())
     }
 
-    /// Calls Scheme's `(selection)`: the selected ranges `[start, end)` in
-    /// characters. Scheme returns one range `(start end)`, a list of them
-    /// (a visual block: one per line), or `()` for none.
+    /// The selected ranges `[start, end)` in characters (a visual block:
+    /// one per line).
     pub fn selection(&mut self) -> Vec<(usize, usize)> {
-        let Ok(v) = self.engine.call_function_by_name_with_args("selection", vec![]) else {
-            return vec![];
-        };
-        let pair = |v: &SteelVal| -> Option<(usize, usize)> {
-            let SteelVal::ListV(items) = v else { return None };
-            let mut it = items.iter();
-            match (it.next()?, it.next()?) {
-                (SteelVal::IntV(a), SteelVal::IntV(b)) => Some((*a as usize, *b as usize)),
-                _ => None,
-            }
-        };
-        let ranges = match &v {
-            SteelVal::ListV(items) if matches!(items.iter().next(), Some(SteelVal::ListV(_))) => {
-                items.iter().filter_map(pair).collect()
-            }
-            other => pair(other).into_iter().collect::<Vec<_>>(),
-        };
-        ranges.into_iter().filter(|(a, b)| a < b).collect()
+        let ranges = self.call::<Vec<Vec<isize>>>("selection", ()).unwrap_or_default();
+        ranges
+            .into_iter()
+            .filter_map(|r| Some((*r.first()?, *r.get(1)?)))
+            .filter(|(a, b)| a < b && *a >= 0)
+            .map(|(a, b)| (a as usize, b as usize))
+            .collect()
     }
 
-    /// Calls Scheme's `(search-highlight)`: the pattern whose matches the
-    /// window highlights, or "" for none.
+    /// The pattern whose matches the window highlights, or "" for none.
     pub fn search_highlight(&mut self) -> String {
-        match self.engine.call_function_by_name_with_args("search-highlight", vec![]) {
-            Ok(SteelVal::StringV(s)) => s.to_string(),
-            _ => String::new(),
-        }
+        self.call::<String>("search_highlight", ()).unwrap_or_default()
     }
 
-    /// A Lua hook's list of lists of strings (`{{"keyword", "magenta"}, ...}`).
-    fn lua_hook_rows(&self, name: &str) -> Option<Result<Vec<Vec<String>>, String>> {
-        let result = self.lua_hook::<mlua::Table>(name)?;
-        Some(
-            result
-                .and_then(|rows| {
-                    rows.sequence_values::<mlua::Table>()
-                        .map(|row| row.and_then(|r| r.sequence_values::<String>().collect()))
-                        .collect()
-                })
-                .map_err(|e| first_line(&e)),
-        )
-    }
-
-    /// Calls Scheme's `(syntax-theme)`: (capture face) pairs saying how
-    /// tree-sitter captures look. A Lua `vmac.hooks.syntax_theme` replaces it.
+    /// (capture face) pairs saying how tree-sitter captures look.
     pub fn syntax_theme(&mut self) -> Vec<(String, String)> {
-        if let Some(Ok(rows)) = self.lua_hook_rows("syntax_theme") {
-            return rows.into_iter().filter_map(|r| Some((r.first()?.clone(), r.get(1)?.clone()))).collect();
-        }
-        match self.engine.call_function_by_name_with_args("syntax-theme", vec![]) {
-            Ok(v) => parse_segments(&v).into_iter().map(|s| (s.text, s.face)).collect(),
-            Err(_) => Vec::new(),
-        }
+        let rows = self.hooked::<Vec<Vec<String>>>("syntax_theme").unwrap_or_default();
+        rows.into_iter().filter_map(|r| Some((r.first()?.clone(), r.get(1)?.clone()))).collect()
     }
 
-    /// Calls Scheme's `(lsp-servers)`: `(language command arg ...)` lists. A
-    /// Lua `vmac.hooks.lsp_servers` replaces it.
+    /// `{language, command, arg...}` lists.
     pub fn lsp_servers(&mut self) -> Vec<crate::lsp::ServerConfig> {
-        if let Some(Ok(rows)) = self.lua_hook_rows("lsp_servers") {
-            return rows
-                .into_iter()
-                .filter_map(|r| {
-                    let mut words = r.into_iter();
-                    Some(crate::lsp::ServerConfig { language: words.next()?, command: words.next()?, args: words.collect() })
-                })
-                .collect();
-        }
-        let Ok(SteelVal::ListV(items)) = self.engine.call_function_by_name_with_args("lsp-servers", vec![]) else {
-            return vec![];
-        };
-        items
-            .iter()
-            .filter_map(|item| {
-                let SteelVal::ListV(parts) = item else { return None };
-                let mut words = parts.iter().filter_map(symbol_text);
-                Some(crate::lsp::ServerConfig {
-                    language: words.next()?,
-                    command: words.next()?,
-                    args: words.collect(),
-                })
+        let rows = self.hooked::<Vec<Vec<String>>>("lsp_servers").unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|r| {
+                let mut words = r.into_iter();
+                Some(crate::lsp::ServerConfig { language: words.next()?, command: words.next()?, args: words.collect() })
             })
             .collect()
     }
 
-    /// Calls Scheme's `(face-specs)`: how named faces look.
+    /// How named faces look.
     pub fn face_specs(&mut self) -> Vec<FaceSpec> {
-        match self.engine.call_function_by_name_with_args("face-specs", vec![]) {
-            Ok(SteelVal::ListV(items)) => items.iter().filter_map(parse_face_spec).collect(),
-            _ => Vec::new(),
-        }
+        let specs = self.call::<Vec<mlua::Table>>("face_specs", ()).unwrap_or_default();
+        specs.iter().filter_map(parse_face_spec).collect()
     }
 
-    /// Calls Scheme's `(modeline)`: a list of `(text face)` pairs. A Lua
-    /// `vmac.hooks.modeline` returning `{{text, face}, ...}` replaces it.
+    /// `{{text, face}, ...}` segments.
     pub fn modeline(&mut self) -> Vec<Segment> {
-        match self.lua_hook_rows("modeline") {
-            Some(Ok(rows)) => {
-                return rows
-                    .into_iter()
-                    .filter_map(|r| {
-                        Some(Segment { text: r.first()?.clone(), face: r.get(1).cloned().unwrap_or("default".into()) })
-                    })
-                    .collect();
-            }
-            Some(Err(e)) => return vec![Segment { text: format!("modeline (lua): {e}"), face: "error".into() }],
-            None => {}
-        }
-        match self.engine.call_function_by_name_with_args("modeline", vec![]) {
-            Ok(v) => parse_segments(&v),
-            Err(e) => vec![Segment {
-                text: format!("modeline: {e}"),
-                face: "error".into(),
-            }],
+        match self.hooked::<Vec<Vec<String>>>("modeline") {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|r| Some(Segment { text: r.first()?.clone(), face: r.get(1).cloned().unwrap_or("default".into()) }))
+                .collect(),
+            Err(e) => vec![Segment { text: format!("modeline: {e}"), face: "error".into() }],
         }
     }
 }
 
-fn parse_segments(v: &SteelVal) -> Vec<Segment> {
-    let SteelVal::ListV(items) = v else { return vec![] };
-    items
-        .iter()
-        .filter_map(|item| {
-            let SteelVal::ListV(pair) = item else { return None };
-            let mut it = pair.iter();
-            let text = match it.next()? {
-                SteelVal::StringV(s) => s.to_string(),
-                other => other.to_string(),
-            };
-            let face = match it.next() {
-                Some(SteelVal::SymbolV(s)) | Some(SteelVal::StringV(s)) => s.to_string(),
-                _ => "default".to_string(),
-            };
-            Some(Segment { text, face })
-        })
-        .collect()
-}
-
-/// Registers a primitive that gets the editor. `$args` are the Scheme
-/// arguments with their Rust types.
-/// The user's config folder: ~/.config/vmac, or ~/.config/gmacs (the
-/// editor's old name) while only that one exists.
 pub fn config_dir() -> Option<PathBuf> {
     let config = PathBuf::from(std::env::var_os("HOME")?).join(".config");
     let (new, old) = (config.join("vmac"), config.join("gmacs"));
     Some(if !new.exists() && old.exists() { old } else { new })
 }
 
-/// Where primitives get registered: Steel, Lua's `vmac` table, or both.
+/// Where primitives get registered: Lua's `vmac` table.
 struct Registry<'a> {
-    engine: Option<&'a mut Engine>,
-    lua: Option<(&'a Lua, mlua::Table)>,
+    lua: &'a Lua,
+    vmac: mlua::Table,
 }
 
 /// A primitive's Lua name: `buffer-name` -> `buffer_name`, `pos->line` ->
 /// `pos_to_line`, `minibuffer-active?` -> `minibuffer_active`.
-pub fn lua_name(scheme: &str) -> String {
-    scheme.replace("->", "_to_").trim_end_matches(['?', '!']).replace('-', "_")
+pub fn lua_name(name: &str) -> String {
+    name.replace("->", "_to_").trim_end_matches(['?', '!']).replace('-', "_")
 }
 
-/// Registers a primitive that gets the editor, in each interpreter of the
-/// registry. `$args` are its arguments with their Rust types.
+/// Registers a primitive that gets the editor. `$args` are its arguments
+/// with their Rust types.
 macro_rules! prim {
     ($reg:ident, $editor:ident, $name:literal, |$st:ident $(, $a:ident : $t:ty)*| $body:expr) => {{
-        if let Some(engine) = $reg.engine.as_mut() {
-            let ed = $editor.clone();
-            engine.register_fn($name, move |$($a: $t),*| {
+        let ed = $editor.clone();
+        #[allow(unused_parens)]
+        let f = $reg
+            .lua
+            .create_function(move |_, ($($a,)*): ($($t,)*)| {
                 #[allow(unused_mut)]
                 let mut $st = ed.lock();
-                $body
-            });
-        }
-        if let Some((lua, vmac)) = $reg.lua.as_ref() {
-            let ed = $editor.clone();
-            #[allow(unused_parens)]
-            let f = lua
-                .create_function(move |_, ($($a,)*): ($($t,)*)| {
-                    #[allow(unused_mut)]
-                    let mut $st = ed.lock();
-                    // An inner closure, so a `return` in the body returns its value.
-                    #[allow(clippy::redundant_closure_call)]
-                    let value = (|| $body)();
-                    Ok(value)
-                })
-                .expect("a Lua function");
-            vmac.set(lua_name($name), f).expect("set in vmac");
-        }
+                // An inner closure, so a `return` in the body returns its value.
+                #[allow(clippy::redundant_closure_call)]
+                let value = (|| $body)();
+                Ok(value)
+            })
+            .expect("a Lua function");
+        $reg.vmac.set(lua_name($name), f).expect("set in vmac");
     }};
 }
 
-/// Registers a primitive that doesn't need the editor, in each interpreter.
+/// Registers a primitive that doesn't need the editor.
 macro_rules! pure {
     ($reg:ident, $name:literal, |$($a:ident : $t:ty),*| $body:expr) => {{
-        if let Some(engine) = $reg.engine.as_mut() {
-            engine.register_fn($name, move |$($a: $t),*| $body);
-        }
-        if let Some((lua, vmac)) = $reg.lua.as_ref() {
-            let f = lua.create_function(move |_, ($($a,)*): ($($t,)*)| Ok($body)).expect("a Lua function");
-            vmac.set(lua_name($name), f).expect("set in vmac");
-        }
+        let f = $reg.lua.create_function(move |_, ($($a,)*): ($($t,)*)| Ok($body)).expect("a Lua function");
+        $reg.vmac.set(lua_name($name), f).expect("set in vmac");
     }};
 }
 
-/// A Steel engine with the primitives, and the bridge to Lua.
-fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
-    let mut engine = Engine::new();
+/// A Lua state with the primitives in `vmac`.
+fn fresh_lua(editor: &Editor) -> Lua {
+    let lua = Lua::new();
+    let vmac = lua.create_table().expect("a table");
     {
-        let mut reg = Registry { engine: Some(&mut engine), lua: None };
+        let mut reg = Registry { lua: &lua, vmac: vmac.clone() };
         register_primitives(&mut reg, editor);
+        register_terminals(&mut reg, editor);
     }
-    // These hold no editor lock while Lua runs: Lua calls primitives, which take it.
-    let (ed, l) = (editor.clone(), lua.clone());
-    engine.register_fn("lua-call", move |name: String| {
-        let result = {
-            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
-            lua_command(&lua, &name)
-        };
-        if let Err(e) = result {
-            ed.lock().message = format!("{name}: {}", first_line(&e));
-        }
-    });
-    // Terminals: start one with a backend ("" for the default), and send a
-    // key to the selected one. Plugin backends run Lua, so no lock is held.
-    let (ed, l) = (editor.clone(), lua.clone());
-    engine.register_fn("terminal-open", move |backend: String, command: String| -> bool {
-        let (backend, cwd, rows, cols, command) = {
-            let st = ed.lock();
-            let backend = if backend.is_empty() { st.terminal_backend.clone() } else { backend };
-            // No command: the terminal shell, as a login shell (its config and PATH load).
-            let command = if command.trim().is_empty() && !st.terminal_shell.is_empty() {
-                format!("{} -l", st.terminal_shell)
-            } else {
-                command
+    lua.globals().set("vmac", vmac.clone()).expect("set vmac");
+    // The editor's old name, so plugins written for it still load.
+    lua.globals().set("gmacs", vmac).expect("set gmacs");
+    lua
+}
+
+/// Terminals: start one with a backend ("" for the default), and send a key
+/// to the selected one. Plugin backends run Lua, so no editor lock is held
+/// while they do.
+fn register_terminals(reg: &mut Registry, editor: &Editor) {
+    let ed = editor.clone();
+    let open = reg
+        .lua
+        .create_function(move |lua, (backend, command): (String, String)| {
+            let (backend, cwd, rows, cols, command) = {
+                let st = ed.lock();
+                let backend = if backend.is_empty() { st.terminal_backend.clone() } else { backend };
+                // No command: the terminal shell, as a login shell (its config and PATH load).
+                let command = if command.trim().is_empty() && !st.terminal_shell.is_empty() {
+                    format!("{} -l", st.terminal_shell)
+                } else {
+                    command
+                };
+                let cwd = st
+                    .buffer()
+                    .file()
+                    .map(|f| crate::picker::project_root(f))
+                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("/"));
+                let (rows, cols) = st.selected_size();
+                (backend, cwd, rows, cols, command)
             };
-            let cwd = st
-                .buffer()
-                .file()
-                .map(|f| crate::picker::project_root(f))
-                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-                .unwrap_or_else(|| PathBuf::from("/"));
-            let (rows, cols) = st.selected_size();
-            (backend, cwd, rows, cols, command)
-        };
-        if backend == "local" {
-            return match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
-                Ok(pty) => {
-                    ed.lock().add_terminal(crate::editor::TermBackend::Local(pty));
-                    true
-                }
-                Err(e) => {
-                    ed.lock().message = format!("terminal: {e}");
-                    false
-                }
-            };
-        }
-        // start returns a handle (then send/read are polled), or
-        // { handle = ..., command = ... }: a command that attaches to the
-        // terminal, run here on a PTY (keys, screen and size go through it).
-        let started = {
-            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
-            call_backend::<mlua::Value>(&lua, &backend, "start", (command, cwd.display().to_string(), rows, cols))
+            if backend == "local" {
+                return Ok(match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
+                    Ok(pty) => {
+                        ed.lock().add_terminal(crate::editor::TermBackend::Local(pty));
+                        true
+                    }
+                    Err(e) => {
+                        ed.lock().message = format!("terminal: {e}");
+                        false
+                    }
+                });
+            }
+            // start returns a handle (then send/read are polled), or
+            // { handle = ..., command = ... }: a command that attaches to the
+            // terminal, run here on a PTY (keys, screen and size go through it).
+            let started = call_backend::<mlua::Value>(lua, &backend, "start", (command, cwd.display().to_string(), rows, cols))
                 .map(|r| {
                     r.and_then(|v| match v {
                         mlua::Value::Table(t) => Ok((t.get::<String>("handle")?, t.get::<Option<String>>("command")?)),
@@ -888,218 +610,74 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
                         mlua::Value::Nil => Ok((String::new(), None)),
                         other => Err(mlua::Error::runtime(format!("start returned a {}", other.type_name()))),
                     })
-                })
-        };
-        match started {
-            Some(Ok((handle, Some(attach)))) if !handle.is_empty() => {
-                match crate::terminal::LocalPty::start(&attach, &cwd, rows, cols) {
-                    Ok(pty) => {
-                        ed.lock().add_terminal(crate::editor::TermBackend::Attached { backend, handle, pty });
-                        true
-                    }
-                    Err(e) => {
-                        ed.lock().message = format!("{backend}: {attach}: {e}");
-                        false
+                });
+            let mut st = ed.lock();
+            Ok(match started {
+                Some(Ok((handle, Some(attach)))) if !handle.is_empty() => {
+                    match crate::terminal::LocalPty::start(&attach, &cwd, rows, cols) {
+                        Ok(pty) => {
+                            st.add_terminal(crate::editor::TermBackend::Attached { backend, handle, pty });
+                            true
+                        }
+                        Err(e) => {
+                            st.message = format!("{backend}: {attach}: {e}");
+                            false
+                        }
                     }
                 }
-            }
-            Some(Ok((handle, None))) if !handle.is_empty() => {
-                ed.lock().add_terminal(crate::editor::TermBackend::Plugin { backend, handle });
-                true
-            }
-            Some(Ok(_)) => {
-                ed.lock().message = format!("{backend}: started nothing");
-                false
-            }
-            Some(Err(e)) => {
-                ed.lock().message = format!("{backend}: {}", first_line(&e));
-                false
-            }
-            None => {
-                ed.lock().message = format!("no terminal backend named {backend}");
-                false
-            }
-        }
-    });
-    let (ed, l) = (editor.clone(), lua.clone());
-    engine.register_fn("terminal-send", move |key: String, text: String| {
-        let plugin = {
-            let mut st = ed.lock();
-            match st.terminal_here() {
-                Some(t) if !t.exited => match &mut t.backend {
-                    crate::editor::TermBackend::Local(pty) | crate::editor::TermBackend::Attached { pty, .. } => {
-                        pty.send(&crate::terminal::key_bytes(&key, &text));
-                        None
-                    }
-                    crate::editor::TermBackend::Plugin { backend, handle } => Some((backend.clone(), handle.clone())),
-                },
-                _ => None,
-            }
-        };
-        if let Some((backend, handle)) = plugin {
-            // A named key (enter, ctrl+c) or the text it types.
-            let (text, name) = match crate::terminal::key_name(&key) {
-                Some(name) => (None, Some(name)),
-                None => (Some(text), None),
+                Some(Ok((handle, None))) if !handle.is_empty() => {
+                    st.add_terminal(crate::editor::TermBackend::Plugin { backend, handle });
+                    true
+                }
+                Some(Ok(_)) => {
+                    st.message = format!("{backend}: started nothing");
+                    false
+                }
+                Some(Err(e)) => {
+                    st.message = format!("{backend}: {}", first_line(&e));
+                    false
+                }
+                None => {
+                    st.message = format!("no terminal backend named {backend}");
+                    false
+                }
+            })
+        })
+        .expect("a Lua function");
+    reg.vmac.set("terminal_open", open).expect("set in vmac");
+
+    let ed = editor.clone();
+    let send = reg
+        .lua
+        .create_function(move |lua, (key, text): (String, String)| {
+            let plugin = {
+                let mut st = ed.lock();
+                match st.terminal_here() {
+                    Some(t) if !t.exited => match &mut t.backend {
+                        crate::editor::TermBackend::Local(pty) | crate::editor::TermBackend::Attached { pty, .. } => {
+                            pty.send(&crate::terminal::key_bytes(&key, &text));
+                            None
+                        }
+                        crate::editor::TermBackend::Plugin { backend, handle } => Some((backend.clone(), handle.clone())),
+                    },
+                    _ => None,
+                }
             };
-            let result = {
-                let lua = l.lock().unwrap_or_else(|e| e.into_inner());
-                call_backend::<()>(&lua, &backend, "send", (handle, text, name))
-            };
-            if let Some(Err(e)) = result {
-                ed.lock().message = format!("{backend}: {}", first_line(&e));
+            if let Some((backend, handle)) = plugin {
+                // A named key (enter, ctrl+c) or the text it types.
+                let (text, name) = match crate::terminal::key_name(&key) {
+                    Some(name) => (None, Some(name)),
+                    None => (Some(text), None),
+                };
+                if let Some(Err(e)) = call_backend::<()>(lua, &backend, "send", (handle, text, name)) {
+                    ed.lock().message = format!("{backend}: {}", first_line(&e));
+                }
             }
-        }
-    });
-    // Calls Lua's vmac.hooks[name](args...): its result as a string ("" when
-    // there's no such hook, or it returned nothing).
-    let (ed, l) = (editor.clone(), lua.clone());
-    engine.register_fn("lua-hook", move |name: String, args: Vec<String>| -> String {
-        let result = {
-            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
-            let hook = lua
-                .globals()
-                .get::<mlua::Table>("vmac")
-                .and_then(|g| g.get::<mlua::Table>("hooks"))
-                .and_then(|h| h.get::<mlua::Function>(name.as_str()));
-            match hook {
-                Ok(f) => f.call::<Option<String>>(mlua::MultiValue::from_iter(
-                    args.into_iter().filter_map(|a| lua.create_string(&a).ok()).map(mlua::Value::String),
-                )),
-                Err(_) => Ok(None),
-            }
-        };
-        match result {
-            Ok(v) => v.unwrap_or_default(),
-            Err(e) => {
-                ed.lock().message = format!("lua hook {name}: {}", first_line(&e.to_string()));
-                String::new()
-            }
-        }
-    });
-    let (ed, l) = (editor.clone(), lua.clone());
-    engine.register_fn("lua-eval", move |code: String| {
-        let result = {
-            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
-            eval_lua_in(&lua, &code)
-        };
-        let mut st = ed.lock();
-        match result {
-            // No value (print, statements): keep whatever the code showed.
-            Ok(v) if v.is_empty() => {}
-            Ok(v) => st.message = v,
-            Err(e) => st.message = format!("lua: {}", first_line(&e)),
-        }
-    });
-    engine
+            Ok(())
+        })
+        .expect("a Lua function");
+    reg.vmac.set("terminal_send", send).expect("set in vmac");
 }
-
-/// A Lua state with the primitives in `vmac`, and the Lua side of the
-/// bridge (`vmac.command`, `vmac.map`, `vmac.hooks`, ...).
-fn fresh_lua(editor: &Editor) -> Lua {
-    let lua = Lua::new();
-    let vmac = lua.create_table().expect("a table");
-    {
-        let mut reg = Registry { engine: None, lua: Some((&lua, vmac.clone())) };
-        register_primitives(&mut reg, editor);
-    }
-    lua.globals().set("vmac", vmac.clone()).expect("set vmac");
-    // The editor's old name, so plugins written for it still load.
-    lua.globals().set("gmacs", vmac).expect("set gmacs");
-    lua.load(LUA_PRELUDE).set_name("prelude.lua").exec().expect("the Lua prelude runs");
-    lua
-}
-
-/// The Lua side of the bridge to Scheme.
-const LUA_PRELUDE: &str = r##"
-vmac.commands = {}
--- Functions that replace Scheme's: modeline, lsp_servers, syntax_theme.
-vmac.hooks = {}
-
-local function quote(s)
-  return '"' .. (s:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
-end
-
--- A command callable by name from anywhere (keys, SPC :, Scheme).
-function vmac.command(name, fn)
-  vmac.commands[name] = fn
-  vmac.scheme("(register-lua-command! '" .. name .. ")")
-end
-
--- Binds keys ("SPC i d") in a state (normal, insert, visual, operator)
--- to a command name or a function.
-local anonymous = 0
-function vmac.map(state, keys, command)
-  if type(command) == "function" then
-    anonymous = anonymous + 1
-    local name = "lua-command-" .. anonymous
-    vmac.command(name, command)
-    command = name
-  end
-  vmac.scheme("(lua-define-key '" .. state .. " " .. quote(keys) .. " '" .. command .. ")")
-end
-
--- Terminal backends: where a terminal's program runs, beside the built-in
--- "local" PTY. A backend is a table of functions:
---   start(command, cwd, rows, cols)   (command "" means a shell) returns
---     a handle, then vmac polls send and read; or
---     { handle = h, command = "tool attach h" }: vmac runs that command on
---     a local PTY, which carries keys, screen and size (tmux, ssh, hc...)
---   send(handle, text, key)   text it types, or a key name (enter, ctrl+c, up)
---   read(handle) -> the screen as text
---   alive(handle) -> bool     (optional)
---   kill(handle)              (optional; also called for attached terminals)
--- vmac.prompt(label, fn, initial): asks for a line in the minibuffer and
--- calls fn with it (when you press RET; ESC drops it).
-function vmac.prompt(label, fn, initial)
-  vmac.hooks._prompt = function(text) fn(text) end
-  local code = "(read-from-minibuffer " .. quote(label) .. " (lambda (text) (lua-hook \"_prompt\" (list text))))"
-  if initial and initial ~= "" then
-    code = code .. " (insert " .. quote(initial) .. ")"
-  end
-  vmac.scheme(code)
-end
-
--- Agent backends: vmac.agent_backend("codex", { command = "codex-acp" })
--- (or just the command line) for an ACP agent in *agent*, or
--- { terminal = "pi", resume = "pi --resume {id}" } for a CLI agent in a
--- terminal beside your code; then vmac.agent_use("codex") or SPC a b.
-function vmac.agent_backend(name, spec)
-  if type(spec) == "table" and spec.terminal then
-    vmac.agent_define_cli(name, spec.terminal, spec.resume or "")
-    return
-  end
-  local command = type(spec) == "table" and spec.command or spec
-  vmac.agent_define(name, command)
-end
-
-vmac.terminal_backends = {}
-function vmac.terminal_backend(name, backend)
-  vmac.terminal_backends[name] = backend
-end
-
--- Runs a command (Scheme's or Lua's) right after this one.
-function vmac.run(name)
-  vmac.scheme("(call-binding '" .. name .. ")")
-end
-
--- vmac.pick(title, items, fn, root): the fuzzy picker over items; fn gets
--- the one picked. With root (a folder), items are paths in it, previewed.
-function vmac.pick(title, items, fn, root)
-  vmac.hooks._pick = function(choice) fn(choice) end
-  local quoted = {}
-  for _, item in ipairs(items) do quoted[#quoted + 1] = quote(item) end
-  vmac.scheme("(pick " .. quote(title) .. " (list " .. table.concat(quoted, " ") .. ") " .. quote(root or "")
-    .. " (lambda (choice) (lua-hook \"_pick\" (list choice))))")
-end
-
--- print shows in the echo area.
-function print(...)
-  local parts = {}
-  for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-  vmac.message(table.concat(parts, " "))
-end
-"##;
 
 /// Calls a function of a plugin's terminal backend
 /// (`vmac.terminal_backends[backend][name]`); None when it has no such function.
@@ -1121,14 +699,6 @@ fn call_backend<R: mlua::FromLuaMulti>(
 
 fn first_line(e: &impl std::fmt::Display) -> String {
     e.to_string().lines().next().unwrap_or("").to_string()
-}
-
-/// Runs a Lua command registered with vmac.command.
-fn lua_command(lua: &Lua, name: &str) -> mlua::Result<()> {
-    let vmac: mlua::Table = lua.globals().get("vmac")?;
-    let commands: mlua::Table = vmac.get("commands")?;
-    let f: mlua::Function = commands.get(name)?;
-    f.call::<()>(())
 }
 
 /// Evaluates Lua and shows the result: an expression's value, else "".
@@ -1193,7 +763,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         s.buffer().search_backward(&re, before.max(0) as usize).map_or(-1, |p| p as isize)
     });
     pure!(reg, "regex-quote", |text: String| regex::escape(&text));
-    // The fuzzy picker. Scheme opens it and decides what picking does.
+    // The fuzzy picker. Lua opens it and decides what picking does.
     prim!(reg, editor, "project-root", |s| {
         let start = s
             .buffer()
@@ -1333,7 +903,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "scroll-window", |s, n: isize| s.scroll(n));
     prim!(reg, editor, "recenter", |s, place: String| s.recenter(&place));
 
-    // Buffers by name, for buffers Scheme draws itself (the file tree).
+    // Buffers by name, for buffers Lua draws itself (the file tree).
     prim!(reg, editor, "ensure-buffer", |s, name: String| {
         s.ensure_buffer(&name);
     });
@@ -1359,7 +929,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         s.open_sidebar(id);
     });
     prim!(reg, editor, "sidebar-close", |s| s.close_sidebar());
-    prim!(reg, editor, "sidebar-open?", |s| s.sidebar().is_some());
+    prim!(reg, editor, "sidebar-shown?", |s| s.sidebar().is_some());
     prim!(reg, editor, "sidebar-selected?", |s| s.is_sidebar(s.selected_window()));
     prim!(reg, editor, "select-main-window", |s| s.select_main_window());
 
@@ -1610,16 +1180,11 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
                 };
             });
         };
-        if let Some(engine) = reg.engine.as_mut() {
-            engine.register_fn("plugin-install", install.clone());
-        }
-        if let Some((lua, vmac)) = reg.lua.as_ref() {
-            let f = lua.create_function(move |_, url: String| {
-                install(url);
-                Ok(())
-            });
-            vmac.set("plugin_install", f.expect("a Lua function")).expect("set in vmac");
-        }
+        let f = reg.lua.create_function(move |_, url: String| {
+            install(url);
+            Ok(())
+        });
+        reg.vmac.set("plugin_install", f.expect("a Lua function")).expect("set in vmac");
     }
     {
         let ed = editor.clone();
@@ -1640,16 +1205,11 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
                 };
             });
         };
-        if let Some(engine) = reg.engine.as_mut() {
-            engine.register_fn("plugin-update", update.clone());
-        }
-        if let Some((lua, vmac)) = reg.lua.as_ref() {
-            let f = lua.create_function(move |_, ()| {
-                update();
-                Ok(())
-            });
-            vmac.set("plugin_update", f.expect("a Lua function")).expect("set in vmac");
-        }
+        let f = reg.lua.create_function(move |_, ()| {
+            update();
+            Ok(())
+        });
+        reg.vmac.set("plugin_update", f.expect("a Lua function")).expect("set in vmac");
     }
 
     // Terminals.
@@ -1869,10 +1429,6 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             .unwrap_or_default()
     });
 
-    // Scheme for Lua to run (vmac.scheme), silently, after the current command.
-    prim!(reg, editor, "scheme", |s, code: String| s.pending_scheme.push(code));
-    // Runs Scheme source after the current command (see `pending_eval`).
-    prim!(reg, editor, "eval-string", |s, code: String| s.pending_eval.push(code));
     prim!(reg, editor, "quit-editor", |s| s.quit_requested = true);
 }
 
@@ -1950,8 +1506,7 @@ mod tests {
         buf.insert(text);
         buf.goto_char(0);
         let editor = Editor::new(buf);
-        let core = Source { label: "core".into(), path: None };
-        (Lisp::new(editor.clone(), vec![core]), editor)
+        (Lisp::new(editor.clone()), editor)
     }
 
     fn text(editor: &Editor) -> String {
@@ -2070,7 +1625,7 @@ mod tests {
     #[test]
     fn redefining_a_command_changes_its_key() {
         let (mut lisp, editor) = lisp_with("abc");
-        lisp.eval(r#"(defcommand (delete-char-under) (insert "!"))"#).unwrap();
+        lisp.eval(r#"vmac.command("delete-char-under", function() vmac.insert("!") end)"#).unwrap();
         typed(&mut lisp, "x");
         assert_eq!(text(&editor), "!abc");
     }
@@ -2078,7 +1633,7 @@ mod tests {
     #[test]
     fn binding_a_key_at_runtime() {
         let (mut lisp, editor) = lisp_with("");
-        lisp.eval(r#"(define-key normal-map "Q" (lambda () (insert "tea")))"#).unwrap();
+        lisp.eval(r#"vmac.map("normal", "Q", function() vmac.insert("tea") end)"#).unwrap();
         typed(&mut lisp, "Q");
         assert_eq!(text(&editor), "tea");
     }
@@ -2086,7 +1641,7 @@ mod tests {
     #[test]
     fn ex_commands_from_colon() {
         let (mut lisp, editor) = lisp_with("");
-        typed(&mut lisp, ":eval (+ 1 2)\n");
+        typed(&mut lisp, ":lua 1 + 2\n");
         assert!(editor.lock().minibuffer_prompt.is_none());
         assert_eq!(editor.lock().message, "3");
         typed(&mut lisp, ":nope\n");
@@ -2101,9 +1656,9 @@ mod tests {
     }
 
     #[test]
-    fn spc_semicolon_evaluates_scheme() {
+    fn spc_semicolon_evaluates_lua() {
         let (mut lisp, editor) = lisp_with("");
-        typed(&mut lisp, " ;(* 6 7)\n");
+        typed(&mut lisp, " ;6 * 7\n");
         assert_eq!(text(&editor), "", "typing went to the minibuffer");
         assert_eq!(editor.lock().message, "42");
     }
@@ -2277,13 +1832,14 @@ mod tests {
     fn readme_custom_motion_example() {
         let (mut lisp, editor) = lisp_with("a\nb\n\nc");
         lisp.eval(r#"
-(define-motion 'next-blank-line 'linewise
-  (lambda (p) (let loop ((l (+ (pos->line p) 1)))
-                (cond ((>= l (line-count)) (line->pos (- (line-count) 1)))
-                      ((empty-line? (line->pos l)) (line->pos l))
-                      (else (loop (+ l 1)))))))
-(define-key normal-map "}" (lambda () (move-by 'next-blank-line)))
-(define-key operator-map "}" (operator-motion 'next-blank-line))
+core.define_motion("next-blank-line", "linewise", function(p)
+  for l = vmac.pos_to_line(p) + 1, vmac.line_count() - 1 do
+    if core.empty_line(vmac.line_to_pos(l)) then return vmac.line_to_pos(l) end
+  end
+  return vmac.line_to_pos(vmac.line_count() - 1)
+end)
+vmac.map("normal", "}", function() core.move_by("next-blank-line") end)
+vmac.map("operator", "}", core.operator_motion("next-blank-line"))
 "#).unwrap();
         typed(&mut lisp, "}");
         assert_eq!(editor.lock().buffer().line(), 2);
@@ -2403,24 +1959,24 @@ mod tests {
             assert_eq!(p.title(), "Find file");
             assert!(p.total() > 5);
         }
-        typed(&mut lisp, "95modeline");
-        assert_eq!(editor.lock().picker.as_ref().unwrap().selection(), Some("lisp/core/95-modeline.scm"));
+        typed(&mut lisp, "80looks");
+        assert_eq!(editor.lock().picker.as_ref().unwrap().selection(), Some("lua/core/80-looks.lua"));
         lisp.dispatch_key("RET", "");
         let st = editor.lock();
         assert!(st.picker.is_none(), "picking closes it");
-        assert_eq!(st.buffer().name(), "95-modeline.scm");
+        assert_eq!(st.buffer().name(), "80-looks.lua");
     }
 
     #[test]
     fn picker_keys_move_and_escape_closes() {
         let (mut lisp, editor) = lisp_with("");
-        lisp.eval(r#"(pick "Fruit" (list "apple" "banana" "cherry") "" (lambda (x) (message x)))"#).unwrap();
+        lisp.eval(r#"vmac.pick("Fruit", {"apple", "banana", "cherry"}, function(x) vmac.message(x) end)"#).unwrap();
         lisp.dispatch_key("C-n", "");
         lisp.dispatch_key("<down>", "");
         lisp.dispatch_key("C-p", "");
         lisp.dispatch_key("RET", "");
         assert_eq!(editor.lock().message, "banana");
-        lisp.eval(r#"(pick "Fruit" (list "apple" "banana") "" (lambda (x) (message x)))"#).unwrap();
+        lisp.eval(r#"vmac.pick("Fruit", {"apple", "banana"}, function(x) vmac.message(x) end)"#).unwrap();
         lisp.dispatch_key("ESC", "");
         assert!(editor.lock().picker.is_some(), "the first ESC leaves typing");
         lisp.dispatch_key("ESC", "");
@@ -2434,15 +1990,11 @@ mod tests {
     fn a_broken_reload_keeps_the_last_good_version() {
         let dir = std::env::temp_dir().join(format!("vmac-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let init = dir.join("init.scm");
-        std::fs::write(&init, "(defcommand (hi) (insert \"hi\"))").unwrap();
+        let init = dir.join("init.lua");
+        std::fs::write(&init, r#"vmac.command("hi", function() vmac.insert("hi") end)"#).unwrap();
         let editor = Editor::new(Buffer::new("t"));
-        let sources = vec![
-            Source { label: "core".into(), path: None },
-            Source { label: "init.scm".into(), path: Some(init.clone()) },
-        ];
-        let mut lisp = Lisp::new(editor.clone(), sources);
-        std::fs::write(&init, "(define (broken) (no-such-function))").unwrap();
+        let mut lisp = Lisp::with_lua(editor.clone(), vec![init.clone()]);
+        std::fs::write(&init, "vmac.map('normal', 'Q', 'x') vmac.no_such_function()").unwrap();
         lisp.reload();
         { let m = editor.lock().message.clone(); assert!(m.contains("kept the last version"), "{m}"); }
         typed(&mut lisp, ":hi\n");
@@ -2554,11 +2106,11 @@ mod tests {
     }
 
     #[test]
-    fn syntax_theme_comes_from_scheme() {
+    fn syntax_theme_comes_from_lua() {
         let (mut lisp, _editor) = lisp_with("");
         let theme = lisp.syntax_theme();
         assert!(theme.iter().any(|(c, f)| c == "keyword" && !f.is_empty()), "{theme:?}");
-        lisp.eval(r#"(define (syntax-theme) (list (list "keyword" 'red)))"#).unwrap();
+        lisp.eval(r#"function core.syntax_theme() return {{"keyword", "red"}} end"#).unwrap();
         assert_eq!(lisp.syntax_theme(), vec![("keyword".to_string(), "red".to_string())]);
     }
 
@@ -2577,8 +2129,8 @@ mod tests {
 
     fn open_fruit_picker(lisp: &mut Lisp) {
         lisp.eval(
-            r#"(pick "Fruit" (list "apple" "apricot" "banana" "cherry" "grape") ""
-                     (lambda (x) (message (string-append "picked " x))))"#,
+            r#"vmac.pick("Fruit", {"apple", "apricot", "banana", "cherry", "grape"},
+                       function(x) vmac.message("picked " .. x) end)"#,
         )
         .unwrap();
     }
@@ -2793,10 +2345,9 @@ mod tests {
     }
 
     #[test]
-    fn steel_strings_count_characters() {
+    fn core_lengths_count_characters() {
         let (mut lisp, _editor) = lisp_with("");
-        assert_eq!(lisp.eval(r#"(string-length "▾ é")"#).unwrap(), "3");
-        assert_eq!(lisp.eval(r#"(substring "▾ é" 2 3)"#).unwrap(), "\"é\"");
+        assert_eq!(lisp.eval(r#"core.length("▾ é")"#).unwrap(), "3");
     }
 
     /// A throwaway project: src/main.rs, src/util/, README.md, an ignored
@@ -2912,12 +2463,13 @@ mod tests {
     }
 
     #[test]
-    fn face_specs_come_from_scheme() {
+    fn face_specs_come_from_lua() {
         let (mut lisp, _editor) = lisp_with("");
         lisp.eval(
-            r#"(define (face-specs)
-                 (list (list "big" 'color 'accent 'scale 1.5 'weight 'bold 'family 'sans)
-                       (list "code" 'background 'muted 'slant 'italic 'underline #t)))"#,
+            r#"function core.face_specs()
+                 return { { "big", color = "accent", scale = 1.5, bold = true, sans = true },
+                          { "code", background = "muted", italic = true, underline = true } }
+               end"#,
         )
         .unwrap();
         let specs = lisp.face_specs();
@@ -2946,8 +2498,8 @@ mod tests {
     fn readme_face_override_example() {
         let (mut lisp, _editor) = lisp_with("");
         lisp.eval(
-            r#"(set-faces! (append (heading-faces 1 2.2 'magenta)
-                                   (list (list "md-bold" 'weight 'bold 'color 'yellow))))"#,
+            r#"vmac.set_faces({ { "md-h1", color = "magenta", scale = 2.2, bold = true, sans = true },
+                                 { "md-bold", bold = true, color = "yellow" } })"#,
         )
         .unwrap();
         let specs = lisp.face_specs();
@@ -3078,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn lsp_servers_come_from_scheme() {
+    fn lsp_servers_come_from_lua() {
         let (mut lisp, _editor) = lisp_with("");
         let servers = lisp.lsp_servers();
         let rust = servers.iter().find(|s| s.language == "rust").unwrap();
@@ -3088,8 +2640,8 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_jump_list_and_count_from_scheme() {
-        let dir = std::env::temp_dir().join(format!("vmac-lsp-scheme-{}", std::process::id()));
+    fn diagnostics_jump_list_and_count() {
+        let dir = std::env::temp_dir().join(format!("vmac-lsp-diagnostics-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let server = dir.join("server.py");
         std::fs::write(&server, crate::lsp::tests::FAKE_SERVER).unwrap();
@@ -3097,7 +2649,7 @@ mod tests {
         std::fs::write(&file, "fn main() {}\nlet x = 1;\n").unwrap();
 
         let (mut lisp, editor) = lisp_with("");
-        lisp.eval(&format!(r#"(define (lsp-servers) (list (list "rust" "python3" "{}")))"#, server.display())).unwrap();
+        lisp.eval(&format!(r#"function core.lsp_servers() return {{ {{ "rust", "python3", "{}" }} }} end"#, server.display())).unwrap();
         editor.lock().open_file(&file).unwrap();
         let mut got = false;
         for _ in 0..200 {
@@ -3353,7 +2905,7 @@ mod tests {
         assert!(!text(&editor).contains("to review"), "{}", text(&editor));
 
         // With review off, edits just land.
-        lisp.eval("(set-agent-review #f)").unwrap();
+        lisp.eval("vmac.set_agent_review(false)").unwrap();
         let fresh = dir.join("c.txt");
         std::fs::write(&fresh, original).unwrap();
         editor.lock().agent_prompt(&format!("patch {}", fresh.display()));
@@ -3372,9 +2924,9 @@ mod tests {
         }
         let (mut lisp, editor) = lisp_with("");
         editor.lock().open_file(&one.join("main.rs")).unwrap();
-        assert!(lisp.eval("dashboard-on-start").unwrap().contains("#t"));
+        assert_eq!(lisp.eval("core.dashboard_on_start").unwrap(), "true");
 
-        lisp.eval("(call-binding 'dashboard)").unwrap();
+        lisp.eval("core.call_binding(\'dashboard\')").unwrap();
         let shown = text(&editor);
         assert_eq!(editor.lock().buffer().name(), "*dashboard*");
         assert!(shown.contains("███"), "the banner");
@@ -3401,18 +2953,18 @@ mod tests {
         lisp.dispatch_key("ESC", "");
 
         // Another folder by path (SPC p a): it becomes the project.
-        lisp.eval(&format!("(project-switch-to \"{}\")", two.display())).unwrap();
+        lisp.eval(&format!("core.project_switch_to({:?})", two.display().to_string())).unwrap();
         assert_eq!(editor.lock().project.as_ref(), Some(&two));
         lisp.dispatch_key("RET", "");
         assert_eq!(editor.lock().buffer().file(), Some(&two.join("main.rs")));
-        lisp.eval("(call-binding 'dashboard)").unwrap();
+        lisp.eval("core.call_binding(\'dashboard\')").unwrap();
         let shown = text(&editor);
         let first = shown.find(&crate::projects::abbreviate(&two)).unwrap();
         let second = shown.find(&crate::projects::abbreviate(&one)).unwrap();
         assert!(first < second, "the latest project comes first: {shown}");
 
         // Not a folder: says so.
-        lisp.eval("(project-switch-to \"/no/such/folder\")").unwrap();
+        lisp.eval("core.project_switch_to('/no/such/folder')").unwrap();
         assert!(editor.lock().message.contains("not a folder"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3504,16 +3056,16 @@ mod tests {
         let (mut lisp, editor) = lisp_with("");
         editor.lock().open_file(&file).unwrap();
 
-        // Backends by name, from Scheme and Lua.
-        let names = lisp.eval("(agent-backends)").unwrap();
+        // Backends by name.
+        let names = lisp.eval("table.concat(vmac.agent_backends(), ' ')").unwrap();
         assert!(names.contains("claude") && names.contains("codex") && names.contains("gemini"), "{names}");
-        lisp.eval(&format!("(agent-define \"fake\" \"{}\")", config.line())).unwrap();
+        lisp.eval(&format!("vmac.agent_define(\'fake\', {:?})", config.line())).unwrap();
         lisp.eval_lua("vmac.agent_backend('other', { command = 'other-acp --flag' })").unwrap();
-        assert!(lisp.eval("(agent-backends)").unwrap().contains("other"));
+        assert!(lisp.eval("table.concat(vmac.agent_backends(), ' ')").unwrap().contains("other"));
         typed(&mut lisp, ":agent-use fake");
         lisp.dispatch_key("RET", "");
         assert_eq!(editor.lock().agent_config, config);
-        assert_eq!(lisp.eval("(agent-backend)").unwrap(), "\"fake\"");
+        assert_eq!(lisp.eval("vmac.agent_backend()").unwrap(), "fake");
 
         let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
             for _ in 0..250 {
@@ -3528,32 +3080,32 @@ mod tests {
         };
         let idle = |s: &mut EditorState| s.agent.as_ref().is_some_and(|a| a.state == crate::agent::State::Idle && a.transcript().contains("✓ Edit") || a.transcript().contains("✗ Edit"));
 
-        // A Scheme rule allows edits: no one is asked; hooks hear it all.
+        // A rule allows edits: no one is asked; hooks hear it all.
         lisp.eval(r#"
-            (define (agent-permission-rule title kind) (if (equal? kind "edit") "allow" "ask"))
-            (define heard '())
-            (define (agent-on-tool-call title kind status) (set! heard (cons (string-append kind ":" status) heard)))
-            (define (agent-on-turn-end reason) (set! heard (cons (string-append "done:" reason) heard)))
+            vmac.hooks.agent_permission = function(title, kind) if kind == "edit" then return "allow" end end
+            heard = {}
+            vmac.hooks.agent_tool_call = function(title, kind, status) heard[#heard + 1] = kind .. ":" .. status end
+            vmac.hooks.agent_turn_end = function(reason) heard[#heard + 1] = "done:" .. reason end
         "#).unwrap();
         editor.lock().agent_prompt(&format!("edit {}", file.display()));
         assert!(pump(&mut lisp, &|s| idle(s) && s.agent_status() == "ready"), "{:?}", editor.lock().agent.as_ref().map(|a| a.transcript()));
         assert!(editor.lock().picker.is_none(), "nobody was asked");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "QUIET\n");
-        let heard = lisp.eval("heard").unwrap();
+        let heard = lisp.eval("table.concat(heard, ' ')").unwrap();
         assert!(heard.contains("done:end_turn") && heard.contains("edit:completed") && heard.contains("edit:pending"), "{heard}");
 
-        // Lua's rule comes first: it rejects.
+        // Another rule rejects.
         lisp.eval_lua("vmac.hooks.agent_permission = function(title, kind) return 'reject' end").unwrap();
         lisp.eval_lua("ended = nil; vmac.hooks.agent_turn_end = function(reason) ended = reason end").unwrap();
-        lisp.eval("(call-binding 'agent-new)").unwrap();
+        lisp.eval("core.call_binding(\'agent-new\')").unwrap();
         editor.lock().agent_prompt(&format!("edit {}", file.display()));
         assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("✗ Edit")) && s.agent_status() == "ready"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "QUIET\n", "rejected: unchanged");
         assert_eq!(lisp.eval_lua("return ended").unwrap(), "end_turn");
 
         // The dashboard's items can be redefined too.
-        lisp.eval(r#"(define (dashboard-items) (list (list "z" "Zebra" 'quit)))"#).unwrap();
-        lisp.eval("(call-binding 'dashboard)").unwrap();
+        lisp.eval(r#"function core.dashboard_items() return { { "z", "Zebra", "quit" } } end"#).unwrap();
+        lisp.eval("core.call_binding(\'dashboard\')").unwrap();
         assert!(text(&editor).contains("z   Zebra"), "{}", text(&editor));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3590,7 +3142,7 @@ mod tests {
         lisp.dispatch_key("ESC", "");
 
         // Unsynced, p uses vmac's register; Cmd-V still the clipboard.
-        lisp.eval("(set-clipboard-sync #f)").unwrap();
+        lisp.eval("vmac.set_clipboard_sync(false)").unwrap();
         *board.lock().unwrap() = "elsewhere".into();
         typed(&mut lisp, "Gddu");
         typed(&mut lisp, "ggyy");
@@ -3611,23 +3163,23 @@ mod tests {
         lisp.dispatch_key("RET", "");
         let (mode, dark) = { let st = editor.lock(); (st.theme_mode.clone(), st.dark_theme.clone()) };
         assert_eq!((mode.as_str(), dark.as_str()), ("dark", "Catppuccin Mocha"));
-        lisp.eval(r#"(set-themes "Catppuccin Latte" "Catppuccin Mocha")"#).unwrap();
+        lisp.eval(r#"vmac.set_themes("Catppuccin Latte", "Catppuccin Mocha")"#).unwrap();
         assert_eq!(editor.lock().theme_mode, "system");
         assert_eq!(editor.lock().theme_name(false), "Catppuccin Latte");
-        lisp.eval(r#"(set-theme "Nope")"#).unwrap();
+        lisp.eval(r#"vmac.set_theme("Nope")"#).unwrap();
         assert!(editor.lock().message.contains("No theme called Nope"));
-        lisp.eval("(call-binding 'theme-picker)").unwrap();
+        lisp.eval("core.call_binding(\'theme-picker\')").unwrap();
         assert_eq!(editor.lock().picker.as_ref().map(|p| p.title().to_string()).as_deref(), Some("Theme"));
         lisp.dispatch_key("ESC", "");
         lisp.dispatch_key("ESC", "");
 
         // Markup is hidden outside insert state; raw while typing.
-        assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#false");
+        assert_eq!(lisp.eval("core.markdown_raw()").unwrap(), "false");
         typed(&mut lisp, "i");
-        assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#true");
+        assert_eq!(lisp.eval("core.markdown_raw()").unwrap(), "true");
         lisp.dispatch_key("ESC", "");
         typed(&mut lisp, "v");
-        assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#true", "selecting shows the text too");
+        assert_eq!(lisp.eval("core.markdown_raw()").unwrap(), "true", "selecting shows the text too");
         lisp.dispatch_key("ESC", "");
         // SPC t m: markup hidden -> as typed -> rendered -> markup hidden.
         let view = || { let st = editor.lock(); (st.markdown_rendered, st.markdown_conceal) };
@@ -3638,7 +3190,7 @@ mod tests {
         assert_eq!(view(), (true, true));
         typed(&mut lisp, " tm");
         assert_eq!(view(), (false, true));
-        lisp.eval(r#"(set-markdown-view "raw")"#).unwrap();
+        lisp.eval(r#"vmac.set_markdown_view("raw")"#).unwrap();
         assert_eq!(view(), (false, false));
 
         // The preview takes the right of the editor while a Markdown file shows.
@@ -3670,8 +3222,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         let (mut lisp, editor) = lisp_with("");
         editor.lock().open_file(&dir.join("a.txt")).unwrap();
-        lisp.eval(&format!("(agent-define \"fake\" \"{}\")", config.line())).unwrap();
-        lisp.eval("(agent-use \"fake\")").unwrap();
+        lisp.eval(&format!("vmac.agent_define(\'fake\', {:?})", config.line())).unwrap();
+        lisp.eval("vmac.agent_use('fake')").unwrap();
         let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
             for _ in 0..250 {
                 editor.lock().agent_pump();
@@ -3711,9 +3263,9 @@ mod tests {
         )
         .unwrap();
         editor.lock().claude_dir = Some(projects);
-        lisp.eval(&format!("(agent-define \"claude\" \"{}\")", config.line())).unwrap();
-        lisp.eval("(agent-use \"claude\")").unwrap();
-        lisp.eval("(call-binding 'agent-history-all)").unwrap();
+        lisp.eval(&format!("vmac.agent_define(\'claude\', {:?})", config.line())).unwrap();
+        lisp.eval("vmac.agent_use('claude')").unwrap();
+        lisp.eval("core.call_binding(\'agent-history-all\')").unwrap();
         lisp.run_events();
         let first = editor.lock().picker.as_ref().map(|p| p.selection().unwrap_or("").to_string());
         assert!(first.as_deref().is_some_and(|f| f.starts_with("1. Work done in the terminal  ·  ")), "{first:?}");
@@ -3745,11 +3297,11 @@ for line in sys.stdin:
         editor.lock().open_file(&file).unwrap();
 
         // The Lua core defines the CLI agents.
-        let names = lisp.eval("(agent-backends)").unwrap();
+        let names = lisp.eval("table.concat(vmac.agent_backends(), ' ')").unwrap();
         assert!(names.contains("claude-cli") && names.contains("codex-cli"), "{names}");
         lisp.eval_lua(&format!("vmac.agent_backend('fakecli', {{ terminal = 'python3 {}' }})", script.display())).unwrap();
-        lisp.eval("(agent-use \"fakecli\")").unwrap();
-        assert_eq!(lisp.eval("(agent-kind)").unwrap(), "\"cli\"");
+        lisp.eval("vmac.agent_use('fakecli')").unwrap();
+        assert_eq!(lisp.eval("vmac.agent_kind()").unwrap(), "cli");
 
         let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
             for _ in 0..250 {
@@ -3768,7 +3320,7 @@ for line in sys.stdin:
         // SPC a a: its pane on the right, typing to it.
         typed(&mut lisp, " aa");
         assert_eq!(editor.lock().buffer().name(), "*fakecli*");
-        assert_eq!(lisp.eval("(terminal-insert?)").unwrap(), "#true");
+        assert_eq!(lisp.eval("core.terminal_insert()").unwrap(), "true");
         assert_eq!(editor.lock().agent_status(), "running");
         lisp.dispatch_key("ESC", "");
 
@@ -3789,7 +3341,7 @@ for line in sys.stdin:
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n", "rejected: the old text is back");
 
         // SPC a t hides its pane (from it), and shows it again.
-        lisp.eval("(agent-cli-open)").unwrap();
+        lisp.eval("vmac.agent_cli_open()").unwrap();
         assert!(editor.lock().agent_cli_here());
         typed(&mut lisp, " at");
         assert!(!editor.lock().agent_cli_here());
@@ -3809,8 +3361,8 @@ for line in sys.stdin:
         editor.lock().claude_dir = Some(projects);
         let line = format!("python3 {}", script.display());
         lisp.eval_lua(&format!("vmac.agent_backend('claude-cli', {{ terminal = '{line}', resume = '{line} --resume {{id}}' }})")).unwrap();
-        lisp.eval("(agent-use \"claude-cli\")").unwrap();
-        lisp.eval("(call-binding 'agent-history-all)").unwrap();
+        lisp.eval("vmac.agent_use('claude-cli')").unwrap();
+        lisp.eval("core.call_binding(\'agent-history-all\')").unwrap();
         lisp.run_events();
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| s.buffer_text_named("*claude-cli*").is_some_and(|t| t.contains("resumed sess-42"))),
@@ -3898,27 +3450,27 @@ for line in sys.stdin:
     #[test]
     fn the_mouse_clicks_drags_and_double_clicks() {
         let (mut lisp, editor) = lisp_with("alpha beta\ngamma delta\n");
-        let state = |lisp: &mut Lisp| lisp.eval("evil-state").unwrap();
-        lisp.eval("(mouse-click 8 1)").unwrap();
+        let state = |lisp: &mut Lisp| lisp.eval("core.state").unwrap();
+        lisp.eval("core.mouse_click(8, 1)").unwrap();
         assert_eq!(editor.lock().buffer().point(), 8);
-        lisp.eval("(mouse-click 10 1)").unwrap();
+        lisp.eval("core.mouse_click(10, 1)").unwrap();
         assert_eq!(editor.lock().buffer().point(), 9, "past the line's end: its last character");
         // Dragging from beta into gamma selects, as v does.
-        lisp.eval("(mouse-click 6 1)").unwrap();
-        lisp.eval("(mouse-drag 13)").unwrap();
+        lisp.eval("core.mouse_click(6, 1)").unwrap();
+        lisp.eval("core.mouse_drag(13)").unwrap();
         assert_eq!(state(&mut lisp), "visual");
         assert_eq!(lisp.selection(), vec![(6, 14)]);
-        lisp.eval("(mouse-click 0 1)").unwrap();
+        lisp.eval("core.mouse_click(0, 1)").unwrap();
         assert_eq!(state(&mut lisp), "normal", "a click ends the selection");
-        lisp.eval("(mouse-click 13 2)").unwrap();
+        lisp.eval("core.mouse_click(13, 2)").unwrap();
         assert_eq!(lisp.selection(), vec![(11, 16)], "a double click selects the word");
         assert!(editor.lock().whichkey.is_none(), "and leaves no which-key popup open");
-        lisp.eval("(mouse-click 13 3)").unwrap();
+        lisp.eval("core.mouse_click(13, 3)").unwrap();
         assert_eq!(state(&mut lisp), "visual-line", "a triple click, the line");
         // Typing: a click moves the cursor and keeps inserting.
-        lisp.eval("(mouse-click 0 1)").unwrap();
+        lisp.eval("core.mouse_click(0, 1)").unwrap();
         typed(&mut lisp, "i");
-        lisp.eval("(mouse-click 10 1)").unwrap();
+        lisp.eval("core.mouse_click(10, 1)").unwrap();
         assert_eq!((state(&mut lisp).as_str(), editor.lock().buffer().point()), ("insert", 10));
     }
 
@@ -3969,12 +3521,12 @@ for line in sys.stdin:
         // A core folder calling a primitive this binary doesn't have.
         let dir = std::env::temp_dir().join(format!("vmac-newer-core-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("00-new.scm"), "(define (x) (primitive-from-the-future))").unwrap();
+        std::fs::write(dir.join("00-core.lua"), "vmac.primitive_from_the_future()").unwrap();
         let editor = Editor::new(Buffer::new("*scratch*"));
-        let mut lisp = Lisp::with_config(editor.clone(), vec![Source { label: "core".into(), path: Some(dir.clone()) }], vec![], None);
+        let mut lisp = Lisp::with_core_dir(editor.clone(), dir.clone());
         let message = editor.lock().message.clone();
         assert!(message.contains("using the core built into vmac"), "{message}");
-        assert!(lisp.eval("(procedure? dispatch-key)").unwrap().contains("true"), "the built-in core runs");
+        assert_eq!(lisp.eval("type(core.dispatch_key)").unwrap(), "function", "the built-in core runs");
         assert!(!lisp.modeline().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4002,7 +3554,7 @@ for line in sys.stdin:
         let file = dir.join("main.rs");
         std::fs::write(&file, text).unwrap();
         let (mut lisp, editor) = lisp_with("");
-        lisp.eval(&format!(r#"(define (lsp-servers) (list (list "rust" "python3" "{}")))"#, server.display())).unwrap();
+        lisp.eval(&format!(r#"function core.lsp_servers() return {{ {{ "rust", "python3", "{}" }} }} end"#, server.display())).unwrap();
         editor.lock().open_file(&file).unwrap();
         (lisp, editor, dir)
     }
@@ -4188,15 +3740,30 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn the_built_in_core_matches_lisp_core() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lisp/core");
-        let on_disk: Vec<String> =
-            scheme_files(&dir).iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
-        let built_in: Vec<String> = CORE_FILES.iter().map(|(n, _)| n.to_string()).collect();
-        assert_eq!(on_disk, built_in, "add new lisp/core files to CORE_FILES in lisp.rs");
-        let from_dir = Source { label: "core".into(), path: Some(dir) }.read().unwrap();
-        let embedded = Source { label: "core".into(), path: None }.read().unwrap();
-        assert_eq!(from_dir, embedded);
+    fn the_built_in_core_matches_lua_core() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/core");
+        assert_eq!(lua_core_files(Some(&dir)), built_in_core(), "add new lua/core files to LUA_CORE_FILES in lisp.rs");
+    }
+
+    /// Every vmac.x / core.x the core calls exists (a typo would only show
+    /// when that command runs).
+    #[test]
+    fn the_core_calls_only_functions_that_exist() {
+        let (mut lisp, _editor) = lisp_with("");
+        let re = regex::Regex::new(r"\b(V|vmac|core)\.([a-z_][a-z0-9_]*)\s*\(").unwrap();
+        let mut missing = Vec::new();
+        for (name, code) in built_in_core() {
+            // Set while it runs: the operator waiting for its motion.
+            for c in re.captures_iter(&code).filter(|c| &c[2] != "pending_operator") {
+                let table = if &c[1] == "core" { "core" } else { "vmac" };
+                let check = format!("type({table}.{})", &c[2]);
+                if lisp.eval(&check).unwrap() != "function" {
+                    missing.push(format!("{name}: {table}.{}", &c[2]));
+                }
+            }
+        }
+        missing.dedup();
+        assert!(missing.is_empty(), "{missing:#?}");
     }
 
     #[test]
@@ -4208,7 +3775,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn lua_names_follow_scheme_names() {
+    fn lua_names_of_primitives() {
         assert_eq!(lua_name("buffer-name"), "buffer_name");
         assert_eq!(lua_name("minibuffer-active?"), "minibuffer_active");
         assert_eq!(lua_name("pos->line"), "pos_to_line");
@@ -4227,7 +3794,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn lua_commands_and_keys_work_beside_scheme() {
+    fn lua_commands_and_keys() {
         let (mut lisp, editor) = lisp_with("");
         lisp.eval_lua(r#"
             vmac.command("insert-greeting", function() vmac.insert("hi from lua") end)
@@ -4242,8 +3809,7 @@ for line in sys.stdin:
         typed(&mut lisp, "u");
         typed(&mut lisp, "0 :insert-greeting\n");
         assert_eq!(text(&editor).matches("hi from lua").count(), 2, "Lua commands run from M-x too: {:?}", text(&editor));
-        // Scheme binds a Lua command by name, and Lua runs a Scheme command.
-        lisp.eval(r#"(define-key normal-map "Z" 'insert-greeting)"#).unwrap();
+        // A key runs a command by name.
         lisp.eval_lua(r#"vmac.map("normal", "W", function() vmac.run("delete-char-under") end)"#).unwrap();
         let before = text(&editor).len();
         typed(&mut lisp, "0W");
@@ -4288,14 +3854,13 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn init_lua_loads_after_scheme_and_reloads() {
+    fn init_lua_loads_after_the_core_and_reloads() {
         let dir = std::env::temp_dir().join(format!("vmac-init-lua-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let init = dir.join("init.lua");
         std::fs::write(&init, r#"vmac.map("normal", "Q", function() vmac.insert("one") end)"#).unwrap();
         let editor = Editor::new(Buffer::new("t"));
-        let core = Source { label: "core".into(), path: None };
-        let mut lisp = Lisp::with_lua(editor.clone(), vec![core], vec![init.clone()]);
+        let mut lisp = Lisp::with_lua(editor.clone(), vec![init.clone()]);
         assert_eq!(editor.lock().message, "loaded core, init.lua");
         typed(&mut lisp, "Q");
         assert_eq!(text(&editor), "one");
@@ -4306,9 +3871,11 @@ for line in sys.stdin:
         assert_eq!(text(&editor), "twoone");
         std::fs::write(&init, "this is not lua").unwrap();
         lisp.reload();
-        { let m = editor.lock().message.clone(); assert!(m.starts_with("init.lua:"), "{m}"); }
+        { let m = editor.lock().message.clone(); assert!(m.starts_with("init.lua:") && m.contains("kept the last version"), "{m}"); }
+        typed(&mut lisp, "0Q");
+        assert_eq!(text(&editor), "twotwoone", "the last init.lua that loaded is kept");
         typed(&mut lisp, "ix");
-        assert!(text(&editor).contains('x'), "Scheme still works when init.lua is broken");
+        assert!(text(&editor).contains('x'), "the core still works when init.lua is broken");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4316,11 +3883,11 @@ for line in sys.stdin:
     fn the_example_init_lua_works() {
         let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/init.lua");
         let editor = Editor::new(Buffer::new("notes"));
-        let mut lisp = Lisp::with_lua(editor.clone(), vec![Source { label: "core".into(), path: None }], vec![example]);
+        let mut lisp = Lisp::with_lua(editor.clone(), vec![example]);
         assert_eq!(editor.lock().message, "loaded core, init.lua");
         typed(&mut lisp, " it");
         assert_eq!(text(&editor), "TODO: ");
-        assert_eq!(lisp.cursor_shape(), "bar", "the Scheme command it ran put it in insert state");
+        assert_eq!(lisp.cursor_shape(), "bar", "the command it ran put it in insert state");
         lisp.dispatch_key("ESC", "");
         typed(&mut lisp, "0 id");
         assert_eq!(text(&editor).len(), "TODO: ".len() + "2026-01-01".len());
@@ -4328,8 +3895,8 @@ for line in sys.stdin:
         assert_eq!(modeline[0].text, "notes ●");
     }
 
-    /// A plugins folder with: `zen` (Scheme), `wc` (Lua, requiring a module
-    /// of its own), `broken` (bad Scheme), `off` (disabled), and `stamp.lua`.
+    /// A plugins folder with: `zen`, `wc` (requiring a module of its own),
+    /// `broken`, `off` (disabled), and `stamp.lua`.
     fn plugin_setup(tag: &str) -> (PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!("vmac-plugin-load-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -4339,24 +3906,20 @@ for line in sys.stdin:
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         };
-        write("zen/init.scm", r#"(defcommand (zen-insert) (insert "zen")) (define-key normal-map "Z" 'zen-insert)"#);
+        write("zen/init.lua", r#"vmac.command("zen-insert", function() vmac.insert("zen") end) vmac.map("normal", "Z", "zen-insert")"#);
         write("wc/init.lua", r#"local util = require("wc_util")
 vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string()) .. " words") end)"#);
         write("wc/lua/wc_util.lua", "return { count = function(s) local n = 0 for _ in s:gmatch('%S+') do n = n + 1 end return n end }");
-        write("broken/init.scm", "(define (oops) (no-such-function))");
-        write("off/init.scm", r#"(defcommand (off-insert) (insert "off"))"#);
+        write("broken/init.lua", "vmac.no_such_function()");
+        write("off/init.lua", r#"vmac.command("off-insert", function() vmac.insert("off") end)"#);
         write("off/disabled", "");
         write("stamp.lua", r#"vmac.command("stamp", function() vmac.insert("stamped") end)"#);
         (base, dir)
     }
 
-    fn with_plugins(dir: &Path, init_scm: Option<&Path>) -> (Lisp, Editor) {
+    fn with_plugins(dir: &Path, init: Option<&Path>) -> (Lisp, Editor) {
         let editor = Editor::new(Buffer::new("t"));
-        let mut sources = vec![Source { label: "core".into(), path: None }];
-        if let Some(init) = init_scm {
-            sources.push(Source { label: "init.scm".into(), path: Some(init.to_path_buf()) });
-        }
-        let lisp = Lisp::with_config(editor.clone(), sources, vec![], Some(dir.to_path_buf()));
+        let lisp = Lisp::load(editor.clone(), None, init.into_iter().map(Path::to_path_buf).collect(), Some(dir.to_path_buf()));
         (lisp, editor)
     }
 
@@ -4369,7 +3932,7 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
             assert!(m.starts_with("broken: "), "the broken plugin's error is shown: {m}");
         }
         typed(&mut lisp, "Z");
-        assert_eq!(text(&editor), "zen", "a Scheme plugin's key");
+        assert_eq!(text(&editor), "zen", "a plugin's key");
         typed(&mut lisp, " :stamp\n");
         assert!(text(&editor).contains("stamped"), "a single-file Lua plugin");
         typed(&mut lisp, " :word-count\n");
@@ -4379,9 +3942,9 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         typed(&mut lisp, "0x");
         assert_eq!(text(&editor).chars().count(), "zenstamped".len() - 1, "the core still works");
 
-        let list = lisp.eval("(plugin-list)").unwrap();
-        assert!(list.contains("broken  (scheme)  failed:"), "{list}");
-        assert!(list.contains("off  (scheme)  off") && list.contains("wc  (lua)  loaded"), "{list}");
+        let list = lisp.eval("table.concat(vmac.plugin_list(), '\\n')").unwrap();
+        assert!(list.contains("broken  (lua)  failed:"), "{list}");
+        assert!(list.contains("off  (lua)  off") && list.contains("wc  (lua)  loaded"), "{list}");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -4389,12 +3952,12 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
     fn the_users_init_loads_after_plugins() {
         let (base, dir) = plugin_setup("order");
         std::fs::remove_dir_all(dir.join("broken")).unwrap();
-        let init = base.join("init.scm");
-        std::fs::write(&init, r#"(define-key normal-map "Z" (lambda () (insert "mine")))"#).unwrap();
+        let init = base.join("init.lua");
+        std::fs::write(&init, r#"vmac.map("normal", "Z", function() vmac.insert("mine") end)"#).unwrap();
         let (mut lisp, editor) = with_plugins(&dir, Some(&init));
-        assert_eq!(editor.lock().message, "loaded core, 3 plugins, init.scm");
+        assert_eq!(editor.lock().message, "loaded core, 3 plugins, init.lua");
         typed(&mut lisp, "Z");
-        assert_eq!(text(&editor), "mine", "init.scm overrides the plugin's key");
+        assert_eq!(text(&editor), "mine", "init.lua overrides the plugin's key");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -4412,10 +3975,10 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         assert_eq!(editor.lock().message, "zen-insert is not a command", "turned off");
         assert!(dir.join("zen/disabled").exists());
 
-        lisp.eval(r#"(plugin-toggle "zen")"#).unwrap();
+        lisp.eval(r#"vmac.plugin_toggle("zen")"#).unwrap();
         assert!(lisp.reload_if_changed());
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(dir.join("zen/init.scm"), r#"(defcommand (zen-insert) (insert "zen 2"))"#).unwrap();
+        std::fs::write(dir.join("zen/init.lua"), r#"vmac.command("zen-insert", function() vmac.insert("zen 2") end)"#).unwrap();
         assert!(lisp.reload_if_changed(), "editing a plugin reloads it");
         typed(&mut lisp, " :zen-insert\n");
         assert_eq!(text(&editor), "zen 2");
@@ -4426,7 +3989,7 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
     fn a_plugin_fixed_on_disk_comes_back() {
         let (base, dir) = plugin_setup("fix");
         let (mut lisp, editor) = with_plugins(&dir, None);
-        std::fs::write(dir.join("broken/init.scm"), r#"(defcommand (fixed) (insert "fixed"))"#).unwrap();
+        std::fs::write(dir.join("broken/init.lua"), r#"vmac.command("fixed", function() vmac.insert("fixed") end)"#).unwrap();
         lisp.reload();
         typed(&mut lisp, " :fixed\n");
         assert_eq!(text(&editor), "fixed");
@@ -4639,7 +4202,7 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         assert_eq!(editor.lock().font.as_deref(), Some("Hack Nerd Font Mono"));
         assert_eq!(editor.lock().message, "no font named Nope (:fonts lists them)");
         lisp.eval_lua(r#"vmac.set_font("Menlo")"#).unwrap();
-        assert_eq!(lisp.eval("(font)").unwrap(), "\"Menlo\"");
+        assert_eq!(lisp.eval("vmac.font()").unwrap(), "Menlo");
         typed(&mut lisp, ":fonts\n");
         assert!(editor.lock().picker.is_some());
         typed(&mut lisp, "hack\n");
@@ -4655,7 +4218,7 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         typed(&mut lisp, ":theme purple\n");
         assert_eq!(editor.lock().theme_mode, "dark", "only system, light or dark");
         lisp.eval_lua(r#"vmac.set_theme("system")"#).unwrap();
-        assert_eq!(lisp.eval("(theme)").unwrap(), "\"system\"");
+        assert_eq!(lisp.eval("vmac.theme()").unwrap(), "system");
     }
 
     #[test]
@@ -4692,11 +4255,11 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
     }
 
     #[test]
-    fn modeline_comes_from_scheme() {
+    fn modeline_comes_from_lua() {
         let (mut lisp, _editor) = lisp_with("");
         let segs = lisp.modeline();
         assert!(segs.iter().any(|s| s.text.contains("test")), "{segs:?}");
-        lisp.eval(r#"(define (modeline) (list (list "custom" 'accent)))"#).unwrap();
+        lisp.eval(r#"function core.modeline() return { { "custom", "accent" } } end"#).unwrap();
         assert_eq!(
             lisp.modeline(),
             vec![Segment { text: "custom".into(), face: "accent".into() }]

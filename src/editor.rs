@@ -1,9 +1,10 @@
-//! The editor's state, shared between the Steel primitives and the GPUI view:
-//! the buffers, the windows showing them and how the windows are split.
+//! The editor's state, shared between the Lua primitives and the session that
+//! lays it out: the buffers, the windows showing them and how the windows are
+//! split.
 //!
-//! Steel requires native functions to be `Send + Sync`, so the state lives
-//! behind `Arc<Mutex<_>>`. Everything runs on GPUI's main thread, so the lock
-//! is never contended; it is only there to satisfy the bounds.
+//! Lua's functions must be `Send`, so the state lives behind `Arc<Mutex<_>>`.
+//! A session runs on one thread, so the lock is never contended; it is only
+//! there to satisfy the bounds.
 
 use crate::buffer::Buffer;
 use crate::lsp::{CompletionItem, Diagnostic, Doc, Location, Lsp, Reply, RequestKind, ServerConfig, WorkspaceEdit};
@@ -282,12 +283,6 @@ pub struct EditorState {
     pub clipboard: Option<SystemClipboard>,
     pub clipboard_sync: bool,
     clipboard_last: String,
-    /// Scheme source queued by `eval-string` (the primitive can't re-enter the
-    /// engine that is calling it), run by the host after the current command.
-    pub pending_eval: Vec<String>,
-    /// Scheme queued by Lua (vmac.scheme): run silently after the current
-    /// command, or after init.lua loads.
-    pub pending_scheme: Vec<String>,
     /// Where plugins live, the plugins found at the last load and how each
     /// went, and whether something (an install) asked for a reload.
     pub plugin_dir: Option<PathBuf>,
@@ -378,7 +373,7 @@ pub struct EditorState {
     pub history: crate::projects::History,
     /// The project opened last (SPC p p), for buffers without a file.
     pub project: Option<PathBuf>,
-    /// The dashboard: its buffer, what Scheme asked it to show (banner
+    /// The dashboard: its buffer, what Lua asked it to show (banner
     /// lines; items as key, label, command), each line's action, and the
     /// width it was laid out for.
     dashboard_buffer: Option<BufferId>,
@@ -387,8 +382,8 @@ pub struct EditorState {
     dashboard_width: usize,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
-    /// Things for Scheme to handle (a function name and its arguments),
-    /// raised where Rust can't call Scheme (server replies).
+    /// Things for Lua to handle (`core.events[name]` and its arguments),
+    /// raised where Rust can't call Lua (server replies).
     events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
     /// The folder relative paths, pickers and new programs start from. Each
@@ -518,8 +513,6 @@ impl EditorState {
             clipboard: None,
             clipboard_sync: true,
             clipboard_last: String::new(),
-            pending_eval: Vec::new(),
-            pending_scheme: Vec::new(),
             plugin_dir: None,
             plugins: Vec::new(),
             reload_requested: false,
@@ -1597,7 +1590,7 @@ impl EditorState {
             changed = true;
         }
         self.agent_terminals_pump();
-        // Hooks: tool calls and finished turns, for Scheme (and Lua) to hear.
+        // Hooks: tool calls and finished turns, for Lua to hear.
         let events = self.agent.as_mut().map(|a| a.take_events()).unwrap_or_default();
         for event in events {
             changed = true;
@@ -2348,7 +2341,7 @@ impl EditorState {
         self.agent_visit(&path, Some(start as u64 + 1));
     }
 
-    /// Raises an event for Scheme (and, through lua-event, Lua) to handle.
+    /// Raises an event for Lua (`core.events[name]`) to handle.
     pub fn push_event(&mut self, name: &str, args: Vec<String>) {
         self.events.push((name.to_string(), args));
     }
@@ -2601,7 +2594,7 @@ impl EditorState {
         }
     }
 
-    /// Puts sessions to the person (a picker, from Scheme).
+    /// Puts sessions to the person (a picker, from Lua).
     fn offer_sessions(&mut self, list: Vec<crate::sessions::Session>, from_claude: bool) {
         if list.is_empty() {
             self.message = "No sessions to reopen".into();

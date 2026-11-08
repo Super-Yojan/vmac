@@ -1,7 +1,7 @@
 //! A text buffer: a rope plus a point (the cursor), in characters.
 //!
 //! This is the Rust core's job: fast text storage and movement. What a key
-//! *does* is decided in Scheme; these are the primitives it calls.
+//! *does* is decided in Lua; these are the primitives it calls.
 
 use ropey::Rope;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ pub struct Buffer {
     modified: bool,
     /// Edits are refused (the file tree, help buffers). `set_text` still works.
     read_only: bool,
-    /// Faces on ranges of the text, set from Scheme (like Emacs text
+    /// Faces on ranges of the text, set from Lua (like Emacs text
     /// properties): `(start, end, face)` in characters.
     faces: Vec<(usize, usize, String)>,
     /// Bumped on every change; tells undo snapshots apart.

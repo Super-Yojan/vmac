@@ -1,6 +1,6 @@
 //! Markdown highlighting: a line scanner that names each piece of a line the
 //! way tree-sitter names code (`markup.heading.1`, `markup.bold`, ...), so
-//! the same `(syntax-theme)` and faces style it. Headings keep their `#`
+//! the same `core.syntax_theme()` and faces style it. Headings keep their `#`
 //! marks (named `markup.heading.N.marker`) so the cursor moves over the real
 //! text.
 

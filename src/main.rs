@@ -1,5 +1,5 @@
-//! vmac: a modal (evil-style) editor whose behavior is written in Steel
-//! Scheme and can be redefined while it runs. See README.md.
+//! vmac: a modal (evil-style) editor whose behavior is written in Lua and
+//! can be redefined while it runs. See README.md.
 
 mod agent;
 mod buffer;
@@ -100,7 +100,7 @@ fn new_server(start: Option<(Buffer, bool)>) -> server::Server {
     let (editor, mut lisp) = new_session(buffer);
     // Started without a file: the dashboard (unless turned off).
     if dashboard {
-        let _ = lisp.eval("(when dashboard-on-start (call-binding 'dashboard))");
+        let _ = lisp.eval("if core.dashboard_on_start then core.call_binding('dashboard') end");
     }
     let first = session::Session::new(editor, lisp);
     let make = Box::new(|| {
@@ -144,6 +144,6 @@ fn new_session(buffer: Buffer) -> (Editor, Lisp) {
     let editor = Editor::new(buffer);
     editor.lock().set_state_dir(projects::History::default_dir());
     editor.lock().clipboard = Some(editor::SystemClipboard(Box::new(clipboard::System)));
-    let lisp = Lisp::with_config(editor.clone(), Lisp::default_sources(), Lisp::default_lua_sources(), Lisp::default_plugin_dir());
+    let lisp = Lisp::with_config(editor.clone(), Lisp::default_lua_sources(), Lisp::default_plugin_dir());
     (editor, lisp)
 }

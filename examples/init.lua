@@ -1,9 +1,9 @@
--- An example ~/.config/vmac/init.lua. Lua sits beside vmac's Scheme core:
--- the same primitives (vmac.insert, vmac.buffer_name, vmac.split_window,
--- ... the Scheme names with - as _), and commands and keys that mix with
--- Scheme's. Save it and vmac reloads it.
+-- An example ~/.config/vmac/init.lua. vmac's core is Lua too (lua/core/):
+-- the primitives are in `vmac` (vmac.insert, vmac.buffer_name,
+-- vmac.split_window, ...) and the core's state and functions in `core`
+-- (core.state, core.keymaps, core.modeline, ...). Save it and vmac reloads it.
 
--- A command, callable from keys, SPC :, or Scheme ('insert-date).
+-- A command, callable from keys, SPC : or vmac.run("insert-date").
 vmac.command("insert-date", function()
   vmac.insert(os.date("%Y-%m-%d"))
 end)
@@ -12,10 +12,10 @@ vmac.map("normal", "SPC i d", "insert-date")
 -- A key bound straight to a function.
 vmac.map("normal", "SPC i t", function()
   vmac.insert("TODO: ")
-  vmac.run("insert-state")   -- run a Scheme command, after this one
+  vmac.run("insert-state")   -- run a command by name
 end)
 
--- Replace the Scheme modeline: a list of {text, face}.
+-- Replace the modeline: a list of {text, face}.
 vmac.hooks.modeline = function()
   local mark = vmac.buffer_modified() and " ●" or ""
   return {

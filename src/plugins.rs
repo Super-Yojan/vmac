@@ -1,9 +1,8 @@
-//! Plugins: Scheme and Lua that load after the core and before the user's
-//! init files, from `~/.config/vmac/plugins/`.
+//! Plugins: Lua that loads after the core and before the user's init.lua,
+//! from `~/.config/vmac/plugins/`.
 //!
-//! A plugin is a folder with an `init.scm` and/or `init.lua` (a Lua plugin
-//! can `require` modules next to it or in its `lua/`), or a single
-//! `name.scm` / `name.lua` file. A folder holding a file named `disabled` is
+//! A plugin is a folder with an `init.lua` (it can `require` modules next
+//! to it or in its `lua/`), or a single `name.lua` file. A folder holding a file named `disabled` is
 //! skipped. Plugins installed with git (`:plugin-install URL`) are folders
 //! that `:plugin-update` pulls.
 
@@ -16,7 +15,6 @@ pub struct Plugin {
     pub name: String,
     /// The plugin's folder, or its single file.
     pub path: PathBuf,
-    pub scheme: Option<PathBuf>,
     pub lua: Option<PathBuf>,
     pub disabled: bool,
 }
@@ -32,12 +30,7 @@ impl Plugin {
     }
 
     pub fn languages(&self) -> String {
-        match (&self.scheme, &self.lua) {
-            (Some(_), Some(_)) => "scheme + lua".into(),
-            (Some(_), None) => "scheme".into(),
-            (None, Some(_)) => "lua".into(),
-            (None, None) => "empty".into(),
-        }
+        if self.lua.is_some() { "lua".into() } else { "empty".into() }
     }
 }
 
@@ -61,22 +54,17 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
                 return None;
             }
             if path.is_dir() {
-                let scheme = Some(path.join("init.scm")).filter(|p| p.is_file());
                 let lua = Some(path.join("init.lua")).filter(|p| p.is_file());
-                if scheme.is_none() && lua.is_none() {
-                    return None;
-                }
+                lua.as_ref()?;
                 let disabled = path.join("disabled").exists();
-                return Some(Plugin { name: file_name, path, scheme, lua, disabled });
+                return Some(Plugin { name: file_name, path, lua, disabled });
             }
             let ext = path.extension()?.to_str()?;
             let name = path.file_stem()?.to_string_lossy().into_owned();
-            let (scheme, lua) = match ext {
-                "scm" => (Some(path.clone()), None),
-                "lua" => (None, Some(path.clone())),
-                _ => return None,
-            };
-            Some(Plugin { name, path, scheme, lua, disabled: false })
+            if ext != "lua" {
+                return None;
+            }
+            Some(Plugin { name, lua: Some(path.clone()), path, disabled: false })
         })
         .collect();
     plugins.sort_by(|a, b| a.name.cmp(&b.name));
@@ -96,7 +84,7 @@ pub fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
                 .build()
                 .filter_map(Result::ok)
                 .map(|e| e.into_path())
-                .filter(|p| p.extension().is_some_and(|e| e == "scm" || e == "lua"))
+                .filter(|p| p.extension().is_some_and(|e| e == "lua"))
                 .collect()
         } else {
             vec![plugin.path.clone()]
@@ -184,9 +172,8 @@ mod tests {
     fn finds_folders_and_single_files() {
         let dir = plugins_dir("discover");
         std::fs::create_dir_all(dir.join("alpha")).unwrap();
-        std::fs::write(dir.join("alpha/init.scm"), "").unwrap();
+        std::fs::write(dir.join("alpha/init.lua"), "").unwrap();
         std::fs::create_dir_all(dir.join("beta")).unwrap();
-        std::fs::write(dir.join("beta/init.lua"), "").unwrap();
         std::fs::write(dir.join("beta/init.scm"), "").unwrap();
         std::fs::write(dir.join("gamma.lua"), "").unwrap();
         std::fs::create_dir_all(dir.join("off")).unwrap();
@@ -199,8 +186,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                ("alpha", "scheme".into(), false),
-                ("beta", "scheme + lua".into(), false),
+                ("alpha", "lua".into(), false),
                 ("gamma", "lua".into(), false),
                 ("off", "lua".into(), true),
             ]

@@ -436,12 +436,12 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::editor::Editor;
     use crate::frame::Content;
-    use crate::lisp::{Lisp, Source};
+    use crate::lisp::Lisp;
     use crate::session::Session;
 
     fn fresh() -> Session {
         let editor = Editor::new(Buffer::new("*scratch*"));
-        Session::new(editor.clone(), Lisp::new(editor, vec![Source { label: "core".into(), path: None }]))
+        Session::new(editor.clone(), Lisp::new(editor))
     }
 
     fn text(frame: &Frame) -> String {

@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/logo-wordmark.svg" alt="vmac" width="420"></p>
 
-<p align="center">A modal (evil-style) editor on GPUI whose behavior is written in Steel
-Scheme and Lua, and can be redefined while it runs.</p>
+<p align="center">A modal (evil-style) editor on GPUI whose behavior is written in Lua,
+and can be redefined while it runs.</p>
 
 <p align="center"><a href="https://super-yojan.dev/vmac/">Install and configure</a></p>
 
@@ -31,9 +31,9 @@ or, the same thing by hand:
 cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.2 --locked
 ```
 
-Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.scm`,
-`init.lua`, `plugins/`). From a checkout, `cargo run -- FILE` runs it with
-live reload of `lisp/core/`.
+Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.lua`,
+`plugins/`). From a checkout, `cargo run -- FILE` runs it with live reload
+of `lua/core/`.
 
 **As a Mac app.** From a checkout, `scripts/make-app.sh` builds `vmac.app`
 into `/Applications` (or the folder you name), with its icon, so it opens
@@ -49,14 +49,16 @@ updating to rebuild the app.
 |--------------|------------------------------------------------------|--------------------------------------------------------------------------------|
 | Text, undo   | `src/buffer.rs`                                      | a rope, the point, undo snapshots                                              |
 | Editor state | `src/editor.rs`                                      | buffers, windows and splits, LSP, the picker                                   |
-| Primitives   | `src/lisp.rs`                                        | `insert`, `char-at`, `delete-region`, `find-file`, ... in both Scheme and Lua  |
-| Window       | `src/shell.rs`                                       | draws windows, modelines, popups; sends every key to Scheme                    |
-| The editor   | `lisp/core/*.scm`                                    | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
-| Plugins      | `~/.config/vmac/plugins/`                            | Scheme and Lua, loaded after the core                                          |
-| Your config  | `~/.config/vmac/init.scm`, `~/.config/vmac/init.lua` | loaded last                                                                    |
+| Primitives   | `src/lisp.rs`                                        | `vmac.insert`, `vmac.char_at`, `vmac.delete_region`, `vmac.find_file`, ...     |
+| Sessions     | `src/session.rs`, `src/server.rs`, `src/daemon.rs`   | lay out frames from keys; sessions; the server windows attach to               |
+| Window       | `src/shell.rs`                                       | draws frames: windows, modelines, popups; sends every key to the session       |
+| The editor   | `lua/core/*.lua`                                     | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
+| Plugins      | `~/.config/vmac/plugins/`                            | Lua, loaded after the core                                                     |
+| Your config  | `~/.config/vmac/init.lua`                            | loaded last                                                                    |
 
-The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
-`75-file-tree.scm`, ...), loaded as one program in name order.
+The core is one file per area (`00-core.lua` for the key dispatcher and
+keymaps, `10-motions.lua`, `20-editing.lua`, `40-tree.lua`, ...), loaded in
+name order. Its state and functions are in the global `core` table.
 
 ## Keys
 
@@ -106,34 +108,35 @@ The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
   what was copied last anywhere (text copied in another app wins over an
   older yank). Cmd-V pastes it at the cursor (normal, insert, prompts, the
   picker, terminals); Cmd-C copies the visual selection.
-  `(set-clipboard-sync #f)` keeps yanks and `p` to vmac's own register.
-- **Ex:** `:w`, `:q`, `:wq`, `:e FILE`, `:eval EXPR`, or `:any-command-name`.
-- **Leader:** `SPC :` run a command by name, `SPC ;` evaluate Scheme,
+  `vmac.set_clipboard_sync(false)` keeps yanks and `p` to vmac's own register.
+- **Ex:** `:w`, `:q`, `:wq`, `:e FILE`, `:lua EXPR`, or `:any-command-name`.
+- **Leader:** `SPC :` run a command by name, `SPC ;` evaluate Lua,
   `SPC f f` find file, `SPC f s` save, `SPC q q` quit.
 
 Your own pickers use the same panel:
 
-```scheme
-(pick "Theme" (list "light" "dark") "" (lambda (choice) (message choice)))
+```lua
+vmac.pick("Theme", { "light", "dark" }, function(choice) vmac.message(choice) end)
 ```
 
 ## Syntax highlighting
 
 tree-sitter, for Rust, Python, JavaScript, TypeScript/TSX, Go, C, Bash, JSON
 and TOML (picked by file extension; the modeline shows which). Colors come
-from `(syntax-theme)` in Scheme: capture names to faces.
+from `core.syntax_theme()`: capture names to faces.
 
-```scheme
-;; Comments in yellow, strings in red; everything else as the core says.
-(define (syntax-theme)
-  (list (list "comment" 'yellow) (list "string" 'red)
-        (list "keyword" 'magenta) (list "function" 'blue) (list "type" 'cyan)))
+```lua
+-- Comments in yellow, strings in red.
+vmac.hooks.syntax_theme = function()
+  return { { "comment", "yellow" }, { "string", "red" },
+           { "keyword", "magenta" }, { "function", "blue" }, { "type", "cyan" } }
+end
 ```
 
 ## Language servers (LSP)
 
 Opening a file starts its language's server for the project (from
-`(lsp-servers)` in `lisp/core/80-lsp.scm`: rust-analyzer, pyright, typescript-language-server,
+`core.lsp_servers()` in `lua/core/60-lsp.lua`: rust-analyzer, pyright, typescript-language-server,
 clangd, gopls). Errors and warnings get colored squiggles; the one under the
 cursor shows in the echo area, the modeline counts them (`E2 W1`), `]d`/`[d`
 jump between them and `SPC c x` lists them in the picker. `gd` goes to the
@@ -151,10 +154,11 @@ Edits to other files open them unsaved, so you can review before `:w`. A server 
 to start or stops says why in the echo area. Set `VMAC_LSP_LOG=/tmp/lsp.log`
 to log every message to and from the servers.
 
-```scheme
-;; init.scm: use pylsp instead of pyright.
-(define (lsp-servers)
-  (list (list "python" "pylsp") (list "rust" "rust-analyzer")))
+```lua
+-- init.lua: use pylsp instead of pyright.
+vmac.hooks.lsp_servers = function()
+  return { { "python", "pylsp" }, { "rust", "rust-analyzer" } }
+end
 ```
 
 ## Terminal
@@ -162,8 +166,8 @@ to log every message to and from the servers.
 `SPC o t` opens a terminal below (or closes it, from the terminal; the
 running one is reused), `SPC o T` one in this window, `:term CMD` runs a
 command. Terminals run fish (as a login shell) when it's installed, else
-`$SHELL`; `:terminal-shell /bin/zsh`, or `(set-terminal-shell ...)` /
-`vmac.set_terminal_shell(...)` in your config, changes it. It's a buffer: in insert state every key goes to the program
+`$SHELL`; `:terminal-shell /bin/zsh`, or `vmac.set_terminal_shell(...)`
+in your config, changes it. It's a buffer: in insert state every key goes to the program
 (`ESC` returns to normal state, `C-\` sends the program an `ESC`); in normal
 state its screen is text, so motions, search and yank work, and `p` pastes
 into the program. Local terminals run on Ghostty's terminal engine
@@ -244,10 +248,18 @@ as it was. Plain `vmac FILE` still runs on its own, without a server. The
 server listens on a socket only you can reach (`$VMAC_SOCKET` to choose
 another) and logs to `~/.local/state/vmac/server.log`.
 
-The dashboard is Scheme: redefine `dashboard-banner` or `dashboard-items`
-in your config, e.g.
-`(define (dashboard-items) (cons (list "t" "Terminal" 'terminal-toggle) (default-dashboard-items)))`,
-or `(define dashboard-on-start #f)` to start on a scratch buffer.
+The dashboard is Lua: redefine `core.dashboard_banner` or
+`core.dashboard_items` in your config, e.g.
+
+```lua
+function core.dashboard_items()
+  local items = core.default_dashboard_items()
+  table.insert(items, 1, { "t", "Terminal", "terminal-toggle" })
+  return items
+end
+```
+
+or `core.dashboard_on_start = false` to start on a scratch buffer.
 
 ## Coding agent
 
@@ -298,7 +310,7 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   as a yellow mark in the file; `gC` deletes them. `SPC a S` (`S` in the
   review) sends them all to the agent, each with the code it's on, asking
   it to revise its changes by them. This works with ACP and CLI agents alike. To accept edits
-  as they're made: `(set-agent-review #f)` or `vmac.set_agent_review(false)`.
+  as they're made: `vmac.set_agent_review(false)`.
 - **When it needs permission** (to edit, to run a command, to start coding
   after a plan), `*agent*` shows the question with what it's about (the
   plan, the command, the diff) and the choices, and puts the cursor on it so
@@ -344,7 +356,6 @@ vmac.agent_backend("my-agent", { command = "my-agent --acp" })
 vmac.agent_use("my-agent")
 ```
 
-or `(agent-define "my-agent" "my-agent --acp")` in init.scm.
 `:agent-command CMD` runs a one-off command line.
 
 **Rules and hooks.** Before asking you for permission, vmac asks a rule,
@@ -357,15 +368,12 @@ with the tool call's title and kind (`read`, `edit`, `delete`, `move`,
 vmac.hooks.agent_permission = function(title, kind)
   if kind == "read" or kind == "search" then return "allow" end
   if kind == "delete" then return "reject" end
-end -- nil: leave it to Scheme, which asks
+end -- nil (or "ask"): ask you
 vmac.hooks.agent_tool_call = function(title, kind, status) end
 vmac.hooks.agent_turn_end = function(reason)   -- end_turn, cancelled, error...
   vmac.exec("osascript", { "-e", 'display notification "Agent done" with title "vmac"' })
 end
 ```
-
-In Scheme, redefine `(agent-permission-rule title kind)`,
-`(agent-on-tool-call title kind status)` and `(agent-on-turn-end reason)`.
 
 `VMAC_AGENT_LOG=/tmp/agent.log` logs the traffic. Claude Code won't start
 from a vmac launched inside a Claude Code session (it refuses to nest); start
@@ -373,10 +381,9 @@ vmac from a plain terminal.
 
 ## Plugins
 
-Plugins live in `~/.config/vmac/plugins/`: a folder with an `init.scm`
-and/or `init.lua` (Lua can `require` modules from the folder or its `lua/`),
-or a single `name.scm` / `name.lua`. They load after the core and before
-your init files, so your config can change anything a plugin sets. A plugin
+Plugins live in `~/.config/vmac/plugins/`: a folder with an `init.lua`
+(it can `require` modules from the folder or its `lua/`), or a single
+`name.lua`. They load after the core and before your init.lua, so your config can change anything a plugin sets. A plugin
 that fails to load is skipped, with its error shown; the rest still load.
 Editing a plugin's files reloads it.
 
@@ -385,12 +392,11 @@ Editing a plugin's files reloads it.
 - `:plugin-install URL` clones one with git (in the background, then reloads),
   `:plugin-update` pulls them all, `:plugin-remove NAME` deletes one.
 
-`examples/plugins/` has `word-count` (Lua, `SPC t w`), `zen` (Scheme,
-`SPC t z`) and `herdr-terminal` (a terminal backend). To try them:
+`examples/plugins/` has `word-count` (`SPC t w`), `zen` (`SPC t z`) and `herdr-terminal` (a terminal backend). To try them:
 `cp -r examples/plugins/* ~/.config/vmac/plugins/`
 
-A plugin is just config that can be shared: in Scheme, `defcommand` and
-`define-key`; in Lua, `vmac.command` and `vmac.map`. To publish one, put
+A plugin is just config that can be shared: `vmac.command` and
+`vmac.map`, like init.lua. To publish one, put
 its folder in a git repository.
 
 ## Markdown
@@ -403,24 +409,26 @@ bold and in the UI's sans-serif font, with `**bold**`, `*italic*`,
 reads like the rendered page: headings without `#`, bold and italic without
 their stars, code without backticks, links as their text, bullets, rules and
 table borders drawn as lines. In insert state everything shows, as typed.
-`SPC t m` (or `(set-markdown-conceal #f)`) shows the markup all the time.
+`SPC t m` (or `vmac.set_markdown_view("raw")`) shows the markup all the time.
 Or `SPC m p` opens a preview on the right, rendered by gpui-kit (headings,
 code blocks, tables, images and HTML like a web page), following the
 Markdown file you're in as you type; `SPC m p` again closes it.
-`(set-markdown-preview #t)` opens it from the start.
+`vmac.set_markdown_preview(true)` opens it from the start.
 
 Tables work like Org mode's: leaving insert state in one aligns it (every
 column padded to its widest cell, the `|---|` row redrawn, `:---:` alignment
 kept), `TAB`/`S-TAB` move between cells as they align, `TAB` in the last cell
 adds a row, and `SPC m a` aligns the table under the cursor.
 
-The styles are faces, defined in Scheme with attributes:
+The styles are faces, defined in Lua with attributes:
 
-```scheme
-;; (name key value ...): color, background, scale, weight, slant, underline, family.
-;; set-faces! puts yours in front of the defaults.
-(set-faces! (append (heading-faces 1 2.2 'magenta)   ; a bigger, magenta h1
-                    (list (list "md-bold" 'weight 'bold 'color 'yellow))))
+```lua
+-- { name, color=, background=, scale=, bold=, italic=, underline=, sans= }.
+-- vmac.set_faces puts yours in front of the defaults.
+vmac.set_faces({
+  { "md-h1", color = "magenta", scale = 2.2, bold = true, sans = true },  -- a bigger, magenta h1
+  { "md-bold", bold = true, color = "yellow" },
+})
 ```
 
 ## Themes
@@ -447,71 +455,56 @@ vmac.set_themes("Catppuccin Latte", "Catppuccin Mocha")   -- light, dark
 vmac starts with an installed Nerd Font (JetBrains Mono, FiraCode, Hack,
 Iosevka, ...), so icons from eza, starship and the like show; without one
 it uses the theme's monospace font. `:font NAME` changes it, `:fonts` or
-`SPC h F` picks from the fonts installed, and `(set-font "...")` or
-`vmac.set_font("...")` sets it from your config.
+`SPC h F` picks from the fonts installed, and `vmac.set_font("...")` sets
+it from your config.
 
 ## Customizing
 
-Newer features are written in Lua, in `lua/core/` (built in, loaded
-before plugins and your config, so either can change them); the older core
-is Scheme, in `lisp/core/`. Both call the same primitives.
+vmac's behavior is Lua, in `lua/core/` (built in, loaded before plugins and
+your config, so either can change anything). `~/.config/vmac/init.lua` gets
+the primitives in the `vmac` table (`vmac.buffer_name()`, `vmac.insert(s)`,
+`vmac.pos_to_line(p)`, ...) and the core's state and functions in `core`
+(`core.state`, `core.keymaps.normal`, `core.modeline`, ...). Functions are
+looked up when called, so redefining one takes effect at once. See
+`examples/init.lua`.
 
-The core, init.scm and init.lua are watched: save any of them and vmac
-reloads, keeping your buffers. If a save doesn't load, vmac shows the error and keeps running
-the last version that did. Or evaluate code live with `SPC ;`.
-
-```scheme
-;; ~/.config/vmac/init.scm
-(defcommand (insert-date) (insert "2026-11-07"))
-(define-key normal-map "SPC i d" 'insert-date)
-
-;; A motion works for moving, in visual mode and after every operator.
-(define-motion 'next-blank-line 'linewise
-  (lambda (p) (let loop ((l (+ (pos->line p) 1)))
-                (cond ((>= l (line-count)) (line->pos (- (line-count) 1)))
-                      ((empty-line? (line->pos l)) (line->pos l))
-                      (else (loop (+ l 1)))))))
-(define-key normal-map "}" (lambda () (move-by 'next-blank-line)))
-(define-key operator-map "}" (operator-motion 'next-blank-line))
-
-;; Show only the state and the file in the modeline.
-(define (modeline)
-  (list (list (if (inserting?) "I" "N") 'accent)
-        (list (buffer-name) 'strong)))
-```
-
-### In Lua
-
-Lua sits beside the Scheme, not instead of it: write either, or both.
-`~/.config/vmac/init.lua` gets the same primitives in the `vmac` table
-(Scheme's names with `-` as `_`: `vmac.buffer_name()`, `vmac.pos_to_line(p)`),
-and its commands and keys mix with Scheme's. See `examples/init.lua`:
+The core, plugins and init.lua are watched: save any of them and vmac
+reloads, keeping your buffers. If a save doesn't load, vmac shows the error
+and keeps running the last version that did. Or evaluate Lua live with
+`SPC ;` or `:lua 1 + 2` (`print` shows in the echo area).
 
 ```lua
+-- ~/.config/vmac/init.lua
 vmac.command("insert-date", function() vmac.insert(os.date("%Y-%m-%d")) end)
 vmac.map("normal", "SPC i d", "insert-date")       -- or a function
-vmac.hooks.modeline = function()                   -- replaces Scheme's
-  return { { vmac.buffer_name(), "strong" }, { vmac.buffer_language(), "dim" } }
+
+-- A motion works for moving, in visual mode and after every operator.
+core.define_motion("next-blank-line", "linewise", function(p)
+  for l = vmac.pos_to_line(p) + 1, vmac.line_count() - 1 do
+    if core.empty_line(vmac.line_to_pos(l)) then return vmac.line_to_pos(l) end
+  end
+  return vmac.line_to_pos(vmac.line_count() - 1)
+end)
+vmac.map("normal", "}", function() core.move_by("next-blank-line") end)
+vmac.map("operator", "}", core.operator_motion("next-blank-line"))
+
+-- Show only the state and the file in the modeline.
+vmac.hooks.modeline = function()
+  return { { core.inserting() and "I" or "N", "accent" }, { vmac.buffer_name(), "strong" } }
 end
 ```
 
-`vmac.hooks` can replace `modeline`, `lsp_servers` and `syntax_theme`.
-`vmac.run("name")` runs any command and `vmac.scheme(code)` any Scheme; both
-happen right after the current command (Lua can't call into Scheme midway
-through one). `:lua 1 + 2` evaluates Lua; `print` shows in the echo area.
-
-**In Scheme, define commands with `defcommand`, not `define`.** Steel resolves calls
-between Scheme functions when it compiles them, so redefining a plain
-function later doesn't change what code loaded earlier calls. `defcommand`
-also registers the command by name, and keys look it up on every press, so
-redefining a command changes its keys at once.
+`vmac.hooks` can replace `modeline`, `lsp_servers` and `syntax_theme`, and
+hears the agent (`agent_permission`, `agent_tool_call`, `agent_turn_end`).
+`vmac.run("name")` runs any command; `vmac.prompt(label, fn)` asks for a
+line and `vmac.pick(title, items, fn)` opens the picker.
 
 ## Not yet
 
 Registers beyond one, marks, macros, `:s`
 substitution, resizing splits, incremental re-parsing (the whole file is
 parsed again after each change), more languages, a custom text `Element`
-(lines are plain divs now), UI trees described from Scheme beyond the
+(lines are plain divs now), UI trees described from Lua beyond the
 modeline and picker.
 
 ## License
