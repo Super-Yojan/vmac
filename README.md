@@ -468,7 +468,9 @@ fits it to the window again.
 **Live preview.** An image or PDF that changes on disk reloads by itself,
 where you were, so a document being built shows beside its source as you
 write: run `typst watch paper.typ` or `latexmk -pvc -pdf paper.tex` (in
-`SPC o t`'s terminal, say), and open `paper.pdf` in a split. It reloads once
+`SPC o t`'s terminal, say), and press `SPC m p` in `paper.typ`: its PDF opens
+in a window on the right (`paper.pdf` beside it, or in `out/`, `build/` or
+`_build/`), the cursor staying in the source; `SPC m p` again closes it. It reloads once
 the file has stopped changing, so never half written; a build that fails or
 writes a broken file leaves the last good version up; the old pages stay
 until the new ones are drawn, so it doesn't flash; and a PDF opened before
@@ -492,7 +494,7 @@ reads like the rendered page: headings without `#`, bold and italic without
 their stars, code without backticks, links as their text, bullets, rules and
 table borders drawn as lines. In insert state everything shows, as typed.
 `SPC t m` (or `vmac.set_markdown_view("raw")`) shows the markup all the time.
-Or `SPC m p` opens a preview on the right, rendered by gpui-kit (headings,
+Or `SPC m p` (in a Markdown file) opens a preview on the right, rendered by gpui-kit (headings,
 code blocks, tables, images and HTML like a web page), following the
 Markdown file you're in as you type; `SPC m p` again closes it.
 `vmac.set_markdown_preview(true)` opens it from the start.

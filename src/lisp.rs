@@ -895,6 +895,15 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         }
     });
     prim!(reg, editor, "other-window", |s, n: isize| s.other_window(n));
+    // A file in a window on the right, the cursor staying here, or that
+    // window closed if there is one: "opened", "closed", or what went wrong.
+    prim!(reg, editor, "toggle-file-beside", |s, path: String| {
+        match s.toggle_file_beside(&expand_home(&path)) {
+            Ok(true) => "opened".to_string(),
+            Ok(false) => "closed".to_string(),
+            Err(e) => format!("{path}: {e}"),
+        }
+    });
     prim!(reg, editor, "delete-window", |s| s.close_window());
     prim!(reg, editor, "delete-other-windows", |s| s.only_window());
     prim!(reg, editor, "window-count", |s| s.window_count() as isize);
@@ -1262,6 +1271,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         };
     });
     prim!(reg, editor, "set-markdown-preview", |s, on: bool| s.markdown_preview = on);
+    prim!(reg, editor, "markdown-preview?", |s| s.markdown_preview);
     // PDFs in the theme's colors (the default), or black on white.
     prim!(reg, editor, "set-pdf-themed", |s, on: bool| s.pdf_themed = on);
     prim!(reg, editor, "pdf-themed", |s| s.pdf_themed);
@@ -3252,9 +3262,9 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         // The preview takes the right of the editor while a Markdown file shows.
         let notes = dir.join("notes.md");
         std::fs::write(&notes, "# Notes\n").unwrap();
-        typed(&mut lisp, " mp");
         assert!(editor.lock().preview_rect().is_none(), "nothing to preview yet");
         editor.lock().open_file(&notes).unwrap();
+        typed(&mut lisp, " mp");
         let (rect, widest) = {
             let st = editor.lock();
             (st.preview_rect(), st.window_rects().iter().map(|(_, r)| r.x + r.w).fold(0., f32::max))
@@ -3674,6 +3684,54 @@ for line in sys.stdin:
         let last: Vec<_> = editor.lock().media_scroll[&id].iter().map(|(_, how)| *how).collect();
         assert_eq!(last, [crate::frame::MediaScroll::Sideways(-1), crate::frame::MediaScroll::Sideways(1)]);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn spc_m_p_shows_the_pdf_built_from_a_file_beside_it() {
+        let dir = std::env::temp_dir().join(format!("vmac-pdf-preview-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        let typ = dir.join("paper.typ");
+        std::fs::write(&typ, "= Hello\n").unwrap();
+        editor.lock().open_file(&typ).unwrap();
+        let shown = |e: &Editor| -> Vec<String> {
+            let st = e.lock();
+            st.window_order()
+                .into_iter()
+                .filter_map(|w| st.window_by_id(w).and_then(|w| st.buffer_by_id(w.buffer)))
+                .map(|b| b.name().to_string())
+                .collect()
+        };
+
+        // Not built yet: it opens anyway, to show up when it is.
+        typed(&mut lisp, " mp");
+        assert_eq!(shown(&editor), ["paper.typ", "paper.pdf"]);
+        assert_eq!(editor.lock().buffer().name(), "paper.typ", "the cursor stays in the source");
+        assert!(editor.lock().message.starts_with("Not built yet"), "{}", editor.lock().message);
+
+        // Again: closed.
+        typed(&mut lisp, " mp");
+        assert_eq!(shown(&editor), ["paper.typ"]);
+        assert_eq!(editor.lock().message, "PDF closed");
+
+        // Built into build/: that one.
+        std::fs::write(dir.join("build/paper.pdf"), b"%PDF-1.4").unwrap();
+        typed(&mut lisp, " mp");
+        let st = editor.lock();
+        let pdf = st.window_order().into_iter().filter_map(|w| st.window_by_id(w)).nth(1).map(|w| w.buffer);
+        let file = pdf.and_then(|b| st.buffer_by_id(b)).and_then(|b| b.file().cloned());
+        assert_eq!(file, Some(std::path::absolute(dir.join("build/paper.pdf")).unwrap()));
+        drop(st);
+
+        // In Markdown, SPC m p is its preview.
+        typed(&mut lisp, " mp");
+        let md = dir.join("notes.md");
+        std::fs::write(&md, "# Notes\n").unwrap();
+        editor.lock().open_file(&md).unwrap();
+        typed(&mut lisp, " mp");
+        assert!(editor.lock().markdown_preview);
+        assert_eq!(shown(&editor), ["notes.md"]);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// vmac on a file served by the fake language server (lsp.rs's tests).

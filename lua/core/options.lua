@@ -61,3 +61,46 @@ for key, binding in pairs({
   h = "media-left", l = "media-right",
 }) do media_keys[key] = binding end
 for key, binding in pairs(media_keys) do core.define_key("media", key, binding) end
+
+---- The PDF beside its source
+--
+-- SPC m p in a Typst, LaTeX (or any) file opens the PDF built from it in a
+-- window on the right, the cursor staying in the source, and closes it
+-- again (in Markdown, SPC m p is its preview). paper.typ's PDF is
+-- paper.pdf beside it, or in out/, build/ or _build/; one not built yet
+-- shows up when it is. It reloads as it's rebuilt: run `typst watch
+-- paper.typ` or `latexmk -pvc -pdf paper.tex` (SPC o t for a terminal).
+-- Redefine core.pdf_for(file) for PDFs kept elsewhere.
+
+function core.pdf_for(file)
+  local dir, stem = file:match("^(.*)/([^/]+)%.[^./]+$")
+  if not dir then return nil end
+  for _, sub in ipairs({ "", "out/", "build/", "_build/" }) do
+    local pdf = dir .. "/" .. sub .. stem .. ".pdf"
+    if vmac.file_exists(pdf) then return pdf end
+  end
+  return dir .. "/" .. stem .. ".pdf"
+end
+
+vmac.command("pdf-preview", function()
+  local file = vmac.buffer_file_name()
+  if file:lower():match("%.pdf$") then return vmac.message("This is the PDF") end
+  local pdf = file ~= "" and core.pdf_for(file)
+  if not pdf then return vmac.message("Not a file with a PDF built from it") end
+  local result = vmac.toggle_file_beside(pdf)
+  if result == "opened" then
+    vmac.message(vmac.file_exists(pdf) and ("PDF: " .. pdf)
+      or ("Not built yet: " .. pdf .. " shows up when it is"))
+  elseif result == "closed" then
+    vmac.message("PDF closed")
+  else
+    vmac.message(result)
+  end
+end)
+
+-- SPC m p (in 90-bindings.lua): Markdown's preview in a Markdown file (and
+-- closing it from anywhere while it's open), else the PDF.
+vmac.command("preview", function()
+  local markdown = vmac.buffer_language() == "markdown" or vmac.markdown_preview()
+  vmac.run(markdown and "markdown-preview" or "pdf-preview")
+end)

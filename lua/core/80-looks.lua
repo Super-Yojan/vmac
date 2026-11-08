@@ -34,7 +34,8 @@ end)
 -- drawing) -> as typed. In init.lua: vmac.set_markdown_view("hidden"), or
 -- "rendered" or "raw".
 --
--- SPC m p opens a preview beside it instead, following the file you're in
+-- SPC m p opens a preview beside it instead (in a Markdown file; elsewhere
+-- it's the PDF built from the file, see options.lua), following the file you're in
 -- as you type; again closes it. vmac.set_markdown_preview(true) opens it
 -- from the start.
 

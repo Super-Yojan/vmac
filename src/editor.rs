@@ -878,6 +878,40 @@ impl EditorState {
         self.select_window(id);
     }
 
+    /// Shows a file in a new window to the right of this one, leaving the
+    /// cursor here (a PDF beside its source); if another window shows it
+    /// already, closes that instead. True when it opened one.
+    pub fn toggle_file_beside(&mut self, path: &Path) -> std::io::Result<bool> {
+        let path = self.resolve(path);
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canonical(&path);
+        let here = self.selected;
+        let showing: Vec<WindowId> = self
+            .window_order()
+            .into_iter()
+            .filter(|&w| w != here && !self.is_sidebar(w))
+            .filter(|&w| {
+                let file = self.window_by_id(w).and_then(|w| self.buffer_by_id(w.buffer)).and_then(|b| b.file());
+                file.is_some_and(|f| canonical(f) == want)
+            })
+            .collect();
+        if !showing.is_empty() {
+            for w in showing {
+                self.select_window(w);
+                self.close_window();
+            }
+            self.select_window(here);
+            return Ok(false);
+        }
+        self.split_window(Axis::Row);
+        let opened = self.open_file(&path);
+        if opened.is_err() {
+            self.close_window();
+        }
+        self.select_window(here);
+        opened.map(|()| true)
+    }
+
     /// Closes the selected window. The last one in the layout can't be closed.
     pub fn close_window(&mut self) -> bool {
         if self.is_sidebar(self.selected) {
