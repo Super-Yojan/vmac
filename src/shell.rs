@@ -626,7 +626,7 @@ impl Render for Shell {
                 let estimate = window_rows(r, area);
                 let lo = w.scroll_top.min(cur_line);
                 let hi = (w.scroll_top + estimate).max(cur_line + 1).min(text.len_lines());
-                let spans = match buffer.file().and_then(|f| language_for_path(f)) {
+                let spans = match buffer.language().or_else(|| buffer.file().and_then(|f| language_for_path(f))) {
                     Some(lang) => syntax.highlight(w.buffer, lang, buffer.revision(), text, lo..hi),
                     None => Vec::new(),
                 };

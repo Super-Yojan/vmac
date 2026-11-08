@@ -80,7 +80,7 @@
         ;; The coding agent
         (list "SPC a a" 'agent-ask) (list "SPC a o" 'agent-open)
         (list "SPC a c" 'agent-cancel-run) (list "SPC a p" 'agent-permission)
-        (list "SPC a k" 'agent-kill)
+        (list "SPC a k" 'agent-kill) (list "SPC a n" 'agent-new) (list "SPC a s" 'agent-ask-selection)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)
         (list "SPC b n" 'buffer-next) (list "SPC b p" 'buffer-previous)
@@ -115,7 +115,7 @@
         (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
         (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
         (list "z z" 'recenter-center) (list "SPC c a" 'code-actions)
-        (list "SPC c f" 'format-buffer)))
+        (list "SPC c f" 'format-buffer) (list "SPC a s" 'agent-ask-selection)))
 
 (define-key operator-map "ESC" 'keyboard-quit)
 

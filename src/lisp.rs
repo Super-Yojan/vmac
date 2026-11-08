@@ -1115,6 +1115,9 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             let exited = if t.exited { ", exited" } else { "" };
             return format!("terminal ({}{exited})", t.backend_name());
         }
+        if s.agent_here() {
+            return format!("agent ({})", s.agent_status());
+        }
         s.buffer().file().and_then(|f| crate::syntax::language_for_path(f)).unwrap_or("text").to_string()
     });
     prim!(reg, editor, "line-number", |s| s.buffer().line() as isize + 1);
@@ -1490,6 +1493,15 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // The coding agent (ACP): prompts, permission answers, how to start it.
     prim!(reg, editor, "agent-prompt", |s, text: String| s.agent_prompt(&text));
     prim!(reg, editor, "agent-show", |s| s.agent_show());
+    prim!(reg, editor, "agent-focus-prompt", |s| s.agent_focus_prompt());
+    prim!(reg, editor, "agent-here?", |s| s.agent_here());
+    prim!(reg, editor, "agent-in-prompt?", |s| s.agent_in_prompt());
+    prim!(reg, editor, "agent-activate", |s| s.agent_activate());
+    prim!(reg, editor, "agent-toggle-at-point", |s| s.agent_toggle_at_point());
+    prim!(reg, editor, "agent-new-session", |s| s.agent_new_session());
+    prim!(reg, editor, "agent-ask-about", |s, start: isize, end: isize, question: String| {
+        s.agent_ask_about(start.max(0) as usize, end.max(0) as usize, &question)
+    });
     prim!(reg, editor, "agent-cancel", |s| s.agent_cancel());
     prim!(reg, editor, "agent-stop", |s| s.agent_stop());
     prim!(reg, editor, "agent-status", |s| s.agent_status());
@@ -2808,15 +2820,93 @@ mod tests {
         assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("✓ Edit")));
 
         let transcript = editor.lock().buffer().text().to_string();
-        assert!(transcript.contains("## > edit"), "{transcript}");
+        assert!(transcript.contains("› edit"), "{transcript}");
         assert!(transcript.contains("Reading it."), "{transcript}");
-        assert!(transcript.contains("- [x] Read it"), "{transcript}");
+        assert!(transcript.contains("  ✓ Read it\n  ○ Shout it"), "{transcript}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "HELLOWORLD\n", "it read the unsaved text");
         editor.lock().open_file(&file).unwrap();
         assert_eq!(editor.lock().buffer().text().to_string(), "HELLOWORLD\n");
         assert!(!editor.lock().buffer().is_modified(), "and saved it");
         typed(&mut lisp, "u");
         assert_eq!(editor.lock().buffer().text().to_string(), "helloworld\n", "one u undoes the agent's edit");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_agent_buffer_has_a_prompt_folds_and_questions_about_code() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-chat-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().agent_config = config;
+        editor.lock().open_file(&file).unwrap();
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&EditorState) -> bool| {
+            for _ in 0..250 {
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let text = || editor.lock().buffer().text().to_string();
+
+        // SPC a a: the prompt, in insert state; RET (normal) sends it.
+        typed(&mut lisp, " aa");
+        assert_eq!(editor.lock().buffer().name(), "*agent*");
+        assert!(text().contains("Ask fake anything"), "{}", text());
+        typed(&mut lisp, "hello there");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "bdw");
+        assert!(text().ends_with("─\nhello "), "Vim keys edit the prompt: {:?}", text());
+        typed(&mut lisp, "gg");
+        typed(&mut lisp, "dd");
+        assert!(text().starts_with("Ask fake"), "the conversation can't be changed");
+        typed(&mut lisp, "G$x");
+        assert!(text().ends_with("─\nhello"), "{:?}", text());
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.buffer().text().to_string().contains("You said: hello")), "{} / {}", text(), editor.lock().message);
+        assert!(text().contains("› hello\n"), "{}", text());
+        assert!(text().ends_with("─\n"), "the prompt was cleared: {:?}", text());
+
+        // Typing while it answers keeps the prompt below the conversation.
+        typed(&mut lisp, "inext");
+        lisp.dispatch_key("ESC", "");
+        assert!(text().ends_with("─\nnext"));
+
+        // A tool call: TAB opens it; RET on its file visits it.
+        let path = file.display().to_string();
+        editor.lock().agent.as_mut().unwrap().prompt(&format!("edit {path}"));
+        assert!(pump(&mut lisp, &|s| s.picker.is_some()));
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("▸ ✓ Edit lib.rs")), "{}", text());
+        assert!(text().ends_with("─\nnext"), "the prompt survived: {:?}", text());
+        let line = text().lines().position(|l| l.contains("▸ ✓ Edit")).unwrap();
+        let pos = editor.lock().buffer().line_to_pos(line);
+        editor.lock().buffer_mut().goto_char(pos);
+        lisp.dispatch_key("TAB", "");
+        assert!(text().contains("▾ ✓ Edit lib.rs\n    (no output)"), "{}", text());
+        assert_eq!(editor.lock().buffer().line(), line, "the point stays on the tool");
+        lisp.dispatch_key("TAB", "");
+        assert!(text().contains("▸ ✓ Edit lib.rs"));
+
+        // SPC a s on a selection: the question, its place and its code.
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, "jVj");
+        typed(&mut lisp, " as");
+        typed(&mut lisp, "why");
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.buffer().text().to_string().contains("You said: why")), "{}", text());
+        assert!(text().contains("› why  [lib.rs:2-3]"), "{}", text());
+        assert!(text().contains("FN B() {}\nFN C() {}"), "the code went with it: {}", text());
+
+        // SPC a n: a new conversation.
+        typed(&mut lisp, " an");
+        assert!(pump(&mut lisp, &|s| s.agent_status() == "ready"));
+        assert!(!text().contains("You said"), "{}", text());
         std::fs::remove_dir_all(&dir).ok();
     }
 

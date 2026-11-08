@@ -80,8 +80,8 @@ pub struct ToolCall {
     pub kind: String,
     /// pending, in_progress, completed, failed.
     pub status: String,
-    /// The files it touches.
-    pub locations: Vec<PathBuf>,
+    /// The files it touches, and the line when it says.
+    pub locations: Vec<(PathBuf, Option<u64>)>,
     /// What it produced, as text (output, diffs summarized).
     pub output: String,
 }
@@ -99,7 +99,8 @@ impl ToolCall {
             self.status = s.to_string();
         }
         if let Some(list) = v["locations"].as_array() {
-            self.locations = list.iter().filter_map(|l| l["path"].as_str().map(PathBuf::from)).collect();
+            self.locations =
+                list.iter().filter_map(|l| Some((PathBuf::from(l["path"].as_str()?), l["line"].as_u64()))).collect();
         }
         if let Some(content) = v["content"].as_array() {
             self.output = content.iter().map(tool_content_text).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
@@ -110,7 +111,7 @@ impl ToolCall {
 fn tool_content_text(c: &Value) -> String {
     match c["type"].as_str() {
         Some("content") => content_text(&c["content"]),
-        Some("diff") => format!("diff {}", c["path"].as_str().unwrap_or("")),
+        Some("diff") => line_diff(c["oldText"].as_str().unwrap_or(""), c["newText"].as_str().unwrap_or("")),
         Some("terminal") => format!("terminal {}", c["terminalId"].as_str().unwrap_or("")),
         _ => String::new(),
     }
@@ -198,6 +199,8 @@ pub struct Agent {
     pub permissions: Vec<Permission>,
     /// Bumped whenever the conversation changes, for redrawing.
     pub revision: u64,
+    /// Tool calls shown open, by id.
+    expanded: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -265,6 +268,7 @@ impl Agent {
             requests: Vec::new(),
             permissions: Vec::new(),
             revision: 0,
+            expanded: Default::default(),
         };
         agent.call(
             Pending::Initialize,
@@ -317,7 +321,13 @@ impl Agent {
 
     /// Sends a prompt; held until the session opens.
     pub fn prompt(&mut self, text: &str) {
-        self.entries.push(Entry::User(text.to_string()));
+        self.prompt_as(text, text);
+    }
+
+    /// Sends `text`, showing `shown` in the conversation (a question about
+    /// a selection shows the question, not the code sent with it).
+    pub fn prompt_as(&mut self, shown: &str, text: &str) {
+        self.entries.push(Entry::User(shown.to_string()));
         self.revision += 1;
         match self.session.clone() {
             Some(session) if self.state == State::Idle => self.send_prompt(&session, text),
@@ -543,51 +553,233 @@ impl Agent {
         self.revision += 1;
     }
 
-    /// The conversation as Markdown, for the agent buffer.
+    /// Opens or closes a tool call's details.
+    pub fn toggle(&mut self, id: &str) {
+        if !self.expanded.remove(id) {
+            self.expanded.insert(id.to_string());
+        }
+        self.revision += 1;
+    }
+
+    /// The conversation as plain text (tests).
+    #[cfg(test)]
     pub fn transcript(&self) -> String {
-        let mut out = String::new();
+        self.render(80).text
+    }
+
+    /// The conversation for the agent buffer: Markdown, faces to color it,
+    /// and what each line points at (a tool call to open, a file to visit).
+    pub fn render(&self, width: usize) -> Rendered {
+        let width = width.max(20);
+        let mut r = Rendered::default();
+        let shorten = |s: &str| {
+            let root = format!("{}/", self.root.display());
+            s.replace(&root, "")
+        };
         for entry in &self.entries {
             match entry {
-                Entry::User(s) => out.push_str(&format!("## > {}\n\n", s.trim())),
-                Entry::Agent(s) => out.push_str(&format!("{}\n\n", s.trim())),
-                Entry::Thought(s) => {
-                    for line in s.trim().lines() {
-                        out.push_str(&format!("> {line}\n"));
+                Entry::User(s) => {
+                    if !r.text.is_empty() {
+                        r.line("", Target::None);
                     }
-                    out.push('\n');
+                    let mut first = true;
+                    for line in s.trim().lines() {
+                        for piece in wrap(line, width - 2) {
+                            let mark = if first { "› " } else { "  " };
+                            first = false;
+                            r.styled(&format!("{mark}{piece}"), "agent-user", Target::None);
+                        }
+                    }
+                    r.line("", Target::None);
+                }
+                Entry::Agent(s) => {
+                    if r.lines.last().is_some_and(|t| *t != Target::None) {
+                        r.line("", Target::None);
+                    }
+                    // Wrapped, except code blocks and tables.
+                    let mut code = false;
+                    for line in s.trim().lines() {
+                        let fence = line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
+                        if code || fence || line.trim_start().starts_with('|') {
+                            r.line(line, Target::None);
+                        } else {
+                            for piece in wrap(line, width) {
+                                r.line(&piece, Target::None);
+                            }
+                        }
+                        code ^= fence;
+                    }
+                    r.line("", Target::None);
+                }
+                Entry::Thought(s) => {
+                    if r.lines.last().is_some_and(|t| *t != Target::None) {
+                        r.line("", Target::None);
+                    }
+                    for line in s.trim().lines() {
+                        for piece in wrap(line, width - 2) {
+                            r.styled(&format!("  {piece}"), "agent-thought", Target::None);
+                        }
+                    }
+                    r.line("", Target::None);
                 }
                 Entry::Tool(t) => {
-                    let mark = match t.status.as_str() {
-                        "completed" => "✓",
-                        "failed" => "✗",
-                        "in_progress" => "…",
-                        _ => "·",
+                    let (mark, face) = match t.status.as_str() {
+                        "completed" => ("✓", "green"),
+                        "failed" => ("✗", "red"),
+                        "in_progress" => ("…", "yellow"),
+                        _ => ("·", "dim"),
                     };
-                    out.push_str(&format!("{mark} {}\n\n", t.title));
+                    let open = self.expanded.contains(&t.id);
+                    let fold = if open { "▾" } else { "▸" };
+                    let start = r.chars;
+                    r.line(&format!("{fold} {mark} {}", shorten(&t.title)), Target::Tool(t.id.clone()));
+                    r.faces.push((start, start + 1, "dim"));
+                    r.faces.push((start + 2, start + 3, face));
+                    if open {
+                        for (path, line) in &t.locations {
+                            let shown = shorten(&path.display().to_string());
+                            let text = match line {
+                                Some(n) => format!("    {shown}:{n}"),
+                                None => format!("    {shown}"),
+                            };
+                            r.styled(&text, "cyan", Target::File(path.clone(), *line));
+                        }
+                        let lines: Vec<&str> = t.output.lines().collect();
+                        for line in lines.iter().take(MAX_TOOL_LINES) {
+                            let face = if line.starts_with("+ ") {
+                                "green"
+                            } else if line.starts_with("- ") {
+                                "red"
+                            } else {
+                                "agent-output"
+                            };
+                            r.styled(&format!("    {line}"), face, Target::Tool(t.id.clone()));
+                        }
+                        if lines.len() > MAX_TOOL_LINES {
+                            let more = lines.len() - MAX_TOOL_LINES;
+                            r.styled(&format!("    … {more} more lines"), "dim", Target::Tool(t.id.clone()));
+                        }
+                        if t.locations.is_empty() && lines.is_empty() {
+                            r.styled("    (no output)", "dim", Target::Tool(t.id.clone()));
+                        }
+                    }
                 }
                 Entry::Plan(steps) => {
-                    out.push_str("Plan:\n");
-                    for (step, status) in steps {
-                        let mark = match status.as_str() {
-                            "completed" => "[x]",
-                            "in_progress" => "[-]",
-                            _ => "[ ]",
-                        };
-                        out.push_str(&format!("- {mark} {step}\n"));
+                    if r.lines.last().is_some_and(|t| *t != Target::None) {
+                        r.line("", Target::None);
                     }
-                    out.push('\n');
+                    r.styled("Plan", "agent-heading", Target::None);
+                    for (step, status) in steps {
+                        let (mark, face) = match status.as_str() {
+                            "completed" => ("✓", "green"),
+                            "in_progress" => ("▸", "yellow"),
+                            _ => ("○", "dim"),
+                        };
+                        let start = r.chars;
+                        r.line(&format!("  {mark} {step}"), Target::None);
+                        r.faces.push((start + 2, start + 3, face));
+                    }
+                    r.line("", Target::None);
                 }
-                Entry::Notice(s) => out.push_str(&format!("-- {s}\n\n")),
+                Entry::Notice(s) => {
+                    r.styled(&format!("— {s}"), "dim", Target::None);
+                    r.line("", Target::None);
+                }
             }
         }
         for p in &self.permissions {
-            out.push_str(&format!("?? Allow {}? (SPC a p to answer)\n\n", p.title));
+            r.styled(&format!("⚠ Allow {}?  SPC a p to answer", shorten(&p.title)), "yellow", Target::None);
         }
-        if self.state == State::Running {
-            out.push_str("…\n");
+        if self.state == State::Running && self.permissions.is_empty() {
+            r.styled("… working (SPC a c cancels)", "dim", Target::None);
         }
-        out
+        r
     }
+}
+
+/// Tool output lines shown before "… N more lines".
+const MAX_TOOL_LINES: usize = 40;
+
+/// What a line of the agent buffer points at.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    None,
+    /// A tool call: RET or TAB opens or closes it.
+    Tool(String),
+    /// A file (and line) a tool touched: RET visits it.
+    File(PathBuf, Option<u64>),
+}
+
+/// The agent buffer's text, its faces (character ranges) and each line's target.
+#[derive(Debug, Default)]
+pub struct Rendered {
+    pub text: String,
+    pub faces: Vec<(usize, usize, &'static str)>,
+    pub lines: Vec<Target>,
+    chars: usize,
+}
+
+impl Rendered {
+    fn line(&mut self, text: &str, target: Target) {
+        self.text.push_str(text);
+        self.text.push('\n');
+        self.chars += text.chars().count() + 1;
+        self.lines.push(target);
+    }
+
+    fn styled(&mut self, text: &str, face: &'static str, target: Target) {
+        let start = self.chars;
+        self.line(text, target);
+        self.faces.push((start, start + text.chars().count(), face));
+    }
+}
+
+/// A line broken at spaces into pieces at most `width` characters long
+/// (a longer word gets a piece to itself), keeping its indent on each.
+pub fn wrap(line: &str, width: usize) -> Vec<String> {
+    if line.chars().count() <= width {
+        return vec![line.to_string()];
+    }
+    let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+    // List items continue under their text, not their marker.
+    let rest = &line[indent.len()..];
+    let hang = match rest.split_once(' ') {
+        Some((m, _)) if matches!(m, "-" | "*" | "+") || m.trim_end_matches(['.', ')']).parse::<u32>().is_ok() => {
+            m.chars().count() + 1
+        }
+        _ => 0,
+    };
+    let next_indent = format!("{indent}{}", " ".repeat(hang));
+    let mut out = Vec::new();
+    let mut current = indent.clone();
+    let mut fresh = true;
+    for word in rest.split(' ').filter(|w| !w.is_empty()) {
+        let len = current.chars().count();
+        if !fresh && len + 1 + word.chars().count() > width {
+            out.push(std::mem::replace(&mut current, next_indent.clone()));
+            fresh = true;
+        }
+        if !fresh {
+            current.push(' ');
+        }
+        current.push_str(word);
+        fresh = false;
+    }
+    out.push(current);
+    out
+}
+
+/// Old and new text as the lines that changed: the common start and end
+/// dropped, the rest as "- old" and "+ new".
+pub fn line_diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..].iter().rev().zip(b[head..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let mut out: Vec<String> = Vec::new();
+    out.extend(a[head..a.len() - tail].iter().map(|l| format!("- {l}")));
+    out.extend(b[head..b.len() - tail].iter().map(|l| format!("+ {l}")));
+    out.join("\n")
 }
 
 impl Drop for Agent {
@@ -720,7 +912,7 @@ while True:
         assert_eq!(agent.state, State::Running);
         agent.cancel();
         assert!(wait_until(&mut agent, |a| a.state == State::Idle), "{:?}", agent.entries);
-        assert!(agent.transcript().contains("-- Cancelled"), "{}", agent.transcript());
+        assert!(agent.transcript().contains("— Cancelled"), "{}", agent.transcript());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -788,6 +980,44 @@ while True:
         assert_eq!(slice_lines(text, Some(2), Some(2)), "b\nc\n");
         assert_eq!(slice_lines(text, Some(3), None), "c\nd\n");
         assert_eq!(slice_lines(text, None, Some(1)), "a\n");
+    }
+
+    #[test]
+    fn diffs_show_the_lines_that_changed() {
+        assert_eq!(line_diff("a\nb\nc\n", "a\nB\nc\n"), "- b\n+ B");
+        assert_eq!(line_diff("", "new\n"), "+ new");
+        assert_eq!(line_diff("same", "same"), "");
+    }
+
+    #[test]
+    fn tool_calls_fold_and_point_at_their_files() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-render-{}", std::process::id()));
+        let mut agent = Agent::start(fake_config(&dir), &dir).unwrap();
+        agent.on_update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "t1",
+            "title": format!("Edit {}/src/a.rs", dir.display()), "status": "completed",
+            "locations": [{ "path": format!("{}/src/a.rs", dir.display()), "line": 3 }],
+            "content": [{ "type": "diff", "path": "a.rs", "oldText": "x\n", "newText": "y\n" }] }));
+        let r = agent.render(80);
+        let line = r.text.lines().position(|l| l.contains("Edit src/a.rs")).unwrap();
+        assert!(r.text.contains("▸ ✓ Edit src/a.rs"), "paths are shown from the project: {}", r.text);
+        assert_eq!(r.lines[line], Target::Tool("t1".into()));
+        assert!(!r.text.contains("+ y"));
+
+        agent.toggle("t1");
+        let r = agent.render(80);
+        assert!(r.text.contains("▾ ✓ Edit src/a.rs\n    src/a.rs:3\n    - x\n    + y\n"), "{}", r.text);
+        assert_eq!(r.lines[line + 1], Target::File(dir.join("src/a.rs"), Some(3)));
+        assert_eq!(r.text.lines().count(), r.lines.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn long_lines_wrap_at_spaces_keeping_indents() {
+        assert_eq!(wrap("short", 10), vec!["short"]);
+        assert_eq!(wrap("one two three four", 9), vec!["one two", "three", "four"]);
+        assert_eq!(wrap("- item with words", 10), vec!["- item", "  with", "  words"]);
+        assert_eq!(wrap("  1. aa bb cc", 8), vec!["  1. aa", "     bb", "     cc"]);
+        assert_eq!(wrap("averyverylongword x", 5), vec!["averyverylongword", "x"]);
     }
 
     #[test]

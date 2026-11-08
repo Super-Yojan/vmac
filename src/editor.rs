@@ -319,8 +319,11 @@ pub struct EditorState {
     pub agent_config: crate::agent::AgentConfig,
     agent_buffer: Option<BufferId>,
     agent_shown: u64,
+    agent_shown_width: usize,
     /// Permissions already put to the person (so each is asked once).
     agent_asked: usize,
+    /// What each line of the agent buffer points at.
+    agent_lines: Vec<crate::agent::Target>,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
     /// Things for Scheme to handle (a function name and its arguments),
@@ -368,7 +371,9 @@ impl EditorState {
             agent_config: crate::agent::AgentConfig::claude(),
             agent_buffer: None,
             agent_shown: 0,
+            agent_shown_width: 0,
             agent_asked: 0,
+            agent_lines: Vec::new(),
             events: Vec::new(),
             search_cache: None,
         }
@@ -957,7 +962,17 @@ impl EditorState {
     /// Where the agent works: the project of the selected buffer's file, or
     /// of the current folder.
     fn agent_root(&self) -> PathBuf {
-        let start = self.buffer().file().cloned().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        // From *agent* itself: the file in another window, else any file open.
+        let shown = self.windows.iter().filter_map(|w| self.buffer_by_id(w.buffer)?.file());
+        let start = self
+            .buffer()
+            .file()
+            .or_else(|| self.window_by_id(self.last_main).and_then(|w| self.buffer_by_id(w.buffer)?.file()))
+            .or_else(|| shown.clone().next())
+            .or_else(|| self.buffers.iter().find_map(|(_, b)| b.file()))
+            .cloned()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
         crate::picker::project_root(&start)
     }
 
@@ -971,7 +986,7 @@ impl EditorState {
         let agent = crate::agent::Agent::start(config.clone(), &root)
             .map_err(|e| format!("{}: {e}", config.command))?;
         self.agent = Some(agent);
-        self.agent_shown = 0;
+        self.agent_shown = u64::MAX;
         self.agent_asked = 0;
         Ok(())
     }
@@ -982,10 +997,10 @@ impl EditorState {
             return id;
         }
         let mut buffer = Buffer::new("*agent*");
-        buffer.set_read_only(true);
+        buffer.set_language(Some("markdown"));
         let id = self.add_buffer(buffer);
         self.agent_buffer = Some(id);
-        self.agent_shown = 0;
+        self.agent_shown = u64::MAX;
         id
     }
 
@@ -993,13 +1008,15 @@ impl EditorState {
     /// new window on the right.
     pub fn agent_show(&mut self) {
         let id = self.agent_buffer_id();
+        self.agent_refresh();
         if let Some(w) = self.windows.iter().find(|w| w.buffer == id && !self.is_sidebar(w.id)).map(|w| w.id) {
             self.select_window(w);
             return;
         }
-        self.split_window(Axis::Row);
-        self.show_buffer(id);
-        self.agent_refresh();
+        if self.window().buffer != id {
+            self.split_window(Axis::Row);
+            self.show_buffer(id);
+        }
     }
 
     /// Sends the agent a prompt, starting it if needed.
@@ -1145,33 +1162,174 @@ impl EditorState {
         std::fs::write(path, content)
     }
 
-    /// Puts the conversation in the agent buffer when it changed. Windows
-    /// at its end follow it.
+    /// Puts the conversation in the agent buffer when it changed, above
+    /// the prompt you're typing (which it keeps). Windows reading the end of
+    /// the conversation follow it.
     fn agent_refresh(&mut self) -> bool {
-        let Some(agent) = self.agent.as_ref() else { return false };
         let Some(id) = self.agent_buffer.filter(|&id| self.buffer_by_id(id).is_some()) else { return false };
-        let revision = agent.revision;
-        if revision == self.agent_shown {
+        // Wrapped to the widest window showing it (re-wrapped on resize).
+        let width = self.windows.iter().filter(|w| w.buffer == id).map(|w| w.cols).max().unwrap_or(0);
+        let width = if width == 0 { 80 } else { width.saturating_sub(2) };
+        let revision = self.agent.as_ref().map_or(0, |a| a.revision + 1);
+        if (revision, width) == (self.agent_shown, self.agent_shown_width) {
             return false;
         }
         self.agent_shown = revision;
-        let text = agent.transcript();
+        self.agent_shown_width = width;
+        let mut rendered = match self.agent.as_ref() {
+            Some(agent) => agent.render(width),
+            None => crate::agent::Rendered::default(),
+        };
+        if rendered.text.is_empty() {
+            rendered.text = format!(
+                "Ask {} anything about this project: type below, then RET in normal state.\n\n",
+                self.agent_config.name
+            );
+            rendered.faces.push((0, rendered.text.chars().count(), "dim"));
+            rendered.lines = vec![crate::agent::Target::None; 2];
+        }
+        // The rule above the prompt.
+        let rule = "─".repeat(40);
+        let at = rendered.text.chars().count();
+        rendered.text.push_str(&rule);
+        rendered.text.push('\n');
+        rendered.faces.push((at, at + 40, "dim"));
+        rendered.lines.push(crate::agent::Target::None);
+
         let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("checked above").1;
-        let old_end = b.len();
-        let follow = b.point() + 1 >= old_end;
-        b.set_text(&text);
-        let end = b.len();
-        if follow {
-            b.goto_char(end);
+        let old = b.protected();
+        b.set_protected_text(&rendered.text);
+        for (start, end, face) in &rendered.faces {
+            b.add_face(*start, *end, face.to_string());
         }
-        for w in self.windows.iter_mut().filter(|w| w.buffer == id) {
-            if w.point + 1 >= old_end {
-                w.point = end;
-            } else {
-                w.point = w.point.min(end);
-            }
+        let new = b.protected();
+        // Windows on the conversation: those in the prompt keep their place
+        // in it; those on its last lines follow it; others stay.
+        let windows: Vec<usize> =
+            self.windows.iter().enumerate().filter(|(_, w)| w.buffer == id).map(|(i, _)| i).collect();
+        for i in windows {
+            let w = &mut self.windows[i];
+            w.point = if w.point >= old { w.point - old + new } else { w.point.min(new) };
         }
+        self.agent_lines = rendered.lines;
         true
+    }
+
+    /// Whether the selected window shows the agent buffer.
+    pub fn agent_here(&self) -> bool {
+        self.agent_buffer == Some(self.window().buffer)
+    }
+
+    /// Whether the selected window is on the agent buffer's prompt.
+    pub fn agent_in_prompt(&self) -> bool {
+        self.agent_buffer == Some(self.window().buffer) && self.buffer().point() >= self.buffer().protected()
+    }
+
+    /// Shows the agent buffer with the point at the end of the prompt.
+    pub fn agent_focus_prompt(&mut self) {
+        self.agent_show();
+        let b = self.buffer_mut();
+        let end = b.len();
+        b.goto_char(end);
+        self.window_mut().point = end;
+    }
+
+    /// RET in the agent buffer: sends the prompt (from the prompt), opens
+    /// or closes a tool call (on one), visits a file (on one).
+    pub fn agent_activate(&mut self) {
+        if self.agent_in_prompt() {
+            let text = self.buffer().unprotected_text();
+            if text.trim().is_empty() {
+                self.message = "Type a prompt first".into();
+                return;
+            }
+            self.buffer_mut().clear_unprotected();
+            self.agent_prompt(text.trim());
+            return;
+        }
+        let line = self.buffer().line();
+        match self.agent_lines.get(line).cloned() {
+            Some(crate::agent::Target::Tool(id)) => self.agent_toggle_tool(&id),
+            Some(crate::agent::Target::File(path, line)) => {
+                self.agent_visit(&path, line);
+            }
+            _ => {}
+        }
+    }
+
+    /// TAB in the agent buffer: opens or closes the tool call on this line.
+    pub fn agent_toggle_at_point(&mut self) {
+        let line = self.buffer().line();
+        if let Some(crate::agent::Target::Tool(id)) = self.agent_lines.get(line).cloned() {
+            self.agent_toggle_tool(&id);
+        }
+    }
+
+    fn agent_toggle_tool(&mut self, id: &str) {
+        if let Some(agent) = self.agent.as_mut() {
+            agent.toggle(id);
+        }
+        // Keep the point on the tool's line as lines open below it.
+        let line = self.buffer().line();
+        self.agent_refresh();
+        let pos = self.buffer().line_to_pos(line);
+        self.buffer_mut().goto_char(pos);
+        self.window_mut().point = pos;
+    }
+
+    /// Opens a file the agent touched in another window, at its line.
+    fn agent_visit(&mut self, path: &Path, line: Option<u64>) {
+        let here = self.selected;
+        let other = self.window_order().into_iter().find(|&w| w != here && !self.is_sidebar(w));
+        match other {
+            Some(w) => self.select_window(w),
+            None => self.split_window(Axis::Row),
+        }
+        if let Err(e) = self.open_file(path) {
+            self.message = format!("{}: {e}", path.display());
+            return;
+        }
+        if let Some(n) = line {
+            let pos = self.buffer().line_to_pos((n as usize).saturating_sub(1));
+            self.buffer_mut().goto_char(pos);
+            self.window_mut().point = pos;
+        }
+    }
+
+    /// Asks about lines of the selected buffer: sends the question with the
+    /// file, the line numbers and the text.
+    pub fn agent_ask_about(&mut self, start: usize, end: usize, question: &str) {
+        let b = self.buffer();
+        let (first, last) = (b.line_of(start), b.line_of(end.saturating_sub(1).max(start)));
+        let code = b.substring(b.line_to_pos(first), b.line_end(b.line_to_pos(last)));
+        let root = self.agent_root();
+        let name = match b.file() {
+            Some(f) => f.strip_prefix(&root).unwrap_or(f).display().to_string(),
+            None => b.name().to_string(),
+        };
+        let language = b.file().and_then(|f| crate::syntax::language_for_path(f)).unwrap_or("");
+        let place = if first == last { format!("{name}:{}", first + 1) } else { format!("{name}:{}-{}", first + 1, last + 1) };
+        let question = if question.trim().is_empty() { "Explain this code." } else { question.trim() };
+        let text = format!("{question}\n\nFrom `{place}`:\n\n```{language}\n{code}\n```\n");
+        let shown = format!("{question}  [{place}]");
+        if let Err(e) = self.agent_start() {
+            self.message = e;
+            return;
+        }
+        self.agent_show();
+        if let Some(agent) = self.agent.as_mut() {
+            agent.prompt_as(&shown, &text);
+        }
+        self.agent_refresh();
+    }
+
+    /// A new conversation: stops the agent and starts it again.
+    pub fn agent_new_session(&mut self) {
+        self.agent = None;
+        if let Err(e) = self.agent_start() {
+            self.message = e;
+        }
+        self.agent_refresh();
     }
 
     pub fn take_events(&mut self) -> Vec<(String, Vec<String>)> {

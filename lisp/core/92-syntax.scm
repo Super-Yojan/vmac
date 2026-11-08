@@ -55,7 +55,12 @@
          (list "md-url" 'color 'dim)
          (list "md-quote" 'color 'dim 'slant 'italic)
          (list "md-list" 'color 'accent 'weight 'bold)
-         (list "md-rule" 'color 'dim))))
+         (list "md-rule" 'color 'dim)
+         ;; The agent buffer
+         (list "agent-user" 'weight 'bold 'color 'accent)
+         (list "agent-heading" 'weight 'bold)
+         (list "agent-thought" 'slant 'italic 'color 'dim)
+         (list "agent-output" 'color 'dim))))
 
 ;; Your faces, in front of the defaults (the first spec with a name wins):
 ;; (set-faces! (list (list "md-bold" 'weight 'bold 'color 'yellow)))

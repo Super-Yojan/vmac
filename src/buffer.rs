@@ -41,6 +41,12 @@ pub struct Buffer {
     revision: u64,
     /// How many times it was saved (language servers hear about each save).
     saves: u64,
+    /// The first this-many characters can't be edited (the agent's
+    /// conversation, above the prompt you type). 0: none are protected.
+    protected: usize,
+    /// The language to highlight as when it isn't the file's (the agent
+    /// buffer is Markdown).
+    language: Option<&'static str>,
 }
 
 impl Buffer {
@@ -60,6 +66,8 @@ impl Buffer {
             redo: Vec::new(),
             revision: 0,
             saves: 0,
+            protected: 0,
+            language: None,
         }
     }
 
@@ -91,6 +99,8 @@ impl Buffer {
             redo: Vec::new(),
             revision: 0,
             saves: 0,
+            protected: 0,
+            language: None,
         })
     }
 
@@ -236,7 +246,7 @@ impl Buffer {
             return String::new();
         }
         let (a, b) = (start.min(self.len()), end.min(self.len()));
-        let (a, b) = (a.min(b), a.max(b));
+        let (a, b) = (a.min(b).max(self.protected), a.max(b).max(self.protected));
         let removed = self.text.slice(a..b).to_string();
         if a < b {
             self.text.remove(a..b);
@@ -256,6 +266,9 @@ impl Buffer {
         }
         let (a, b) = (start.min(self.len()), end.min(self.len()));
         let (a, b) = (a.min(b), a.max(b));
+        if a < self.protected {
+            return;
+        }
         let added = text.chars().count();
         self.text.remove(a..b);
         self.text.insert(a, text);
@@ -329,13 +342,61 @@ impl Buffer {
         self.goal_column = None;
     }
 
+    /// Replaces the protected start of the text (see `protected`) with
+    /// `text`, which becomes the new protected part, keeping what follows
+    /// it. A point in the editable part stays with its text. Undo history
+    /// goes (its snapshots hold the old protected text), and so do faces.
+    pub fn set_protected_text(&mut self, text: &str) {
+        let old = self.protected.min(self.len());
+        let new = text.chars().count();
+        self.faces.clear();
+        self.revision += 1;
+        self.text.remove(0..old);
+        self.text.insert(0, text);
+        self.protected = new;
+        self.point = if self.point >= old { self.point - old + new } else { self.point.min(new) };
+        self.goal_column = None;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    pub fn protected(&self) -> usize {
+        self.protected
+    }
+
+    /// The editable text after the protected part.
+    pub fn unprotected_text(&self) -> String {
+        self.text.slice(self.protected.min(self.len())..).to_string()
+    }
+
+    /// Empties the editable part.
+    pub fn clear_unprotected(&mut self) {
+        let start = self.protected.min(self.len());
+        let end = self.len();
+        if start < end {
+            self.text.remove(start..end);
+            self.revision += 1;
+        }
+        self.point = self.point.min(self.len());
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    pub fn set_language(&mut self, language: Option<&'static str>) {
+        self.language = language;
+    }
+
+    pub fn language(&self) -> Option<&'static str> {
+        self.language
+    }
+
     pub fn goto_char(&mut self, pos: usize) {
         self.point = pos.min(self.len());
         self.goal_column = None;
     }
 
     pub fn insert(&mut self, s: &str) {
-        if self.read_only {
+        if self.read_only || self.point < self.protected {
             return;
         }
         self.text.insert(self.point, s);
@@ -348,7 +409,7 @@ impl Buffer {
         if self.read_only {
             return;
         }
-        let start = self.point.saturating_sub(n);
+        let start = self.point.saturating_sub(n).max(self.protected);
         if start < self.point {
             self.text.remove(start..self.point);
             self.point = start;
@@ -362,7 +423,7 @@ impl Buffer {
             return;
         }
         let end = (self.point + n).min(self.len());
-        if self.point < end {
+        if self.point < end && self.point >= self.protected {
             self.text.remove(self.point..end);
             self.touch();
         }
@@ -406,6 +467,31 @@ impl Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_protected_part_cant_be_edited_and_can_be_replaced() {
+        let mut b = Buffer::new("t");
+        b.set_protected_text("log\n");
+        b.goto_char(4);
+        b.insert("ask");
+        assert_eq!(b.text().to_string(), "log\nask");
+        b.goto_char(1);
+        b.insert("x");
+        b.delete_forward(1);
+        assert_eq!(b.text().to_string(), "log\nask", "the log is protected");
+        b.goto_char(5);
+        b.delete_backward(3);
+        assert_eq!(b.text().to_string(), "log\nsk", "deletes stop at its end");
+        assert_eq!(b.delete_range(0, 6), "sk");
+        b.insert("ask");
+        b.goto_char(6);
+        b.set_protected_text("longer log\n");
+        assert_eq!(b.text().to_string(), "longer log\nask");
+        assert_eq!(b.point(), 13, "the point stays where it was in the prompt");
+        assert_eq!(b.unprotected_text(), "ask");
+        b.clear_unprotected();
+        assert_eq!(b.text().to_string(), "longer log\n");
+    }
 
     #[test]
     fn insert_and_move() {

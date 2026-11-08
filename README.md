@@ -184,17 +184,30 @@ built on a command line tool.
 vmac talks to coding agents over the
 [Agent Client Protocol](https://agentclientprotocol.com) (ACP), the protocol
 Zed uses, so it drives the real Claude Code, Codex or Gemini CLI rather than
-an agent of its own. `SPC a a` asks the agent something; its replies, plan
-and tool calls stream into the `*agent*` buffer on the right. It works in the
-current file's project.
+an agent of its own. It works in the current file's project.
 
+`SPC a a` opens the `*agent*` buffer on the right with the cursor in its
+prompt, below a rule. The prompt is ordinary text: type, and use any Vim key
+on it; `RET` in normal state sends it (`C-RET` or `Cmd-RET` from insert
+state). Above the rule the conversation streams in, wrapped to the window:
+your prompts, its replies as Markdown, its thinking in italics, its plan as a
+checklist, and each tool call on one line (`▸ ✓ Edit src/lsp.rs`). You can
+move through, search and yank the conversation, not change it; `i`, `a` or
+`o` there jump down to the prompt.
+
+- **On a tool call**, `RET` or `TAB` (or `za`) opens it: the files it touched
+  and its output, an edit as the lines it changed. `RET` on a file opens it in
+  the other window at that line.
+- **`SPC a s`** asks about the current line, or the visual selection: it sends
+  your question with the file, the line numbers and the code.
 - It reads files **through your buffers**, so it sees edits you haven't saved.
-- When it edits a file that is open, the change lands in that buffer as one
+  When it edits a file that is open, the change lands in that buffer as one
   undo step and is saved: `u` takes it back. Other files are written to disk.
 - When it needs permission (to edit, to run a command), a picker asks you;
   `SPC a p` reopens it if you were busy.
-- `SPC a c` cancels the run, `SPC a k` stops the agent, `SPC a o` shows
-  `*agent*`. `:agent PROMPT` asks from the command line.
+- `SPC a c` (or `C-c` in `*agent*`) cancels the run, `SPC a n` starts a new
+  conversation, `SPC a k` stops the agent, `SPC a o` shows `*agent*`.
+  `:agent PROMPT` asks from the command line.
 
 The default is Claude Code through
 [claude-code-acp](https://www.npmjs.com/package/@zed-industries/claude-code-acp)
