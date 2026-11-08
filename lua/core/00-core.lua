@@ -391,6 +391,20 @@ function V.prompt(label, fn, initial)
   if initial and initial ~= "" then V.insert(initial) end
 end
 
+---- Ticks: about ten times a second, Rust calls core.tick, which calls each
+-- function in core.tick_hooks, by name, so a redefinition replaces it.
+-- One returns true when it changed something to draw. Keep them cheap.
+
+core.tick_hooks = core.tick_hooks or {}
+
+function core.tick()
+  local changed = false
+  for _, hook in pairs(core.tick_hooks) do
+    if hook() then changed = true end
+  end
+  return changed
+end
+
 ---- Events Rust raises (server replies, the agent asking...): each calls
 -- core.events[name] with a list of strings.
 

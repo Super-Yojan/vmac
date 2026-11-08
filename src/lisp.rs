@@ -402,6 +402,23 @@ impl Lisp {
         }
     }
 
+    /// `core.tick()`, about ten times a second (with the language servers'
+    /// pump): for what follows on its own, like the PDF following the
+    /// cursor. True when it changed something to draw. A failing tick says
+    /// so once, not ten times a second.
+    pub fn tick(&mut self) -> bool {
+        match self.call::<bool>("tick", ()) {
+            Ok(changed) => changed,
+            Err(e) => {
+                let message = format!("tick: {e}");
+                let mut st = self.editor.lock();
+                let changed = st.message != message;
+                st.message = message;
+                changed
+            }
+        }
+    }
+
     /// Runs what Rust raised for Lua (server replies, the agent asking):
     /// each calls `core.events[name]` with a list of strings.
     pub fn run_events(&mut self) -> bool {
@@ -1317,13 +1334,16 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     // Forward search: the PDF's view scrolled to a box on a page (from 1),
     // in PDF points from its top left, and marked for a moment.
-    prim!(reg, editor, "pdf-reveal", |s, pdf: String, page: isize, x: f64, y: f64, width: f64, height: f64| {
+    // With `follow`, only when it's out of view (the PDF following the cursor).
+    prim!(reg, editor, "pdf-reveal", |s, pdf: String, page: isize, x: f64, y: f64, width: f64, height: f64, follow: bool| {
         let Some(id) = s.buffer_for_file(&expand_home(&pdf)) else { return false };
         let page = (page - 1).max(0) as usize;
         let (x, y, width, height) = (x as f32, y as f32, width as f32, height as f32);
-        s.queue_media_scroll(id, crate::frame::MediaScroll::Reveal { page, x, y, width, height });
+        s.queue_media_scroll(id, crate::frame::MediaScroll::Reveal { page, x, y, width, height, follow });
         true
     });
+    // Whether a window other than this one shows a file.
+    prim!(reg, editor, "file-shown?", |s, path: String| s.file_shown(&expand_home(&path)));
     prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
     // SPC t m: markup hidden (the default) -> as typed -> rendered, like the preview.
     prim!(reg, editor, "markdown-view-cycle", |s| {

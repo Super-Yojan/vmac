@@ -77,7 +77,8 @@ impl Session {
             let mut editor = self.editor.lock();
             editor.lsp_pump(configs) | editor.agent_pump() | editor.dashboard_refresh()
         };
-        self.lisp.run_events() || changed
+        let ran = self.lisp.run_events();
+        self.lisp.tick() || ran || changed
     }
 
     // ---- Input
@@ -872,6 +873,56 @@ mod tests {
             key(&mut s, k);
         }
         assert_eq!(s.frame(VIEW).windows.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_pdf_follows_the_cursor_once_it_rests() {
+        use crate::frame::MediaScroll;
+        let Some(dir) = latex_sample("follow") else { return };
+        let mut s = session_with("");
+        s.editor.lock().open_file(&dir.join("paper.tex")).unwrap();
+        let reveals = |s: &mut Session| -> Vec<(f32, bool)> {
+            let frame = s.frame(VIEW);
+            let Some(Content::Media { scroll, .. }) = frame.windows.get(1).map(|w| &w.content) else { return Vec::new() };
+            scroll.iter().filter_map(|(_, how)| match how {
+                MediaScroll::Reveal { y, follow, .. } => Some((*y, *follow)),
+                _ => None,
+            }).collect()
+        };
+        let ticks = |s: &mut Session, n: usize| (0..n).for_each(|_| { s.pump_servers(); });
+
+        // The PDF closed: nothing to follow.
+        for k in ["7", "G"] {
+            key(&mut s, k);
+        }
+        ticks(&mut s, 5);
+        assert!(reveals(&mut s).is_empty());
+
+        // Beside it: resting on line 7 shows it there, following (only if out of view).
+        for k in ["SPC", "m", "p"] {
+            key(&mut s, k);
+        }
+        ticks(&mut s, 5);
+        let found = reveals(&mut s);
+        assert_eq!(found.len(), 1, "once, not every tick: {found:?}");
+        assert!((140. ..165.).contains(&found[0].0) && found[0].1, "{found:?}");
+
+        // Moving through lines without resting: no search for each.
+        for k in ["k", "k", "k"] {
+            key(&mut s, k);
+            ticks(&mut s, 1);
+        }
+        assert_eq!(reveals(&mut s).len(), 1);
+        ticks(&mut s, 5);
+        assert_eq!(reveals(&mut s).len(), 2, "rested on line 4: shown");
+
+        // Off: it stays put.
+        for k in ["SPC", "t", "s", "3", "G"] {
+            key(&mut s, k);
+        }
+        ticks(&mut s, 5);
+        assert_eq!(reveals(&mut s).len(), 2);
         std::fs::remove_dir_all(dir).ok();
     }
 

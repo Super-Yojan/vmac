@@ -914,6 +914,11 @@ impl EditorState {
         opened
     }
 
+    /// Whether a window other than the selected one shows a file.
+    pub fn file_shown(&self, path: &Path) -> bool {
+        !self.windows_showing(&self.resolve(path)).is_empty()
+    }
+
     /// The windows other than the selected one (and the sidebar) showing a file.
     fn windows_showing(&self, path: &Path) -> Vec<WindowId> {
         let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());

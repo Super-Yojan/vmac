@@ -307,6 +307,18 @@ impl PdfView {
         cx.notify();
     }
 
+    /// Whether the band `y`..`y + height` (PDF points) of page `ix` is on
+    /// screen, from where the page was last laid out.
+    fn in_view(&self, ix: usize, (y, height): (f32, f32)) -> bool {
+        let Some(&(own, _)) = self.sizes.as_ref().ok().and_then(|s| s.get(ix)) else { return false };
+        let Some(item) = self.list.bounds_for_item(ix) else { return false };
+        let viewport = self.list.viewport_bounds();
+        let scale = self.page_width(ix) / own.max(1.);
+        let top = f32::from(item.origin.y) + if ix == 0 { PAGE_MARGIN } else { 0. } + y * scale;
+        let (lo, hi) = (f32::from(viewport.origin.y), f32::from(viewport.origin.y + viewport.size.height));
+        top >= lo && top + height * scale <= hi
+    }
+
     /// Scrolls a box on a page into view, a third of the way down the
     /// window (and to its middle sideways when zoomed wide), and marks it
     /// for a moment.
@@ -367,7 +379,11 @@ impl PdfView {
                 MediaScroll::Pages(n) => self.list.scroll_to(page(top.item_ix.saturating_add_signed(n as isize))),
                 MediaScroll::Page(ix) => self.list.scroll_to(page(ix)),
                 MediaScroll::End => self.list.scroll_to_end(),
-                MediaScroll::Reveal { page, x, y, width, height } => self.reveal(page, (x, y, width, height), cx),
+                MediaScroll::Reveal { page, x, y, width, height, follow } => {
+                    if !(follow && self.in_view(page, (y, height))) {
+                        self.reveal(page, (x, y, width, height), cx)
+                    }
+                }
             }
         }
     }

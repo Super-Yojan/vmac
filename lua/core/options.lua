@@ -145,6 +145,11 @@ end
 -- (opened beside it if it isn't showing): scrolled to, and marked for a
 -- moment. Like the other way, it needs synctex and a PDF built with
 -- -synctex=1.
+--
+-- While the PDF shows beside a .tex file, it follows the cursor on its own:
+-- once the cursor rests on another line for a moment, the PDF scrolls there
+-- if that's out of view. SPC t s turns that off and on
+-- (core.pdf_follow = false in init.lua for off).
 
 -- Where a source line is in its PDF: the page (from 1) and the box of
 -- its text, x, y (top left), width and height in PDF points (or nil).
@@ -158,17 +163,57 @@ function core.synctex_view(file, line, column, pdf)
   return page, h, v - height, width, height
 end
 
-vmac.command("pdf-forward-search", function()
-  local file = vmac.buffer_file_name()
-  local pdf = file ~= "" and core.pdf_for(file)
-  if not pdf or file:lower():match("%.pdf$") then return vmac.message("Not a file with a PDF built from it") end
-  if not vmac.file_exists(pdf) then return vmac.message("Not built yet: " .. pdf) end
-  local page, x, y, width, height = core.synctex_view(file, vmac.line_number(), 0, pdf)
+-- Shows a source line in the PDF: on a key, opening the PDF and saying
+-- what happened; following the cursor, quietly, only where it shows.
+function core.forward_search(file, line, follow)
+  local pdf = file ~= "" and not file:lower():match("%.pdf$") and core.pdf_for(file)
+  if not pdf then return follow or vmac.message("Not a file with a PDF built from it") end
+  if not vmac.file_exists(pdf) then return follow or vmac.message("Not built yet: " .. pdf) end
+  local page, x, y, width, height = core.synctex_view(file, line, 0, pdf)
   if not page then
-    return vmac.message("Not found in the PDF: is synctex installed, and was it built with -synctex=1?")
+    return follow or vmac.message("Not found in the PDF: is synctex installed, and was it built with -synctex=1?")
   end
-  local err = vmac.show_file_beside(pdf)
-  if err ~= "" then return vmac.message(err) end
-  vmac.pdf_reveal(pdf, page, x, y, width, height)
-  vmac.message("Page " .. page)
+  if not follow then
+    local err = vmac.show_file_beside(pdf)
+    if err ~= "" then return vmac.message(err) end
+    vmac.message("Page " .. page)
+  end
+  vmac.pdf_reveal(pdf, page, x, y, width, height, follow)
+end
+
+vmac.command("pdf-forward-search", function()
+  core.forward_search(vmac.buffer_file_name(), vmac.line_number(), false)
+end)
+
+-- Following the cursor: the line it's on, and for how many ticks. It acts
+-- once the cursor has rested a few ticks, so moving through lines doesn't
+-- run synctex for each.
+core.pdf_follow = core.pdf_follow ~= false
+local resting = { at = nil, ticks = 0 }
+local REST_TICKS = 3
+
+core.tick_hooks.pdf_follow = function()
+  if not core.pdf_follow or vmac.minibuffer_active() then return false end
+  local file = vmac.buffer_file_name()
+  if not file:match("%.tex$") then return false end
+  local pdf = core.pdf_for(file)
+  if not (pdf and vmac.file_shown(pdf)) then
+    resting.at = nil
+    return false
+  end
+  -- A new line, or the PDF just opened: rest a moment, then show it.
+  local at = file .. ":" .. vmac.line_number()
+  if at ~= resting.at then
+    resting.at, resting.ticks = at, 0
+    return false
+  end
+  resting.ticks = resting.ticks + 1
+  if resting.ticks ~= REST_TICKS then return false end
+  core.forward_search(file, vmac.line_number(), true)
+  return true
+end
+
+vmac.command("toggle-pdf-follow", function()
+  core.pdf_follow = not core.pdf_follow
+  vmac.message(core.pdf_follow and "The PDF follows the cursor" or "The PDF stays put (SPC m s to show the line)")
 end)

@@ -480,7 +480,11 @@ it exists shows up when it's first built.
 it was built from, in the source's window (opened beside the PDF if it isn't
 showing). The other way, `SPC m s` in the source shows where the cursor's
 line is in the PDF (opening it beside the source if needed): scrolled to,
-and marked for a moment. This is SyncTeX, so it's for LaTeX: build with `-synctex=1`
+and marked for a moment. While the PDF shows beside a `.tex` file it also
+follows the cursor on its own: rest on a line for a moment and the PDF
+scrolls there if it's out of view (`SPC t s` turns that off and on, and
+`core.pdf_follow = false` in `init.lua` starts it off). This is SyncTeX, so
+it's for LaTeX: build with `-synctex=1`
 (`latexmk -pvc -pdf -synctex=1 paper.tex`), which leaves `paper.synctex.gz`
 beside the PDF, and have TeX Live's `synctex` on your `PATH` (MacTeX and
 Homebrew's TeX Live include it). Typst doesn't write SyncTeX.
