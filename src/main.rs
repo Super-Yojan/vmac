@@ -10,6 +10,7 @@ mod picker;
 mod plugins;
 mod shell;
 mod syntax;
+mod terminal;
 
 use buffer::Buffer;
 use editor::Editor;

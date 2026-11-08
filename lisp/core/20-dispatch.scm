@@ -117,6 +117,9 @@
               ((keymap-prefix? keymap seq)
                (set! pending-keys seq)
                (message (string-append seq "-")))
+              ;; Typing into a terminal: every other key goes to its program.
+              ((and (equal? pending-keys "") (terminal-insert?))
+               (terminal-send key text))
               ((and (equal? pending-keys "") (inserting?) (not (equal? text "")))
                (insert text)
                (when (and (equal? evil-state 'insert) (not (minibuffer-active?)))

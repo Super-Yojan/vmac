@@ -34,6 +34,7 @@ const CORE_FILES: &[(&str, &str)] = &[
     ("60-minibuffer.scm", include_str!("../lisp/core/60-minibuffer.scm")),
     ("65-picker.scm", include_str!("../lisp/core/65-picker.scm")),
     ("70-windows.scm", include_str!("../lisp/core/70-windows.scm")),
+    ("72-terminal.scm", include_str!("../lisp/core/72-terminal.scm")),
     ("75-file-tree.scm", include_str!("../lisp/core/75-file-tree.scm")),
     ("80-lsp.scm", include_str!("../lisp/core/80-lsp.scm")),
     ("85-bindings.scm", include_str!("../lisp/core/85-bindings.scm")),
@@ -168,6 +169,8 @@ pub struct Lisp {
     plugin_signature: Vec<(PathBuf, Option<SystemTime>)>,
     /// Each source's last text that loaded, by label, to fall back on.
     last_good: std::collections::HashMap<String, String>,
+    /// When plugin-backed terminals were last read.
+    last_terminal_poll: std::time::Instant,
 }
 
 impl Lisp {
@@ -202,6 +205,7 @@ impl Lisp {
             plugin_dir,
             plugin_signature: Vec::new(),
             last_good: Default::default(),
+            last_terminal_poll: std::time::Instant::now(),
         };
         lisp.reload();
         lisp
@@ -421,6 +425,65 @@ impl Lisp {
             || self.sources.iter().zip(&self.stamps).any(|(s, old)| s.mtime() != *old);
         if changed {
             self.reload();
+        }
+        changed
+    }
+
+    /// Reads terminals into their buffers: local ones every call, plugin
+    /// ones (which run Lua, often a process) every 150 ms. Returns whether
+    /// a screen changed.
+    pub fn pump_terminals(&mut self) -> bool {
+        let follow = match self.engine.call_function_by_name_with_args("terminal-insert?", vec![]) {
+            Ok(SteelVal::BoolV(true)) => Some(self.editor.lock().window().buffer),
+            _ => None,
+        };
+        let mut changed = self.editor.lock().pump_local_terminals(follow);
+        if self.last_terminal_poll.elapsed() < std::time::Duration::from_millis(150) {
+            return changed;
+        }
+        self.last_terminal_poll = std::time::Instant::now();
+        let (plugins, kills) = {
+            let mut st = self.editor.lock();
+            let plugins: Vec<(crate::editor::BufferId, String, String)> = st
+                .terminals
+                .iter()
+                .filter(|t| !t.exited)
+                .filter_map(|t| match &t.backend {
+                    crate::editor::TermBackend::Plugin { backend, handle } => Some((t.buffer, backend.clone(), handle.clone())),
+                    _ => None,
+                })
+                .collect();
+            (plugins, std::mem::take(&mut st.terminals_to_kill))
+        };
+        for (buffer, backend, handle) in plugins {
+            let (text, alive) = {
+                let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+                let text = call_backend::<String>(&lua, &backend, "read", handle.clone());
+                let alive = call_backend::<bool>(&lua, &backend, "alive", handle.clone()).unwrap_or(Ok(true));
+                (text, alive)
+            };
+            let mut st = self.editor.lock();
+            match text {
+                Some(Ok(text)) => {
+                    let unchanged = st.buffer_by_id(buffer).is_some_and(|b| *b.text() == *text.trim_end_matches('\n'));
+                    if !unchanged {
+                        st.show_screen(buffer, &crate::terminal::Screen::from_text(&text), follow == Some(buffer));
+                        changed = true;
+                    }
+                }
+                Some(Err(e)) => st.message = format!("{backend}: {}", first_line(&e)),
+                None => {}
+            }
+            if matches!(alive, Ok(false))
+                && let Some(t) = st.terminal_for(buffer)
+            {
+                t.exited = true;
+                changed = true;
+            }
+        }
+        for (backend, handle) in kills {
+            let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = call_backend::<()>(&lua, &backend, "kill", handle);
         }
         changed
     }
@@ -696,6 +759,87 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
             ed.lock().message = format!("{name}: {}", first_line(&e));
         }
     });
+    // Terminals: start one with a backend ("" for the default), and send a
+    // key to the selected one. Plugin backends run Lua, so no lock is held.
+    let (ed, l) = (editor.clone(), lua.clone());
+    engine.register_fn("terminal-open", move |backend: String, command: String| -> bool {
+        let (backend, cwd, rows, cols) = {
+            let st = ed.lock();
+            let backend = if backend.is_empty() { st.terminal_backend.clone() } else { backend };
+            let cwd = st
+                .buffer()
+                .file()
+                .map(|f| crate::picker::project_root(f))
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let w = st.window();
+            (backend, cwd, w.rows.max(2) as u16, w.cols.max(20) as u16)
+        };
+        if backend == "local" {
+            return match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
+                Ok(pty) => {
+                    ed.lock().add_terminal(crate::editor::TermBackend::Local(pty));
+                    true
+                }
+                Err(e) => {
+                    ed.lock().message = format!("terminal: {e}");
+                    false
+                }
+            };
+        }
+        let started = {
+            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
+            call_backend::<String>(&lua, &backend, "start", (command, cwd.display().to_string(), rows, cols))
+        };
+        match started {
+            Some(Ok(handle)) if !handle.is_empty() => {
+                ed.lock().add_terminal(crate::editor::TermBackend::Plugin { backend, handle });
+                true
+            }
+            Some(Ok(_)) => {
+                ed.lock().message = format!("{backend}: started nothing");
+                false
+            }
+            Some(Err(e)) => {
+                ed.lock().message = format!("{backend}: {}", first_line(&e));
+                false
+            }
+            None => {
+                ed.lock().message = format!("no terminal backend named {backend}");
+                false
+            }
+        }
+    });
+    let (ed, l) = (editor.clone(), lua.clone());
+    engine.register_fn("terminal-send", move |key: String, text: String| {
+        let plugin = {
+            let mut st = ed.lock();
+            match st.terminal_here() {
+                Some(t) if !t.exited => match &mut t.backend {
+                    crate::editor::TermBackend::Local(pty) => {
+                        pty.send(&crate::terminal::key_bytes(&key, &text));
+                        None
+                    }
+                    crate::editor::TermBackend::Plugin { backend, handle } => Some((backend.clone(), handle.clone())),
+                },
+                _ => None,
+            }
+        };
+        if let Some((backend, handle)) = plugin {
+            // A named key (enter, ctrl+c) or the text it types.
+            let (text, name) = match crate::terminal::key_name(&key) {
+                Some(name) => (None, Some(name)),
+                None => (Some(text), None),
+            };
+            let result = {
+                let lua = l.lock().unwrap_or_else(|e| e.into_inner());
+                call_backend::<()>(&lua, &backend, "send", (handle, text, name))
+            };
+            if let Some(Err(e)) = result {
+                ed.lock().message = format!("{backend}: {}", first_line(&e));
+            }
+        }
+    });
     let (ed, l) = (editor.clone(), lua.clone());
     engine.register_fn("lua-eval", move |code: String| {
         let result = {
@@ -756,6 +900,18 @@ function gmacs.map(state, keys, command)
   gmacs.scheme("(lua-define-key '" .. state .. " " .. quote(keys) .. " '" .. command .. ")")
 end
 
+-- Terminal backends: where a terminal's program runs, beside the built-in
+-- "local" PTY. A backend is a table of functions:
+--   start(command, cwd, rows, cols) -> handle   (command "" means a shell)
+--   send(handle, text, key)   text it types, or a key name (enter, ctrl+c, up)
+--   read(handle) -> the screen as text
+--   alive(handle) -> bool     (optional)
+--   kill(handle)              (optional)
+gmacs.terminal_backends = {}
+function gmacs.terminal_backend(name, backend)
+  gmacs.terminal_backends[name] = backend
+end
+
 -- Runs a command (Scheme's or Lua's) right after this one.
 function gmacs.run(name)
   gmacs.scheme("(call-binding '" .. name .. ")")
@@ -768,6 +924,24 @@ function print(...)
   gmacs.message(table.concat(parts, " "))
 end
 "##;
+
+/// Calls a function of a plugin's terminal backend
+/// (`gmacs.terminal_backends[backend][name]`); None when it has no such function.
+fn call_backend<R: mlua::FromLuaMulti>(
+    lua: &Lua,
+    backend: &str,
+    name: &str,
+    args: impl mlua::IntoLuaMulti,
+) -> Option<mlua::Result<R>> {
+    let f = lua
+        .globals()
+        .get::<mlua::Table>("gmacs")
+        .and_then(|g| g.get::<mlua::Table>("terminal_backends"))
+        .and_then(|b| b.get::<mlua::Table>(backend))
+        .and_then(|b| b.get::<mlua::Function>(name))
+        .ok()?;
+    Some(f.call::<R>(args))
+}
 
 fn first_line(e: &impl std::fmt::Display) -> String {
     e.to_string().lines().next().unwrap_or("").to_string()
@@ -898,12 +1072,13 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "buffer-read-only?", |s| s.buffer().is_read_only());
     prim!(reg, editor, "buffer-revision", |s| s.buffer().revision() as isize);
     prim!(reg, editor, "buffer-modified?", |s| s.buffer().is_modified());
-    prim!(reg, editor, "buffer-language", |s| s
-        .buffer()
-        .file()
-        .and_then(|f| crate::syntax::language_for_path(f))
-        .unwrap_or("text")
-        .to_string());
+    prim!(reg, editor, "buffer-language", |s| {
+        if let Some(t) = s.terminal_here() {
+            let exited = if t.exited { ", exited" } else { "" };
+            return format!("terminal ({}{exited})", t.backend_name());
+        }
+        s.buffer().file().and_then(|f| crate::syntax::language_for_path(f)).unwrap_or("text").to_string()
+    });
     prim!(reg, editor, "line-number", |s| s.buffer().line() as isize + 1);
     prim!(reg, editor, "column-number", |s| s.buffer().column() as isize);
     prim!(reg, editor, "find-file", |s, path: String| {
@@ -1241,6 +1416,23 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             gmacs.set("plugin_update", f.expect("a Lua function")).expect("set in gmacs");
         }
     }
+
+    // Terminals.
+    prim!(reg, editor, "terminal-here?", |s| s.terminal_here().is_some());
+    prim!(reg, editor, "terminal-buffer-name", |s| {
+        let id = s.terminals.iter().find(|t| !t.exited).map(|t| t.buffer);
+        id.and_then(|id| s.buffer_by_id(id)).map(|b| b.name().to_string()).unwrap_or_default()
+    });
+    prim!(reg, editor, "set-terminal-backend", |s, name: String| s.terminal_backend = name);
+    prim!(reg, editor, "terminal-backend", |s| s.terminal_backend.clone());
+    // Runs a program, returning what it printed (for plugins: hc, rex, ...).
+    pure!(reg, "exec", |command: String, args: Vec<String>| {
+        std::process::Command::new(&command)
+            .args(&args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    });
 
     // Scheme for Lua to run (gmacs.scheme), silently, after the current command.
     prim!(reg, editor, "scheme", |s, code: String| s.pending_scheme.push(code));
@@ -2933,7 +3125,7 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
     fn the_example_plugins_load() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/plugins");
         let (mut lisp, editor) = with_plugins(&dir, None);
-        assert_eq!(editor.lock().message, "loaded core, 2 plugins");
+        assert_eq!(editor.lock().message, "loaded core, 3 plugins");
         typed(&mut lisp, "ione two\nthree");
         lisp.dispatch_key("ESC", "");
         typed(&mut lisp, " tw");
@@ -2973,6 +3165,126 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         );
         assert_eq!(lisp.cursor_shape(), "box", "out of visual state");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pumps terminals until `done`, for up to four seconds.
+    fn pump_terminals_until(lisp: &mut Lisp, editor: &Editor, done: impl Fn(&EditorState) -> bool) -> bool {
+        for _ in 0..200 {
+            lisp.pump_terminals();
+            if done(&editor.lock()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_local_terminal_runs_a_shell_you_type_into() {
+        let (mut lisp, editor) = lisp_with("");
+        typed(&mut lisp, ":term sh\n");
+        assert!(editor.lock().terminal_here().is_some(), "{}", editor.lock().message.clone());
+        assert_eq!(lisp.cursor_shape(), "bar", "typing into it");
+        typed(&mut lisp, "echo gmacs-$((40 + 2))\n");
+        assert!(
+            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("gmacs-42")),
+            "{}",
+            editor.lock().buffer().text()
+        );
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(lisp.cursor_shape(), "box", "ESC: normal state, over the screen's text");
+        typed(&mut lisp, "gg");
+        assert_eq!(editor.lock().buffer().point(), 0, "motions work on the screen");
+        assert!(lisp.modeline().iter().any(|s| s.text == "terminal (local)"));
+        typed(&mut lisp, "x");
+        assert!(editor.lock().buffer().text().to_string().contains("gmacs-42"), "read-only: x does nothing");
+        typed(&mut lisp, "i");
+        typed(&mut lisp, "exit\n");
+        assert!(
+            pump_terminals_until(&mut lisp, &editor, |st| st.terminals.first().is_some_and(|t| t.exited)),
+            "exit ends it"
+        );
+    }
+
+    #[test]
+    fn spc_o_t_opens_a_terminal_below_and_closes_it() {
+        let (mut lisp, editor) = lisp_with("text");
+        typed(&mut lisp, " ot");
+        assert_eq!(editor.lock().window_count(), 2);
+        assert!(editor.lock().terminal_here().is_some());
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " ot");
+        assert_eq!(editor.lock().window_count(), 1, "from the terminal, SPC o t closes its window");
+        assert_eq!(editor.lock().buffer().name(), "test");
+        typed(&mut lisp, " ot");
+        assert_eq!(editor.lock().terminals.len(), 1, "the running terminal is reused");
+    }
+
+    #[test]
+    fn plugins_add_terminal_backends() {
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval_lua(r#"
+            local screens = {}
+            killed = {}
+            gmacs.terminal_backend("fake", {
+              start = function(command, cwd, rows, cols)
+                screens.h1 = "fake$ " .. command
+                return "h1"
+              end,
+              send = function(h, text, key)
+                screens[h] = screens[h] .. (text or ("<" .. key .. ">"))
+              end,
+              read = function(h) return screens[h] end,
+              kill = function(h) killed[#killed + 1] = h end,
+            })
+            gmacs.set_terminal_backend("fake")
+        "#)
+        .unwrap();
+        typed(&mut lisp, ":term top\n");
+        typed(&mut lisp, "ab");
+        lisp.dispatch_key("RET", "");
+        lisp.dispatch_key("C-c", "");
+        lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
+        assert!(pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string() == "fake$ topab<enter><ctrl+c>"));
+        assert!(lisp.modeline().iter().any(|s| s.text == "terminal (fake)"));
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, ":bd\n");
+        lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
+        lisp.pump_terminals();
+        assert_eq!(lisp.eval_lua("killed[1]").unwrap(), "h1", "closing its buffer ends it");
+    }
+
+    #[test]
+    fn an_unknown_backend_says_so() {
+        let (mut lisp, editor) = lisp_with("");
+        typed(&mut lisp, ":terminal-backend nope\n");
+        typed(&mut lisp, ":term\n");
+        assert_eq!(editor.lock().message, "no terminal backend named nope");
+        assert!(editor.lock().terminals.is_empty());
+    }
+
+    /// Against the real herdr-core: `cargo test -- --ignored herdr`. It makes
+    /// a terminal there and ends it.
+    #[test]
+    #[ignore]
+    fn the_herdr_backend_runs_terminals_in_herdr_core() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/plugins");
+        let (mut lisp, editor) = with_plugins(&dir, None);
+        lisp.eval_lua(r#"gmacs.set_terminal_backend("herdr")"#).unwrap();
+        typed(&mut lisp, ":term sh\n");
+        assert!(editor.lock().terminal_here().is_some(), "{}", editor.lock().message.clone());
+        typed(&mut lisp, "echo herdr-$((40 + 2))\n");
+        let found = (0..100).any(|_| {
+            lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
+            lisp.pump_terminals();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            editor.lock().buffer().text().to_string().contains("herdr-42")
+        });
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, ":bd\n");
+        lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
+        lisp.pump_terminals();
+        assert!(found, "{}", editor.lock().buffer().text());
     }
 
     #[test]

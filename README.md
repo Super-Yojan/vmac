@@ -114,6 +114,35 @@ to log every message to and from the servers.
   (list (list "python" "pylsp") (list "rust" "rust-analyzer")))
 ```
 
+## Terminal
+
+`SPC o t` opens a terminal below (or closes it, from the terminal; the
+running one is reused), `SPC o T` one in this window, `:term CMD` runs a
+command. It's a buffer: in insert state every key goes to the program
+(`ESC` returns to normal state, `C-\` sends the program an `ESC`); in normal
+state its screen is text, so motions, search and yank work, and `p` pastes
+into the program. Colors carry over (256 and true color too).
+
+Where the program runs is a **backend**. The built-in one is `local` (a
+PTY). Plugins add others in Lua:
+
+```lua
+gmacs.terminal_backend("name", {
+  start = function(command, cwd, rows, cols) return handle end,  -- "" = a shell
+  send  = function(handle, text, key) end,   -- text typed, or a key: enter, ctrl+c, up
+  read  = function(handle) return screen_text end,
+  alive = function(handle) return true end,  -- optional
+  kill  = function(handle) end,              -- optional
+})
+```
+
+`:terminal-backend NAME` (or `gmacs.set_terminal_backend`) picks the
+default. `examples/plugins/herdr-terminal` runs terminals in herdr-core
+through `hc`, so they outlive gmacs; `hc keys` can't type every character,
+so it sends what you type a line at a time (RET), which suits shells and
+agents. `gmacs.exec(cmd, args)` runs a program and returns its output, for
+backends built on a command line tool.
+
 ## Plugins
 
 Plugins live in `~/.config/gmacs/plugins/`: a folder with an `init.scm`
@@ -128,8 +157,8 @@ Editing a plugin's files reloads it.
 - `:plugin-install URL` clones one with git (in the background, then reloads),
   `:plugin-update` pulls them all, `:plugin-remove NAME` deletes one.
 
-`examples/plugins/` has two: `word-count` (Lua, `SPC t w`) and `zen`
-(Scheme, `SPC t z`). To try them:
+`examples/plugins/` has `word-count` (Lua, `SPC t w`), `zen` (Scheme,
+`SPC t z`) and `herdr-terminal` (a terminal backend). To try them:
 `cp -r examples/plugins/* ~/.config/gmacs/plugins/`
 
 A plugin is just config that can be shared: in Scheme, `defcommand` and

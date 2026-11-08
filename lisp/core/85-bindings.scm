@@ -29,6 +29,8 @@
         ((equal? name 'visual) (define-key visual-map key binding))
         ((equal? name 'operator) (define-key operator-map key binding))
         ((equal? name 'insert) (define-key insert-map key binding))
+        ((equal? name 'terminal) (define-key terminal-map key binding))
+        ((equal? name 'terminal-normal) (define-key terminal-normal-map key binding))
         (else (define-key minibuffer-map key binding))))
 
 (for-each (lambda (pair)
@@ -65,6 +67,7 @@
         (list "SPC :" 'execute-extended-command) (list "SPC ;" 'eval-expression)
         (list "SPC f f" 'find-file-command) (list "SPC SPC" 'find-file-command)
         (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
+        (list "SPC o t" 'terminal-toggle) (list "SPC o T" 'terminal-new)
         (list "SPC m a" 'table-align)
         ;; Language servers
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)

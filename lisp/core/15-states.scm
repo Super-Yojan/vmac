@@ -17,7 +17,9 @@
 (define tree-buffer "*tree*")
 
 (define (current-keymap)
-  (cond ((and (equal? evil-state 'normal) (not (minibuffer-active?)) (equal? (buffer-name) tree-buffer))
+  (cond ((terminal-insert?) terminal-map)
+        ((terminal-normal?) (append terminal-normal-map normal-map))
+        ((and (equal? evil-state 'normal) (not (minibuffer-active?)) (equal? (buffer-name) tree-buffer))
          (append tree-map normal-map))
         ((picker-normal?)
          (cond ((visual?) visual-map)

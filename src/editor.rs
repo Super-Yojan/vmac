@@ -31,6 +31,39 @@ pub fn compile_search(pattern: &str) -> Option<Regex> {
 pub type BufferId = u64;
 pub type WindowId = u64;
 
+/// Where a terminal's program runs: a local PTY, or a plugin's backend
+/// (driven from Lua by the Lisp side) with its handle for the terminal.
+pub enum TermBackend {
+    Local(crate::terminal::LocalPty),
+    Plugin { backend: String, handle: String },
+}
+
+impl std::fmt::Debug for TermBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TermBackend::Local(_) => write!(f, "local"),
+            TermBackend::Plugin { backend, handle } => write!(f, "{backend}:{handle}"),
+        }
+    }
+}
+
+/// A terminal, shown in its own read-only buffer.
+#[derive(Debug)]
+pub struct Terminal {
+    pub buffer: BufferId,
+    pub backend: TermBackend,
+    pub exited: bool,
+}
+
+impl Terminal {
+    pub fn backend_name(&self) -> String {
+        match &self.backend {
+            TermBackend::Local(_) => "local".into(),
+            TermBackend::Plugin { backend, .. } => backend.clone(),
+        }
+    }
+}
+
 /// The completion popup: the server's candidates, those matching what's
 /// been typed since `start`, and the selected one.
 #[derive(Debug, Clone)]
@@ -94,6 +127,8 @@ pub struct Window {
     pub scroll_top: usize,
     /// Text rows on screen, set by the view when it lays the window out.
     pub rows: usize,
+    /// Text columns on screen (monospace), set by the view too.
+    pub cols: usize,
 }
 
 /// How windows divide the space: side by side (`Row`) or stacked (`Column`).
@@ -214,6 +249,11 @@ pub struct EditorState {
     jumps: Vec<(BufferId, usize)>,
     /// The completion popup while typing, if open.
     pub completion: Option<Completion>,
+    /// Running terminals, and the backend new ones use ("local", or a
+    /// plugin's). Plugin terminals to end, for the Lisp side (it runs Lua).
+    pub terminals: Vec<Terminal>,
+    pub terminal_backend: String,
+    pub terminals_to_kill: Vec<(String, String)>,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
     /// Things for Scheme to handle (a function name and its arguments),
@@ -224,7 +264,7 @@ pub struct EditorState {
 
 impl EditorState {
     pub fn new(buffer: Buffer) -> Self {
-        let window = Window { id: 2, buffer: 1, point: buffer.point(), scroll_top: 0, rows: 0 };
+        let window = Window { id: 2, buffer: 1, point: buffer.point(), scroll_top: 0, rows: 0, cols: 0 };
         Self {
             buffers: vec![(1, buffer)],
             windows: vec![window],
@@ -250,6 +290,9 @@ impl EditorState {
             jumps: Vec::new(),
             completion: None,
             code_actions: Vec::new(),
+            terminals: Vec::new(),
+            terminal_backend: "local".into(),
+            terminals_to_kill: Vec::new(),
             events: Vec::new(),
             search_cache: None,
         }
@@ -378,6 +421,13 @@ impl EditorState {
             return Err(format!("{name} has unsaved changes (:bd! to discard)"));
         }
         self.buffers.retain(|(b, _)| *b != id);
+        // A terminal's program ends with its buffer.
+        if let Some(i) = self.terminals.iter().position(|t| t.buffer == id) {
+            match self.terminals.remove(i).backend {
+                TermBackend::Local(mut pty) => pty.kill(),
+                TermBackend::Plugin { backend, handle } => self.terminals_to_kill.push((backend, handle)),
+            }
+        }
         if self.buffers.is_empty() {
             self.add_buffer(Buffer::new("*scratch*"));
         }
@@ -458,7 +508,7 @@ impl EditorState {
             Some(id) => id,
             None => {
                 let id = self.fresh_id();
-                self.windows.push(Window { id, buffer, point: 0, scroll_top: 0, rows: 0 });
+                self.windows.push(Window { id, buffer, point: 0, scroll_top: 0, rows: 0, cols: 0 });
                 self.sidebar = Some(id);
                 id
             }
@@ -1010,6 +1060,76 @@ impl EditorState {
         let mut list: Vec<_> = self.lsp.diagnostics(path).iter().map(|d| (d.to_chars(rope), d.clone())).collect();
         list.sort_by_key(|(range, d)| (range.0, d.severity));
         list
+    }
+
+    // ---- Terminals
+
+    pub fn terminal_for(&mut self, buffer: BufferId) -> Option<&mut Terminal> {
+        self.terminals.iter_mut().find(|t| t.buffer == buffer)
+    }
+
+    /// The selected buffer's terminal, if it is one.
+    pub fn terminal_here(&mut self) -> Option<&mut Terminal> {
+        let id = self.window().buffer;
+        self.terminal_for(id)
+    }
+
+    /// The size of the window showing a buffer (rows, columns), at least 2x10.
+    pub fn size_for(&self, buffer: BufferId) -> (u16, u16) {
+        let w = self.windows.iter().find(|w| w.buffer == buffer).unwrap_or_else(|| self.window());
+        ((w.rows.max(2)) as u16, (w.cols.max(10)) as u16)
+    }
+
+    /// Makes a terminal buffer (`*terminal*`, `*terminal*<2>`...) for a
+    /// backend and shows it in the selected window.
+    pub fn add_terminal(&mut self, backend: TermBackend) -> BufferId {
+        let mut buffer = Buffer::new("*terminal*");
+        buffer.set_read_only(true);
+        let id = self.add_buffer(buffer);
+        self.terminals.push(Terminal { buffer: id, backend, exited: false });
+        self.show_buffer(id);
+        id
+    }
+
+    /// Shows a terminal's screen in its buffer. `follow` puts the point on
+    /// the terminal's cursor (while typing into it).
+    pub fn show_screen(&mut self, buffer: BufferId, screen: &crate::terminal::Screen, follow: bool) {
+        let Some((_, b)) = self.buffers.iter_mut().find(|(id, _)| *id == buffer) else { return };
+        b.set_text(&screen.lines.join("\n"));
+        let rope = b.text().clone();
+        for (line, start, end, face) in &screen.colors {
+            if *line < rope.len_lines() {
+                let base = rope.line_to_char(*line);
+                b.add_face(base + start, base + end, face.clone());
+            }
+        }
+        if follow {
+            let line = screen.cursor.0.min(rope.len_lines().saturating_sub(1));
+            b.goto_char(rope.line_to_char(line) + screen.cursor.1.min(b.line_end(rope.line_to_char(line)) - rope.line_to_char(line)));
+        }
+    }
+
+    /// Reads local terminals, resizing each to its window. Returns whether
+    /// any screen changed. `follow` is the buffer being typed into, if any.
+    pub fn pump_local_terminals(&mut self, follow: Option<BufferId>) -> bool {
+        let mut screens = Vec::new();
+        let sizes: Vec<(u16, u16)> = self.terminals.iter().map(|t| self.size_for(t.buffer)).collect();
+        for (t, (rows, cols)) in self.terminals.iter_mut().zip(sizes) {
+            if let TermBackend::Local(pty) = &mut t.backend {
+                pty.resize(rows, cols);
+                if let Some(screen) = pty.screen() {
+                    screens.push((t.buffer, screen));
+                }
+                if !t.exited && !pty.alive() {
+                    t.exited = true;
+                }
+            }
+        }
+        let changed = !screens.is_empty();
+        for (buffer, screen) in screens {
+            self.show_screen(buffer, &screen, follow == Some(buffer));
+        }
+        changed
     }
 
     // ---- Search

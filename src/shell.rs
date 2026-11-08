@@ -20,6 +20,8 @@ const FONT_SIZE: f32 = 14.;
 const RELOAD_POLL: Duration = Duration::from_millis(400);
 /// How often language servers are synced and read.
 const LSP_POLL: Duration = Duration::from_millis(100);
+/// How often terminals' screens are read.
+const TERMINAL_POLL: Duration = Duration::from_millis(30);
 /// How wide the sidebar (the file tree) is.
 const SIDEBAR_WIDTH: f32 = 260.;
 /// A monospace character's width, as a share of the font size (Menlo, SF Mono).
@@ -44,6 +46,7 @@ impl Shell {
         focus.focus(window, cx);
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
+        Self::drive_terminals(cx);
         Self { editor, lisp, focus, syntax: Syntax::default() }
     }
 
@@ -54,6 +57,25 @@ impl Shell {
                 cx.background_executor().timer(RELOAD_POLL).await;
                 let alive = this.update(cx, |shell, cx| {
                     if shell.lisp.reload_if_changed() {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Reads terminals' screens into their buffers, often enough that typing
+    /// into one feels immediate.
+    fn drive_terminals(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TERMINAL_POLL).await;
+                let alive = this.update(cx, |shell, cx| {
+                    if !shell.editor.lock().terminals.is_empty() && shell.lisp.pump_terminals() {
                         cx.notify();
                     }
                 });
@@ -167,6 +189,13 @@ pub fn key_name(ks: &Keystroke) -> Option<(String, String)> {
 
 fn face_color(face: &str, cx: &App) -> Hsla {
     let t = cx.theme();
+    // "#rrggbb": an exact color (terminals' 256 and true colors).
+    if let Some(hex) = face.strip_prefix('#')
+        && let Ok(n) = u32::from_str_radix(hex, 16)
+        && hex.len() == 6
+    {
+        return gpui_kit::rgb(n).into();
+    }
     match face {
         "muted" => t.muted,
         "strong" => t.foreground,
@@ -694,6 +723,12 @@ impl Render for Shell {
             if let Some(w) = st.window_by_id_mut(id) {
                 w.scroll_top = top;
                 w.rows = rows.max(1);
+            }
+        }
+        // Columns of monospace text each window fits (terminals size to it).
+        for (id, r) in &rects {
+            if let Some(w) = st.window_by_id_mut(*id) {
+                w.cols = ((r.w * width - 16.) / (FONT_SIZE * CHAR_WIDTH)).max(10.) as usize;
             }
         }
         syntax.retain(|id| st.buffer_by_id(id).is_some());
