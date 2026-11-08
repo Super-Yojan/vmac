@@ -455,7 +455,9 @@ its folder in a git repository.
 ## Images and PDFs
 
 Opening an image (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.ico`)
-shows it, as large as the window allows and never larger than it is. A PDF
+shows it, as large as the window allows and never larger than it is. It
+zooms like a PDF's pages (below), and zoomed larger than the window, it
+scrolls with the same keys (`h`/`j`/`k`/`l`, `C-d`/`C-u`, `gg`/`G`). A PDF
 shows its pages one under the other, to scroll through with the trackpad,
 the wheel or keys: `j`/`k` a little, `C-d`/`C-u` half a window, `C-f`/`C-b` a
 window, `J`/`K` a page, `gg`/`G` the first and last page (`5G` page 5).

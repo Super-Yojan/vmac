@@ -100,11 +100,10 @@ impl Session {
             Input::Wheel { window, lines, line, col, mods } => {
                 let mut st = self.editor.lock();
                 let Some(buffer) = st.window_by_id(window).map(|w| w.buffer) else { return };
-                // Ctrl and the wheel over a PDF zoom it: up (away) in, down out.
-                let pdf = st.buffer_by_id(buffer).and_then(|b| b.file()).and_then(|f| crate::frame::media_kind(f))
-                    == Some(crate::frame::MediaKind::Pdf);
-                if pdf && mods.control {
-                    st.zoom_pdf(buffer, PDF_WHEEL_ZOOM.powi(-lines as i32));
+                // Ctrl and the wheel over an image or PDF zoom it: up (away) in, down out.
+                let media = st.buffer_by_id(buffer).and_then(|b| b.file()).and_then(|f| crate::frame::media_kind(f));
+                if media.is_some() && mods.control {
+                    st.zoom_media(buffer, WHEEL_ZOOM.powi(-lines as i32));
                     return;
                 }
                 // A terminal program that asked for the mouse gets the wheel.
@@ -408,8 +407,8 @@ impl Session {
                 let content = if let Some(review) = review.as_ref().filter(|_| Some(w.buffer) == review_id) {
                     Content::Review(review.clone())
                 } else if let Some((path, kind)) = media {
-                    Content::Media { path, kind, themed: st.pdf_themed, scroll: st.pdf_scroll.get(&w.buffer).cloned().unwrap_or_default(),
-                        zoom: st.pdf_zoom.get(&w.buffer).copied().unwrap_or(1.),
+                    Content::Media { path, kind, themed: st.pdf_themed, scroll: st.media_scroll.get(&w.buffer).cloned().unwrap_or_default(),
+                        zoom: st.media_zoom.get(&w.buffer).copied().unwrap_or(1.),
                     }
                 } else if rendered.contains(id) {
                     Content::Markdown {
@@ -628,8 +627,8 @@ impl Session {
     }
 }
 
-/// How much each line of Ctrl and the wheel zooms a PDF.
-const PDF_WHEEL_ZOOM: f32 = 1.05;
+/// How much each line of Ctrl and the wheel zooms an image or PDF.
+const WHEEL_ZOOM: f32 = 1.05;
 
 fn is_terminal(st: &crate::editor::EditorState, buffer: BufferId) -> bool {
     st.terminals.iter().any(|t| t.buffer == buffer)
@@ -805,6 +804,22 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_and_the_wheel_zoom_an_image() {
+        let mut s = session_with("");
+        let path = std::env::temp_dir().join(format!("vmac-wheel-{}.png", std::process::id()));
+        std::fs::write(&path, b"\x89PNG").unwrap();
+        s.editor.lock().open_file(&path).unwrap();
+        let window = s.frame(VIEW).windows[0].id;
+        let mods = Mods { control: true, ..Default::default() };
+        s.handle(Input::Wheel { window, lines: -1, line: 0, col: 0, mods });
+        match &s.frame(VIEW).windows[0].content {
+            Content::Media { zoom, .. } => assert!((zoom - WHEEL_ZOOM).abs() < 1e-4),
+            other => panic!("not media: {other:?}"),
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn ctrl_and_the_wheel_zoom_a_pdf() {
         let mut s = session_with("");
         let path = std::env::temp_dir().join(format!("vmac-wheel-{}.pdf", std::process::id()));
@@ -820,9 +835,9 @@ mod tests {
             s.handle(Input::Wheel { window, lines, line: 0, col: 0, mods });
         };
         wheel(&mut s, -2, true);
-        assert!((zoom(&mut s) - PDF_WHEEL_ZOOM.powi(2)).abs() < 1e-4, "up zooms in: {}", zoom(&mut s));
+        assert!((zoom(&mut s) - WHEEL_ZOOM.powi(2)).abs() < 1e-4, "up zooms in: {}", zoom(&mut s));
         wheel(&mut s, 4, true);
-        assert!((zoom(&mut s) - PDF_WHEEL_ZOOM.powi(-2)).abs() < 1e-4, "down zooms out: {}", zoom(&mut s));
+        assert!((zoom(&mut s) - WHEEL_ZOOM.powi(-2)).abs() < 1e-4, "down zooms out: {}", zoom(&mut s));
         let before = zoom(&mut s);
         wheel(&mut s, 3, false);
         assert_eq!(zoom(&mut s), before, "without Ctrl the wheel doesn't zoom");

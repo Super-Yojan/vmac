@@ -335,9 +335,9 @@ pub struct EditorState {
     /// PDF pages drawn in the theme's colors rather than black on white.
     pub pdf_themed: bool,
     /// Each PDF buffer's latest scrolls asked for by keys, numbered.
-    pub pdf_scroll: std::collections::HashMap<BufferId, Vec<(u64, crate::frame::PdfScroll)>>,
-    /// Each PDF buffer's zoom (1 fits its pages to the window).
-    pub pdf_zoom: std::collections::HashMap<BufferId, f32>,
+    pub media_scroll: std::collections::HashMap<BufferId, Vec<(u64, crate::frame::MediaScroll)>>,
+    /// Each image or PDF buffer's zoom (1 fits it to the window).
+    pub media_zoom: std::collections::HashMap<BufferId, f32>,
     pub preview_last: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The coding agent (ACP), how to start it, its buffer, and the
@@ -554,8 +554,8 @@ impl EditorState {
             line_numbers: "off".into(),
             markdown_preview: false,
             pdf_themed: true,
-            pdf_scroll: Default::default(),
-            pdf_zoom: Default::default(),
+            media_scroll: Default::default(),
+            media_zoom: Default::default(),
             preview_last: None,
             terminals_to_kill: Vec::new(),
             agent: None,
@@ -996,12 +996,12 @@ impl EditorState {
 
     /// Scrolls any window by `n` lines (the mouse wheel), moving its point
     /// onto the screen when it scrolls off, as `C-e` and `C-y` do.
-    /// Zooms a PDF buffer by `by` times (from a quarter to eight times its
+    /// Zooms an image or PDF buffer by `by` times (from a quarter to eight times its
     /// fitted size), or back to fitting the window with 0.
-    pub fn zoom_pdf(&mut self, buffer: BufferId, by: f32) {
-        let now = self.pdf_zoom.get(&buffer).copied().unwrap_or(1.);
+    pub fn zoom_media(&mut self, buffer: BufferId, by: f32) {
+        let now = self.media_zoom.get(&buffer).copied().unwrap_or(1.);
         let zoom = if by <= 0. { 1. } else { (now * by).clamp(0.25, 8.) };
-        self.pdf_zoom.insert(buffer, zoom);
+        self.media_zoom.insert(buffer, zoom);
         self.message = format!("Zoom {:.0}%", zoom * 100.);
     }
 

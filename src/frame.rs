@@ -159,16 +159,16 @@ pub enum Content {
         /// The latest scrolls asked for by keys, numbered so the window
         /// does each once (several may come between two frames).
         #[serde(default)]
-        scroll: Vec<(u64, PdfScroll)>,
-        /// A PDF's zoom: 1 fits its pages to the window.
+        scroll: Vec<(u64, MediaScroll)>,
+        /// The zoom: 1 fits the image, or the PDF's pages, to the window.
         #[serde(default = "default_scale")]
         zoom: f32,
     },
 }
 
-/// A move through a PDF, asked for by keys (j, C-d, G...).
+/// A move through an image or PDF, asked for by keys (j, C-d, G...).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-pub enum PdfScroll {
+pub enum MediaScroll {
     /// Steps of a couple of rows (negative: up).
     Lines(i32),
     /// Window heights.

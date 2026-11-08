@@ -1265,33 +1265,31 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // PDFs in the theme's colors (the default), or black on white.
     prim!(reg, editor, "set-pdf-themed", |s, on: bool| s.pdf_themed = on);
     prim!(reg, editor, "pdf-themed", |s| s.pdf_themed);
-    // Keys in a PDF: whether this is one, and moving through it
-    // ("lines", "screens", "pages", "page" (from 1), or "end").
-    // Zoom: times `by`, or back to fitting the window with 0.
-    prim!(reg, editor, "pdf-zoom", |s, by: f64| {
+    // Keys in an image or PDF: zoom (times `by`, or back to fitting the
+    // window with 0), whether this is one, and moving through it ("lines",
+    // "screens", "sideways", "pages", "page" (from 1), or "end").
+    prim!(reg, editor, "media-zoom", |s, by: f64| {
         let id = s.window().buffer;
-        s.zoom_pdf(id, by as f32);
+        s.zoom_media(id, by as f32);
     });
-    prim!(reg, editor, "pdf-zoom-level", |s| s.pdf_zoom.get(&s.window().buffer).copied().unwrap_or(1.) as f64);
-    prim!(reg, editor, "pdf-here?", |s| {
-        s.buffer().file().and_then(|f| crate::frame::media_kind(f)) == Some(crate::frame::MediaKind::Pdf)
-    });
-    prim!(reg, editor, "pdf-scroll", |s, how: String, n: f64| {
-        use crate::frame::PdfScroll;
+    prim!(reg, editor, "media-zoom-level", |s| s.media_zoom.get(&s.window().buffer).copied().unwrap_or(1.) as f64);
+    prim!(reg, editor, "media-here?", |s| s.buffer().file().and_then(|f| crate::frame::media_kind(f)).is_some());
+    prim!(reg, editor, "media-scroll", |s, how: String, n: f64| {
+        use crate::frame::MediaScroll;
         let scroll = match how.as_str() {
-            "lines" => PdfScroll::Lines(n as i32),
-            "screens" => PdfScroll::Screens(n as f32),
-            "sideways" => PdfScroll::Sideways(n as i32),
-            "pages" => PdfScroll::Pages(n as i32),
-            "page" => PdfScroll::Page((n as usize).saturating_sub(1)),
-            "end" => PdfScroll::End,
+            "lines" => MediaScroll::Lines(n as i32),
+            "screens" => MediaScroll::Screens(n as f32),
+            "sideways" => MediaScroll::Sideways(n as i32),
+            "pages" => MediaScroll::Pages(n as i32),
+            "page" => MediaScroll::Page((n as usize).saturating_sub(1)),
+            "end" => MediaScroll::End,
             _ => {
-                s.message = format!("{how}: PDFs scroll by lines, screens, sideways, pages, to a page or the end");
+                s.message = format!("{how}: images and PDFs scroll by lines, screens, sideways, pages, to a page or the end");
                 return;
             }
         };
         let id = s.window().buffer;
-        let queue = s.pdf_scroll.entry(id).or_default();
+        let queue = s.media_scroll.entry(id).or_default();
         let n = queue.last().map_or(0, |(n, _)| *n) + 1;
         queue.push((n, scroll));
         // Plenty for the keys typed between two frames.
@@ -3615,7 +3613,7 @@ for line in sys.stdin:
 
     #[test]
     fn keys_in_a_pdf_scroll_it() {
-        use crate::frame::PdfScroll::*;
+        use crate::frame::MediaScroll::*;
         let (mut lisp, editor) = lisp_with("one\ntwo\n");
         let path = std::env::temp_dir().join(format!("vmac-keys-{}.pdf", std::process::id()));
         std::fs::write(&path, b"%PDF-1.4").unwrap();
@@ -3625,13 +3623,29 @@ for line in sys.stdin:
         typed(&mut lisp, "JK5Ggg");
         typed(&mut lisp, "G");
         let id = editor.lock().window().buffer;
-        let asked: Vec<_> = editor.lock().pdf_scroll[&id].iter().map(|(_, how)| *how).collect();
+        let asked: Vec<_> = editor.lock().media_scroll[&id].iter().map(|(_, how)| *how).collect();
         assert_eq!(
             asked,
             [Lines(1), Lines(-1), Lines(1), Lines(1), Lines(1), Screens(0.5), Pages(1), Pages(-1), Page(4), Page(0), End]
         );
-        let numbers: Vec<u64> = editor.lock().pdf_scroll[&id].iter().map(|(n, _)| *n).collect();
+        let numbers: Vec<u64> = editor.lock().media_scroll[&id].iter().map(|(n, _)| *n).collect();
         assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "numbered in order: {numbers:?}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn images_take_the_same_keys() {
+        let (mut lisp, editor) = lisp_with("");
+        let path = std::env::temp_dir().join(format!("vmac-image-keys-{}.png", std::process::id()));
+        std::fs::write(&path, b"\x89PNG").unwrap();
+        editor.lock().open_file(&path).unwrap();
+        typed(&mut lisp, "+jl");
+        let st = editor.lock();
+        let id = st.window().buffer;
+        assert_eq!(st.media_zoom[&id], 1.25);
+        let asked: Vec<_> = st.media_scroll[&id].iter().map(|(_, how)| *how).collect();
+        assert_eq!(asked, [crate::frame::MediaScroll::Lines(1), crate::frame::MediaScroll::Sideways(1)]);
+        drop(st);
         std::fs::remove_file(path).ok();
     }
 
@@ -3643,7 +3657,7 @@ for line in sys.stdin:
         editor.lock().open_file(&path).unwrap();
         let zoom = |e: &Editor| {
             let st = e.lock();
-            st.pdf_zoom.get(&st.window().buffer).copied().unwrap_or(1.)
+            st.media_zoom.get(&st.window().buffer).copied().unwrap_or(1.)
         };
         typed(&mut lisp, "++");
         assert!((zoom(&editor) - 1.5625).abs() < 1e-4, "{}", zoom(&editor));
@@ -3657,8 +3671,8 @@ for line in sys.stdin:
         typed(&mut lisp, "=hl");
         assert_eq!(zoom(&editor), 1.);
         let id = editor.lock().window().buffer;
-        let last: Vec<_> = editor.lock().pdf_scroll[&id].iter().map(|(_, how)| *how).collect();
-        assert_eq!(last, [crate::frame::PdfScroll::Sideways(-1), crate::frame::PdfScroll::Sideways(1)]);
+        let last: Vec<_> = editor.lock().media_scroll[&id].iter().map(|(_, how)| *how).collect();
+        assert_eq!(last, [crate::frame::MediaScroll::Sideways(-1), crate::frame::MediaScroll::Sideways(1)]);
         std::fs::remove_file(path).ok();
     }
 

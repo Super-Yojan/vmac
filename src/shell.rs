@@ -40,6 +40,8 @@ pub struct Shell {
     md_views: std::collections::HashMap<crate::frame::BufferId, MdView>,
     /// PDFs shown in windows, by buffer: their pages, drawn as they come into view.
     pdf_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::media::PdfView>>,
+    /// Images shown in windows, by buffer: their zoom and scroll.
+    image_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::media::ImageView>>,
     /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
     /// parsed from, and the cursor line it last selected.
     review_view: Option<ReviewView>,
@@ -166,6 +168,7 @@ impl Shell {
             _appearance: appearance,
             md_views: Default::default(),
             pdf_views: Default::default(),
+            image_views: Default::default(),
             review_view: None,
             hits: Vec::new(),
             modal: false,
@@ -366,6 +369,39 @@ impl Shell {
         self.send(Input::Wheel { window: hit.id, lines: n as isize, line, col, mods }, cx);
     }
 
+    /// What a view calls with Ctrl and the wheel over it: tells the session
+    /// as such, which zooms it.
+    fn zoom_sender(cx: &mut Context<Self>) -> crate::media::OnZoom {
+        let shell = cx.entity().downgrade();
+        std::rc::Rc::new(move |window: WindowId, lines: isize, cx: &mut gpui_kit::App| {
+            let mods = Mods { control: true, ..Default::default() };
+            let input = Input::Wheel { window, lines, line: 0, col: 0, mods };
+            let _ = shell.update(cx, |shell, cx| shell.send(input, cx));
+        })
+    }
+
+    /// The image view of a buffer, made the first time.
+    fn image_view(
+        &mut self,
+        buffer: crate::frame::BufferId,
+        path: &std::path::Path,
+        scroll: &[(u64, crate::frame::MediaScroll)],
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Entity<crate::media::ImageView> {
+        if self.image_views.get(&buffer).is_some_and(|v| v.read(cx).path() != path) {
+            self.image_views.remove(&buffer);
+        }
+        if let Some(view) = self.image_views.get(&buffer) {
+            return view.clone();
+        }
+        // Scrolls asked for before this view existed are done with.
+        let seen = scroll.last().map_or(0, |(n, _)| *n);
+        let on_zoom = Self::zoom_sender(cx);
+        let view = gpui_kit::AppContext::new(cx, |_| crate::media::ImageView::new(path.to_path_buf(), seen, on_zoom));
+        self.image_views.insert(buffer, view.clone());
+        view
+    }
+
     /// The PDF view of a buffer, made the first time and read again when
     /// the file changes.
     fn pdf_view(
@@ -373,7 +409,7 @@ impl Shell {
         buffer: crate::frame::BufferId,
         path: &std::path::Path,
         themed: bool,
-        scroll: &[(u64, crate::frame::PdfScroll)],
+        scroll: &[(u64, crate::frame::MediaScroll)],
         zoom: f32,
         width: f32,
         cx: &mut Context<Self>,
@@ -392,13 +428,7 @@ impl Shell {
             .or_insert_with(|| {
                 // Scrolls asked for before this view existed are done with.
                 let seen = scroll.last().map_or(0, |(n, _)| *n);
-                // Ctrl and the wheel over it: told to the session as such, to zoom.
-                let shell = cx.entity().downgrade();
-                let on_zoom = move |window: WindowId, lines: isize, cx: &mut gpui_kit::App| {
-                    let mods = Mods { control: true, ..Default::default() };
-                    let input = Input::Wheel { window, lines, line: 0, col: 0, mods };
-                    let _ = shell.update(cx, |shell, cx| shell.send(input, cx));
-                };
+                let on_zoom = Self::zoom_sender(cx);
                 gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf(), seen, on_zoom))
             })
             .clone();
@@ -945,6 +975,7 @@ impl Render for Shell {
         let live: std::collections::HashSet<_> = frame.buffers.iter().copied().collect();
         self.md_views.retain(|id, _| live.contains(id));
         self.pdf_views.retain(|id, _| live.contains(id));
+        self.image_views.retain(|id, _| live.contains(id));
 
         let this = cx.entity().downgrade();
         let windows: Vec<_> = frame
@@ -1034,7 +1065,15 @@ impl Render for Shell {
                             )
                             .into_any_element()
                     }
-                    Content::Media { path, kind: MediaKind::Image, .. } => crate::media::image_element(path, cx),
+                    Content::Media { path, kind: MediaKind::Image, scroll, zoom, .. } => {
+                        let view = self.image_view(w.buffer, path, scroll, cx);
+                        view.update(cx, |v, cx| {
+                            v.set_window(w.id);
+                            v.set_size(*zoom, w.width, w.height - ROW_HEIGHT, cx);
+                            v.scroll(scroll);
+                        });
+                        div().flex_1().overflow_hidden().child(view).into_any_element()
+                    }
                     Content::Media { path, kind: MediaKind::Pdf, themed, scroll, zoom } => {
                         let view = self.pdf_view(w.buffer, path, *themed, scroll, *zoom, w.width, cx);
                         view.update(cx, |v, _| v.set_window(w.id));

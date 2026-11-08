@@ -3,7 +3,7 @@
 //! through, each drawn (off the main thread) when it first comes into view.
 
 use gpui_kit::component::ActiveTheme as _;
-use crate::frame::PdfScroll;
+use crate::frame::MediaScroll;
 use gpui_kit::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState, ObjectFit,
     ParentElement as _, Render, RenderImage, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
@@ -88,7 +88,7 @@ pub struct PdfView {
     /// The window it was last shown in, and what to call with Ctrl and the
     /// wheel over it (whole lines of it; negative: up).
     window: WindowId,
-    on_zoom: Rc<dyn Fn(WindowId, isize, &mut App)>,
+    on_zoom: OnZoom,
     /// Ctrl-wheel movement short of a whole line, kept for the next event.
     zoom_wheel: Rc<Cell<f32>>,
 }
@@ -98,7 +98,7 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 impl PdfView {
-    pub fn new(path: PathBuf, scrolled: u64, on_zoom: impl Fn(WindowId, isize, &mut App) + 'static) -> Self {
+    pub fn new(path: PathBuf, scrolled: u64, on_zoom: OnZoom) -> Self {
         let sizes = crate::pdf::page_sizes(&path);
         let count = sizes.as_ref().map_or(0, Vec::len);
         Self {
@@ -117,7 +117,7 @@ impl PdfView {
             pixels_per_point: 2.,
             sideways: ScrollHandle::new(),
             window: 0,
-            on_zoom: Rc::new(on_zoom),
+            on_zoom,
             zoom_wheel: Rc::new(Cell::new(0.)),
         }
     }
@@ -188,7 +188,7 @@ impl PdfView {
     }
 
     /// Does the scrolls asked for since the last one done.
-    pub fn scroll(&mut self, asked: &[(u64, PdfScroll)]) {
+    pub fn scroll(&mut self, asked: &[(u64, MediaScroll)]) {
         let done = self.scrolled;
         for &(n, how) in asked.iter().filter(|(n, _)| *n > done) {
             self.scrolled = n;
@@ -196,23 +196,23 @@ impl PdfView {
             let top = self.list.logical_scroll_top();
             let page = |item_ix: usize| ListOffset { item_ix: item_ix.min(count.saturating_sub(1)), offset_in_item: px(0.) };
             match how {
-                PdfScroll::Lines(lines) => self.list.scroll_by(px(lines as f32 * LINE_STEP)),
-                PdfScroll::Screens(screens) => {
+                MediaScroll::Lines(lines) => self.list.scroll_by(px(lines as f32 * LINE_STEP)),
+                MediaScroll::Screens(screens) => {
                     let height: f32 = self.list.viewport_bounds().size.height.into();
                     self.list.scroll_by(px(screens * height.max(LINE_STEP)));
                 }
-                PdfScroll::Sideways(steps) => {
+                MediaScroll::Sideways(steps) => {
                     let room = (self.content_width() - self.width).max(0.);
                     let x = (-f32::from(self.sideways.offset().x) + steps as f32 * LINE_STEP).clamp(0., room);
                     self.sideways.set_offset(point(px(-x), px(0.)));
                 }
                 // Back from partway down a page: that page's top first.
-                PdfScroll::Pages(n) if n < 0 && top.offset_in_item > px(1.) => {
+                MediaScroll::Pages(n) if n < 0 && top.offset_in_item > px(1.) => {
                     self.list.scroll_to(page((top.item_ix + 1).saturating_sub(n.unsigned_abs() as usize)))
                 }
-                PdfScroll::Pages(n) => self.list.scroll_to(page(top.item_ix.saturating_add_signed(n as isize))),
-                PdfScroll::Page(ix) => self.list.scroll_to(page(ix)),
-                PdfScroll::End => self.list.scroll_to_end(),
+                MediaScroll::Pages(n) => self.list.scroll_to(page(top.item_ix.saturating_add_signed(n as isize))),
+                MediaScroll::Page(ix) => self.list.scroll_to(page(ix)),
+                MediaScroll::End => self.list.scroll_to_end(),
             }
         }
     }
@@ -320,31 +320,170 @@ impl PdfView {
 }
 
 impl PdfView {
-    /// Catches Ctrl and the wheel over the view before the pages see it (they
-    /// would scroll), and hands it on as whole lines to zoom by.
     fn zoom_catcher(&self) -> impl IntoElement {
-        let (window_id, on_zoom, pending) = (self.window, self.on_zoom.clone(), self.zoom_wheel.clone());
-        canvas(
-            |_, _, _| {},
-            move |bounds, _, window, _| {
-                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
-                    if phase != DispatchPhase::Capture || !event.modifiers.control || !bounds.contains(&event.position) {
-                        return;
-                    }
-                    cx.stop_propagation();
-                    let dy: f32 = event.delta.pixel_delta(px(ROW_HEIGHT)).y.into();
-                    // Up (content down) is negative lines, as the session counts them.
-                    let lines = pending.get() - dy / ROW_HEIGHT;
-                    let whole = lines.trunc();
-                    pending.set(lines - whole);
-                    if whole != 0. {
-                        on_zoom(window_id, whole as isize, cx);
-                    }
-                });
-            },
-        )
-        .absolute()
-        .size_full()
+        zoom_catcher(self.window, self.on_zoom.clone(), self.zoom_wheel.clone())
+    }
+}
+
+/// Catches Ctrl and the wheel over a view before what's in it sees it (it
+/// would scroll), and hands it on as whole lines to zoom by.
+fn zoom_catcher(
+    window_id: WindowId,
+    on_zoom: Rc<dyn Fn(WindowId, isize, &mut App)>,
+    pending: Rc<Cell<f32>>,
+) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                if phase != DispatchPhase::Capture || !event.modifiers.control || !bounds.contains(&event.position) {
+                    return;
+                }
+                cx.stop_propagation();
+                let dy: f32 = event.delta.pixel_delta(px(ROW_HEIGHT)).y.into();
+                // Up (content down) is negative lines, as the session counts them.
+                let lines = pending.get() - dy / ROW_HEIGHT;
+                let whole = lines.trunc();
+                pending.set(lines - whole);
+                if whole != 0. {
+                    on_zoom(window_id, whole as isize, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// What a view calls with Ctrl and the wheel over it: the window, and whole
+/// lines of wheel (negative: up).
+pub type OnZoom = Rc<dyn Fn(WindowId, isize, &mut App)>;
+
+/// An image, fitted to the window (never larger than it is) times its zoom;
+/// larger than the window, it scrolls both ways.
+pub struct ImageView {
+    path: PathBuf,
+    /// Its size in pixels (drawn a point each at zoom 1), or None when it
+    /// can't be read: then it's only fitted, as GPUI manages.
+    size: Option<(f32, f32)>,
+    zoom: f32,
+    /// The window's width and the height under its modeline.
+    width: f32,
+    height: f32,
+    scroll: ScrollHandle,
+    scrolled: u64,
+    window: WindowId,
+    on_zoom: OnZoom,
+    zoom_wheel: Rc<Cell<f32>>,
+}
+
+impl ImageView {
+    pub fn new(path: PathBuf, scrolled: u64, on_zoom: OnZoom) -> Self {
+        let size = image::image_dimensions(&path).ok().map(|(w, h)| (w as f32, h as f32));
+        Self {
+            path,
+            size,
+            zoom: 1.,
+            width: 800.,
+            height: 600.,
+            scroll: ScrollHandle::new(),
+            scrolled,
+            window: 0,
+            on_zoom,
+            zoom_wheel: Rc::new(Cell::new(0.)),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn set_window(&mut self, window: WindowId) {
+        self.window = window;
+    }
+
+    /// How large it's shown, in points.
+    fn shown(&self) -> (f32, f32) {
+        let Some((w, h)) = self.size else { return (self.width, self.height) };
+        let room = |r: f32| (r - 2. * PAGE_MARGIN).max(16.);
+        let fit = 1f32.min(room(self.width) / w.max(1.)).min(room(self.height) / h.max(1.));
+        (w * fit * self.zoom, h * fit * self.zoom)
+    }
+
+    /// The area it scrolls over: the image and its margin, or the window.
+    fn content(&self) -> (f32, f32) {
+        let (w, h) = self.shown();
+        ((w + 2. * PAGE_MARGIN).max(self.width), (h + 2. * PAGE_MARGIN).max(self.height))
+    }
+
+    fn offset(&self) -> (f32, f32) {
+        let o = self.scroll.offset();
+        (-f32::from(o.x), -f32::from(o.y))
+    }
+
+    fn set_offset(&self, x: f32, y: f32) {
+        let (cw, ch) = self.content();
+        let x = x.clamp(0., (cw - self.width).max(0.));
+        let y = y.clamp(0., (ch - self.height).max(0.));
+        self.scroll.set_offset(point(px(-x), px(-y)));
+    }
+
+    /// Takes a new zoom or window size, keeping the middle of what's in view.
+    pub fn set_size(&mut self, zoom: f32, width: f32, height: f32, cx: &mut Context<Self>) {
+        if (zoom, width, height) == (self.zoom, self.width, self.height) {
+            return;
+        }
+        let (x, y) = self.offset();
+        let (cw, ch) = self.content();
+        let middle = ((x + self.width / 2.) / cw.max(1.), (y + self.height / 2.) / ch.max(1.));
+        (self.zoom, self.width, self.height) = (zoom, width, height);
+        let (cw, ch) = self.content();
+        self.set_offset(middle.0 * cw - width / 2., middle.1 * ch - height / 2.);
+        cx.notify();
+    }
+
+    /// Does the scrolls asked for since the last one done.
+    pub fn scroll(&mut self, asked: &[(u64, MediaScroll)]) {
+        let done = self.scrolled;
+        for &(n, how) in asked.iter().filter(|(n, _)| *n > done) {
+            self.scrolled = n;
+            let (x, y) = self.offset();
+            match how {
+                MediaScroll::Lines(n) => self.set_offset(x, y + n as f32 * LINE_STEP),
+                MediaScroll::Screens(n) => self.set_offset(x, y + n * self.height),
+                MediaScroll::Pages(n) => self.set_offset(x, y + n as f32 * self.height),
+                MediaScroll::Sideways(n) => self.set_offset(x + n as f32 * LINE_STEP, y),
+                MediaScroll::Page(0) => self.set_offset(x, 0.),
+                MediaScroll::Page(_) | MediaScroll::End => self.set_offset(x, f32::MAX),
+            }
+        }
+    }
+}
+
+impl Render for ImageView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.size.is_none() {
+            return image_element(&self.path, cx);
+        }
+        let ((w, h), (cw, ch)) = (self.shown(), self.content());
+        let muted = cx.theme().muted_foreground;
+        let shown = self.path.display().to_string();
+        div()
+            .flex_1()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .child(zoom_catcher(self.window, self.on_zoom.clone(), self.zoom_wheel.clone()))
+            .child(
+                div().id("image-scroll").size_full().overflow_scroll().track_scroll(&self.scroll).child(
+                    div().w(px(cw)).h(px(ch)).flex().items_center().justify_center().child(
+                        img(self.path.clone()).flex_none().w(px(w)).h(px(h)).with_fallback(move || {
+                            div().text_color(muted).child(format!("can't show {shown}")).into_any_element()
+                        }),
+                    ),
+                ),
+            )
+            .into_any_element()
     }
 }
 
@@ -380,8 +519,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn images_fit_never_grow_and_zoom_from_there() {
+        let path = std::env::temp_dir().join(format!("vmac-image-{}.png", std::process::id()));
+        image::RgbaImage::new(400, 200).save(&path).unwrap();
+        let mut view = ImageView::new(path.clone(), 0, Rc::new(|_, _, _| {}));
+        assert_eq!(view.size, Some((400., 200.)), "its size, read from the file");
+        (view.width, view.height) = (2000., 1000.);
+        assert_eq!(view.shown(), (400., 200.), "never larger than it is");
+        assert_eq!(view.content(), (2000., 1000.));
+        view.width = 232.;
+        assert_eq!(view.shown(), (200., 100.), "fitted to a narrow window");
+        view.zoom = 3.;
+        assert_eq!(view.shown(), (600., 300.));
+        assert_eq!(view.content(), (600. + 2. * PAGE_MARGIN, 1000.), "wider than the window: scrolls sideways");
+        std::fs::remove_file(path).ok();
+        assert_eq!(ImageView::new(PathBuf::from("/nonexistent.png"), 0, Rc::new(|_, _, _| {})).size, None);
+    }
+
+    #[test]
     fn pages_fit_the_window_then_grow_with_the_zoom() {
-        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0, |_, _, _| {});
+        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0, Rc::new(|_, _, _| {}));
         view.sizes = Ok(vec![(612., 792.), (1200., 800.)]);
         view.width = 2000.;
         assert_eq!(view.page_width(0), 612., "its own width when there's room");
