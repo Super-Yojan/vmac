@@ -772,8 +772,8 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
                 .map(|f| crate::picker::project_root(f))
                 .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from("/"));
-            let w = st.window();
-            (backend, cwd, w.rows.max(2) as u16, w.cols.max(20) as u16)
+            let (rows, cols) = st.selected_size();
+            (backend, cwd, rows, cols)
         };
         if backend == "local" {
             return match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
@@ -787,12 +787,35 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
                 }
             };
         }
+        // start returns a handle (then send/read are polled), or
+        // { handle = ..., command = ... }: a command that attaches to the
+        // terminal, run here on a PTY (keys, screen and size go through it).
         let started = {
             let lua = l.lock().unwrap_or_else(|e| e.into_inner());
-            call_backend::<String>(&lua, &backend, "start", (command, cwd.display().to_string(), rows, cols))
+            call_backend::<mlua::Value>(&lua, &backend, "start", (command, cwd.display().to_string(), rows, cols))
+                .map(|r| {
+                    r.and_then(|v| match v {
+                        mlua::Value::Table(t) => Ok((t.get::<String>("handle")?, t.get::<Option<String>>("command")?)),
+                        mlua::Value::String(s) => Ok((s.to_string_lossy().to_string(), None)),
+                        mlua::Value::Nil => Ok((String::new(), None)),
+                        other => Err(mlua::Error::runtime(format!("start returned a {}", other.type_name()))),
+                    })
+                })
         };
         match started {
-            Some(Ok(handle)) if !handle.is_empty() => {
+            Some(Ok((handle, Some(attach)))) if !handle.is_empty() => {
+                match crate::terminal::LocalPty::start(&attach, &cwd, rows, cols) {
+                    Ok(pty) => {
+                        ed.lock().add_terminal(crate::editor::TermBackend::Attached { backend, handle, pty });
+                        true
+                    }
+                    Err(e) => {
+                        ed.lock().message = format!("{backend}: {attach}: {e}");
+                        false
+                    }
+                }
+            }
+            Some(Ok((handle, None))) if !handle.is_empty() => {
                 ed.lock().add_terminal(crate::editor::TermBackend::Plugin { backend, handle });
                 true
             }
@@ -816,7 +839,7 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
             let mut st = ed.lock();
             match st.terminal_here() {
                 Some(t) if !t.exited => match &mut t.backend {
-                    crate::editor::TermBackend::Local(pty) => {
+                    crate::editor::TermBackend::Local(pty) | crate::editor::TermBackend::Attached { pty, .. } => {
                         pty.send(&crate::terminal::key_bytes(&key, &text));
                         None
                     }
@@ -902,11 +925,14 @@ end
 
 -- Terminal backends: where a terminal's program runs, beside the built-in
 -- "local" PTY. A backend is a table of functions:
---   start(command, cwd, rows, cols) -> handle   (command "" means a shell)
+--   start(command, cwd, rows, cols)   (command "" means a shell) returns
+--     a handle, then gmacs polls send and read; or
+--     { handle = h, command = "tool attach h" }: gmacs runs that command on
+--     a local PTY, which carries keys, screen and size (tmux, ssh, hc...)
 --   send(handle, text, key)   text it types, or a key name (enter, ctrl+c, up)
 --   read(handle) -> the screen as text
 --   alive(handle) -> bool     (optional)
---   kill(handle)              (optional)
+--   kill(handle)              (optional; also called for attached terminals)
 gmacs.terminal_backends = {}
 function gmacs.terminal_backend(name, backend)
   gmacs.terminal_backends[name] = backend
@@ -3252,6 +3278,50 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
         lisp.pump_terminals();
         assert_eq!(lisp.eval_lua("killed[1]").unwrap(), "h1", "closing its buffer ends it");
+    }
+
+    #[test]
+    fn a_backend_can_attach_through_a_local_pty() {
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval_lua(r#"
+            killed = {}
+            gmacs.terminal_backend("attaching", {
+              -- A stand-in for `hc attach t7`: the "attach" command is a shell.
+              start = function(command, cwd, rows, cols) return { handle = "t7", command = "sh" } end,
+              kill = function(h) killed[#killed + 1] = h end,
+            })
+            gmacs.set_terminal_backend("attaching")
+        "#)
+        .unwrap();
+        typed(&mut lisp, ":term\n");
+        assert!(lisp.modeline().iter().any(|s| s.text == "terminal (attaching)"), "{}", editor.lock().message.clone());
+        typed(&mut lisp, "echo attached-$((40 + 2))\n");
+        assert!(
+            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("attached-42")),
+            "keys and screen go through the PTY: {}",
+            editor.lock().buffer().text()
+        );
+        {
+            // The PTY takes the window's size.
+            let mut st = editor.lock();
+            let id = st.selected_window();
+            st.window_by_id_mut(id).unwrap().cols = 50;
+        }
+        // Apply the size before typing (resizing mid-output re-wraps lines,
+        // as in any terminal).
+        lisp.pump_terminals();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        typed(&mut lisp, "tput cols\n");
+        assert!(
+            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().lines().any(|l| l.trim() == "50")),
+            "{:?}",
+            editor.lock().buffer().text().to_string()
+        );
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, ":bd\n");
+        lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
+        lisp.pump_terminals();
+        assert_eq!(lisp.eval_lua("killed[1]").unwrap(), "t7", "closing it asks the backend to end it");
     }
 
     #[test]

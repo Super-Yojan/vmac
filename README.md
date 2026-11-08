@@ -121,27 +121,33 @@ running one is reused), `SPC o T` one in this window, `:term CMD` runs a
 command. It's a buffer: in insert state every key goes to the program
 (`ESC` returns to normal state, `C-\` sends the program an `ESC`); in normal
 state its screen is text, so motions, search and yank work, and `p` pastes
-into the program. Colors carry over (256 and true color too).
+into the program. Local terminals run on Ghostty's terminal engine
+([qwertty-term-vt](https://github.com/joshka/qwertty-term)): colors (256 and
+true color), 2,000 lines of scrollback in the buffer (`gg`, `/` reach back
+through it), text re-wrapped on resize, and answers to programs' queries.
 
 Where the program runs is a **backend**. The built-in one is `local` (a
 PTY). Plugins add others in Lua:
 
 ```lua
 gmacs.terminal_backend("name", {
-  start = function(command, cwd, rows, cols) return handle end,  -- "" = a shell
+  -- "" = a shell. Return a handle (then send/read are polled), or attach:
+  -- { handle = h, command = "tool attach h" } runs that command on a local
+  -- PTY, which carries keys, screen and size (tmux, ssh, docker exec, hc...).
+  start = function(command, cwd, rows, cols) return handle end,
   send  = function(handle, text, key) end,   -- text typed, or a key: enter, ctrl+c, up
   read  = function(handle) return screen_text end,
   alive = function(handle) return true end,  -- optional
-  kill  = function(handle) end,              -- optional
+  kill  = function(handle) end,              -- optional (attached ones too)
 })
 ```
 
 `:terminal-backend NAME` (or `gmacs.set_terminal_backend`) picks the
 default. `examples/plugins/herdr-terminal` runs terminals in herdr-core
-through `hc`, so they outlive gmacs; `hc keys` can't type every character,
-so it sends what you type a line at a time (RET), which suits shells and
-agents. `gmacs.exec(cmd, args)` runs a program and returns its output, for
-backends built on a command line tool.
+(`hc run`) and attaches with herdr's own client (`hc attach`), so they
+outlive gmacs while keys, size and colors work as in a local terminal.
+`gmacs.exec(cmd, args)` runs a program and returns its output, for backends
+built on a command line tool.
 
 ## Plugins
 

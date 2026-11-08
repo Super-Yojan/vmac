@@ -31,11 +31,14 @@ pub fn compile_search(pattern: &str) -> Option<Regex> {
 pub type BufferId = u64;
 pub type WindowId = u64;
 
-/// Where a terminal's program runs: a local PTY, or a plugin's backend
-/// (driven from Lua by the Lisp side) with its handle for the terminal.
+/// Where a terminal's program runs: a local PTY; a plugin's backend
+/// polled through Lua (send/read) with its handle; or a plugin's terminal
+/// shown through a local PTY running its attach command (`hc attach t7`),
+/// which carries keys, screen and size itself.
 pub enum TermBackend {
     Local(crate::terminal::LocalPty),
     Plugin { backend: String, handle: String },
+    Attached { backend: String, handle: String, pty: crate::terminal::LocalPty },
 }
 
 impl std::fmt::Debug for TermBackend {
@@ -43,6 +46,7 @@ impl std::fmt::Debug for TermBackend {
         match self {
             TermBackend::Local(_) => write!(f, "local"),
             TermBackend::Plugin { backend, handle } => write!(f, "{backend}:{handle}"),
+            TermBackend::Attached { backend, handle, .. } => write!(f, "{backend}:{handle} (attached)"),
         }
     }
 }
@@ -59,7 +63,7 @@ impl Terminal {
     pub fn backend_name(&self) -> String {
         match &self.backend {
             TermBackend::Local(_) => "local".into(),
-            TermBackend::Plugin { backend, .. } => backend.clone(),
+            TermBackend::Plugin { backend, .. } | TermBackend::Attached { backend, .. } => backend.clone(),
         }
     }
 }
@@ -105,6 +109,14 @@ impl Completion {
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         self.shown = scored.into_iter().map(|(_, i)| i).collect();
     }
+}
+
+/// A window's text size (rows, columns) for a terminal: 24x80 before it is
+/// laid out, and never under 2x10.
+fn window_size(w: &Window) -> (u16, u16) {
+    let rows = if w.rows == 0 { 24 } else { w.rows.max(2) };
+    let cols = if w.cols == 0 { 80 } else { w.cols.max(10) };
+    (rows as u16, cols as u16)
 }
 
 fn plural(n: usize) -> &'static str {
@@ -426,6 +438,10 @@ impl EditorState {
             match self.terminals.remove(i).backend {
                 TermBackend::Local(mut pty) => pty.kill(),
                 TermBackend::Plugin { backend, handle } => self.terminals_to_kill.push((backend, handle)),
+                TermBackend::Attached { backend, handle, mut pty } => {
+                    pty.kill();
+                    self.terminals_to_kill.push((backend, handle));
+                }
             }
         }
         if self.buffers.is_empty() {
@@ -1074,10 +1090,16 @@ impl EditorState {
         self.terminal_for(id)
     }
 
-    /// The size of the window showing a buffer (rows, columns), at least 2x10.
+    /// The size of the window showing a buffer (rows, columns); 24x80
+    /// until the view has laid it out.
     pub fn size_for(&self, buffer: BufferId) -> (u16, u16) {
         let w = self.windows.iter().find(|w| w.buffer == buffer).unwrap_or_else(|| self.window());
-        ((w.rows.max(2)) as u16, (w.cols.max(10)) as u16)
+        window_size(w)
+    }
+
+    /// The selected window's size, for a terminal about to open in it.
+    pub fn selected_size(&self) -> (u16, u16) {
+        window_size(self.window())
     }
 
     /// Makes a terminal buffer (`*terminal*`, `*terminal*<2>`...) for a
@@ -1115,7 +1137,7 @@ impl EditorState {
         let mut screens = Vec::new();
         let sizes: Vec<(u16, u16)> = self.terminals.iter().map(|t| self.size_for(t.buffer)).collect();
         for (t, (rows, cols)) in self.terminals.iter_mut().zip(sizes) {
-            if let TermBackend::Local(pty) = &mut t.backend {
+            if let TermBackend::Local(pty) | TermBackend::Attached { pty, .. } = &mut t.backend {
                 pty.resize(rows, cols);
                 if let Some(screen) = pty.screen() {
                     screens.push((t.buffer, screen));
