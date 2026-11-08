@@ -345,6 +345,11 @@ pub struct EditorState {
     agent_lines: Vec<crate::agent::Target>,
     /// Terminals the agent asked for (terminal/create), by its ids.
     agent_terms: Vec<AgentTerm>,
+    /// Where Claude Code keeps its sessions; the sessions last offered to
+    /// reopen, and whether they came from there.
+    pub claude_dir: Option<PathBuf>,
+    session_choices: Vec<crate::sessions::Session>,
+    sessions_from_claude: bool,
     /// Whether the agent's writes are kept for review (else just applied),
     /// the files waiting, and the review buffer with each line's hunk.
     pub agent_review: bool,
@@ -485,6 +490,9 @@ impl EditorState {
             agent_asked: 0,
             agent_lines: Vec::new(),
             agent_terms: Vec::new(),
+            claude_dir: crate::sessions::claude_dir(),
+            session_choices: Vec::new(),
+            sessions_from_claude: false,
             agent_review: true,
             reviews: Vec::new(),
             review_buffer: None,
@@ -1386,10 +1394,13 @@ impl EditorState {
         let events = self.agent.as_mut().map(|a| a.take_events()).unwrap_or_default();
         for event in events {
             changed = true;
-            self.events.push(match event {
-                crate::agent::Event::Tool(id, title, kind, status) => ("agent-tool-event".into(), vec![id, title, kind, status]),
-                crate::agent::Event::Done(why) => ("agent-done-event".into(), vec![why]),
-            });
+            match event {
+                crate::agent::Event::Tool(id, title, kind, status) => {
+                    self.events.push(("agent-tool-event".into(), vec![id, title, kind, status]))
+                }
+                crate::agent::Event::Done(why) => self.events.push(("agent-done-event".into(), vec![why])),
+                crate::agent::Event::Sessions(list) => self.offer_sessions(list, false),
+            }
         }
         // Put each new permission to the person once.
         let waiting = self.agent.as_ref().map_or(0, |a| a.permissions.len());
@@ -2046,6 +2057,89 @@ impl EditorState {
         if let Some(agent) = self.agent.as_mut() {
             agent.prompt_as(&shown, &text);
         }
+        self.agent_refresh();
+    }
+
+    /// SPC a h / SPC a H: past sessions to reopen, of this project or all.
+    /// Claude Code's come from its own files (no agent needs to run, and
+    /// they include those from the CLI); other agents are asked.
+    pub fn agent_sessions(&mut self, all: bool) {
+        let project = self.agent_root();
+        let filter = (!all).then_some(project.as_path());
+        if self.agent_config.name == "claude"
+            && let Some(dir) = self.claude_dir.clone()
+        {
+            let list = crate::sessions::claude_sessions(&dir, filter);
+            self.offer_sessions(list, true);
+            return;
+        }
+        if let Err(e) = self.agent_start() {
+            self.message = e;
+            return;
+        }
+        let agent = self.agent.as_mut().expect("started above");
+        if agent.list_sessions(filter) {
+            self.message = format!("Asking {} for its sessions…", agent.config.name);
+        } else {
+            self.message = format!("{} can't list its sessions", agent.config.name);
+        }
+    }
+
+    /// Puts sessions to the person (a picker, from Scheme).
+    fn offer_sessions(&mut self, list: Vec<crate::sessions::Session>, from_claude: bool) {
+        if list.is_empty() {
+            self.message = "No sessions to reopen".into();
+            return;
+        }
+        let items = list
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let when = crate::sessions::ago(s.updated);
+                let place = crate::projects::abbreviate(&s.cwd);
+                let title = if s.title.chars().count() > 60 {
+                    format!("{}…", s.title.chars().take(59).collect::<String>().trim_end())
+                } else {
+                    s.title.clone()
+                };
+                if when.is_empty() { format!("{}. {title}  ·  {place}", i + 1) } else { format!("{}. {title}  ·  {place}  ·  {when}", i + 1) }
+            })
+            .collect();
+        self.session_choices = list;
+        self.sessions_from_claude = from_claude;
+        self.events.push(("agent-sessions-event".into(), items));
+    }
+
+    /// Reopens the n-th session offered (1-based): the agent starts in its
+    /// folder and replays it into *agent*, to carry on.
+    pub fn agent_open_session(&mut self, n: usize) {
+        let Some(session) = self.session_choices.get(n.wrapping_sub(1)).cloned() else { return };
+        if !session.cwd.is_dir() {
+            self.message = format!("{} is gone", session.cwd.display());
+            return;
+        }
+        let config = if self.sessions_from_claude {
+            self.agent_backends.iter().find(|b| b.name == "claude").cloned().unwrap_or_else(crate::agent::AgentConfig::claude)
+        } else {
+            self.agent_config.clone()
+        };
+        self.agent_kill_terminals();
+        self.agent = None;
+        match crate::agent::Agent::start(config.clone(), &session.cwd) {
+            Ok(mut agent) => {
+                agent.load = Some(session.id.clone());
+                agent.entries.clear();
+                agent.prompt_notice(format!("Reopening “{}” ({})", session.title, crate::projects::abbreviate(&session.cwd)));
+                self.agent = Some(agent);
+                self.agent_shown = u64::MAX;
+                self.agent_asked = 0;
+            }
+            Err(e) => {
+                self.message = format!("{}: {e}", config.command);
+                return;
+            }
+        }
+        self.agent_show();
         self.agent_refresh();
     }
 

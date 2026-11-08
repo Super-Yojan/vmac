@@ -19,6 +19,10 @@
 ;; SPC a c: cancel the run         SPC a p: answer a permission it waits on
 ;; SPC a n: a new conversation     SPC a k: stop the agent
 ;; SPC a o: show *agent*            SPC a e: ask about this file's problems
+;; SPC a h: reopen a past session of this project; SPC a H: of any project.
+;;   With Claude Code these are all its sessions (the CLI's and the desktop
+;;   app's too, from ~/.claude/projects); other agents list their own. The
+;;   agent starts in the session's folder and replays it into *agent*.
 ;;
 ;; In the prompt, @ at the start of a word picks a project file to attach:
 ;; @src/lib.rs sends the file's text along (your buffer's, saved or not).
@@ -42,6 +46,15 @@
   (set! evil-state 'insert))
 
 (defcommand (agent-open) (agent-show))
+(defcommand (agent-history) (agent-sessions #f))
+(defcommand (agent-history-all) (agent-sessions #t))
+
+;; Raised with the sessions to pick from: "3. Title · ~/project · 2h ago".
+(define (agent-sessions-event items)
+  (pick "Agent sessions" items ""
+        (lambda (item)
+          (let ((dot (let loop ((i 0)) (if (equal? (substring item i (+ i 1)) ".") i (loop (+ i 1))))))
+            (agent-open-session (string->number (substring item 0 dot)))))))
 (defcommand (agent-cancel-run) (agent-cancel))
 (defcommand (agent-kill) (agent-stop))
 (defcommand (agent-new) (agent-new-session))

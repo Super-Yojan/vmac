@@ -204,6 +204,8 @@ pub enum Event {
     Tool(String, String, String, String),
     /// A prompt finished: why (end_turn, cancelled, max_tokens, refusal, error).
     Done(String),
+    /// The sessions it listed (session/list), newest first.
+    Sessions(Vec<crate::sessions::Session>),
 }
 
 /// A prompt's text and the files attached to it (path, text).
@@ -234,6 +236,10 @@ pub struct Permission {
 enum Pending {
     Initialize,
     NewSession,
+    /// session/load or session/resume: reopening a past session.
+    LoadSession,
+    /// session/list.
+    List,
     Prompt,
 }
 
@@ -275,6 +281,20 @@ pub struct Agent {
     pub embedded_context: bool,
     /// What happened, for hooks: taken by the editor.
     events: Vec<Event>,
+    /// What it can do with past sessions: reopen (load, replaying them, or
+    /// resume) and list them.
+    pub can_load: bool,
+    pub can_resume: bool,
+    pub can_list: bool,
+    /// Answered initialize (so lists can be asked).
+    initialized: bool,
+    /// The past session to reopen instead of a new one.
+    pub load: Option<String>,
+    /// Replaying a reopened session: its tool calls aren't news for hooks.
+    replaying: bool,
+    /// A list of sessions asked before initialize was answered (Some(None):
+    /// all of them; Some(Some(dir)): those in a folder).
+    list_wanted: Option<Option<PathBuf>>,
     /// Terminals the editor runs for it: id -> (buffer name, last lines).
     pub terminals: HashMap<String, (String, String)>,
 }
@@ -347,6 +367,13 @@ impl Agent {
             expanded: Default::default(),
             embedded_context: false,
             events: Vec::new(),
+            can_load: false,
+            can_resume: false,
+            can_list: false,
+            initialized: false,
+            load: None,
+            replaying: false,
+            list_wanted: None,
             terminals: HashMap::new(),
         };
         agent.call(
@@ -391,6 +418,11 @@ impl Agent {
 
     pub fn respond_error(&mut self, id: Value, message: &str) {
         self.write(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } }));
+    }
+
+    /// Adds a line from vmac to the conversation.
+    pub fn prompt_notice(&mut self, text: String) {
+        self.note(text);
     }
 
     fn note(&mut self, text: String) {
@@ -474,6 +506,21 @@ impl Agent {
         };
         self.respond(p.id, json!({ "outcome": { "outcome": "selected", "optionId": option } }));
         self.note(format!("{name}: {}", p.title));
+        true
+    }
+
+    /// Asks for its past sessions (all, or those in `dir`): Event::Sessions
+    /// brings them. Asked before it's ready, they're asked once it is.
+    pub fn list_sessions(&mut self, dir: Option<&Path>) -> bool {
+        if !self.initialized {
+            self.list_wanted = Some(dir.map(Path::to_path_buf));
+            return true;
+        }
+        if !self.can_list {
+            return false;
+        }
+        let cwd = dir.map(|d| d.display().to_string());
+        self.call(Pending::List, "session/list", json!({ "cwd": cwd }));
         true
     }
 
@@ -565,9 +612,63 @@ impl Agent {
     fn on_result(&mut self, kind: Pending, result: &Value) {
         match kind {
             Pending::Initialize => {
-                self.embedded_context = result["agentCapabilities"]["promptCapabilities"]["embeddedContext"] == true;
+                let caps = &result["agentCapabilities"];
+                self.embedded_context = caps["promptCapabilities"]["embeddedContext"] == true;
+                self.can_load = caps["loadSession"] == true;
+                self.can_resume = caps["sessionCapabilities"]["resume"].is_object();
+                self.can_list = caps["sessionCapabilities"]["list"].is_object();
+                self.initialized = true;
                 let cwd = self.root.display().to_string();
-                self.call(Pending::NewSession, "session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+                match self.load.take() {
+                    // Reopen a past session: load replays it; resume just continues.
+                    Some(id) if self.can_load => {
+                        self.replaying = true;
+                        self.session = Some(id.clone());
+                        self.call(Pending::LoadSession, "session/load", json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] }));
+                    }
+                    Some(id) if self.can_resume => {
+                        self.session = Some(id.clone());
+                        self.call(Pending::LoadSession, "session/resume", json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] }));
+                        self.note("Resumed: its earlier messages aren't shown (this agent doesn't replay them)".into());
+                    }
+                    other => {
+                        if other.is_some() {
+                            self.note(format!("{} can't reopen sessions; starting a new one", self.config.name));
+                        }
+                        self.call(Pending::NewSession, "session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+                    }
+                }
+                if let Some(dir) = self.list_wanted.take() {
+                    self.list_sessions(dir.as_deref());
+                }
+            }
+            Pending::LoadSession => {
+                self.replaying = false;
+                self.state = State::Idle;
+                let name = self.config.name.clone();
+                self.note(format!("{name} reopened the session; carry on below"));
+                if let (Some(session), false) = (self.session.clone(), self.queued.is_empty()) {
+                    let prompt = self.queued.remove(0);
+                    self.send_prompt(&session, prompt);
+                }
+            }
+            Pending::List => {
+                let sessions = result["sessions"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|s| {
+                                Some(crate::sessions::Session {
+                                    id: s["sessionId"].as_str()?.to_string(),
+                                    cwd: PathBuf::from(s["cwd"].as_str().unwrap_or("")),
+                                    title: s["title"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or("(untitled)").to_string(),
+                                    updated: s["updatedAt"].as_str().map_or(0, crate::sessions::parse_time),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.events.push(Event::Sessions(sessions));
             }
             Pending::NewSession => {
                 let Some(session) = result["sessionId"].as_str().map(str::to_string) else {
@@ -602,7 +703,8 @@ impl Agent {
 
     fn on_error(&mut self, kind: Pending, text: String) {
         match kind {
-            Pending::Initialize | Pending::NewSession => {
+            Pending::List => self.note(format!("Couldn't list sessions: {text}")),
+            Pending::Initialize | Pending::NewSession | Pending::LoadSession => {
                 // Nothing more will work; stop it so the next prompt starts afresh.
                 self.state = State::Exited;
                 self.queued.clear();
@@ -624,6 +726,14 @@ impl Agent {
     fn on_update(&mut self, update: &Value) {
         let kind = update["sessionUpdate"].as_str().unwrap_or("");
         match kind {
+            // A reopened session's own prompts, replayed.
+            "user_message_chunk" => {
+                let text = content_text(&update["content"]);
+                match self.entries.last_mut() {
+                    Some(Entry::User(s)) => s.push_str(&text),
+                    _ => self.entries.push(Entry::User(text)),
+                }
+            }
             "agent_message_chunk" | "agent_thought_chunk" => {
                 let text = content_text(&update["content"]);
                 let thought = kind == "agent_thought_chunk";
@@ -638,7 +748,9 @@ impl Agent {
                 let mut call = ToolCall { id: update["toolCallId"].as_str().unwrap_or("").to_string(), ..Default::default() };
                 call.status = "pending".into();
                 call.update(update);
-                self.events.push(Event::Tool(call.id.clone(), call.title.clone(), call.kind.clone(), call.status.clone()));
+                if !self.replaying {
+                    self.events.push(Event::Tool(call.id.clone(), call.title.clone(), call.kind.clone(), call.status.clone()));
+                }
                 self.entries.push(Entry::Tool(call));
             }
             "tool_call_update" => {
@@ -652,7 +764,7 @@ impl Agent {
                     Some(t) => {
                         let before = t.status.clone();
                         t.update(update);
-                        if t.status != before {
+                        if t.status != before && !self.replaying {
                             let e = event(t);
                             self.events.push(e);
                         }
@@ -1035,7 +1147,19 @@ while True:
     if method == "initialize":
         assert m["params"]["clientCapabilities"]["fs"]["readTextFile"]
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"protocolVersion": 1,
-              "agentCapabilities": {"promptCapabilities": {"embeddedContext": True}}}})
+              "agentCapabilities": {"promptCapabilities": {"embeddedContext": True},
+                                    "loadSession": True, "sessionCapabilities": {"list": {}}}}})
+    elif method == "session/list":
+        cwd = m["params"].get("cwd") or "/"
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"sessions": [
+            {"sessionId": "s-new", "cwd": cwd, "title": "Second session", "updatedAt": "2026-11-07T22:00:00Z"},
+            {"sessionId": "s-old", "cwd": cwd, "title": "First session"}]}})
+    elif method == "session/load":
+        sid = m["params"]["sessionId"]
+        update(sid, {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "earlier question " + sid}})
+        update(sid, {"sessionUpdate": "tool_call", "toolCallId": "old1", "title": "Read old.txt", "kind": "read", "status": "completed"})
+        say(sid, "earlier answer")
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {}})
     elif method == "session/new":
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"sessionId": "s1"}})
     elif method == "session/prompt":

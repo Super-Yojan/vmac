@@ -263,6 +263,12 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   plan, the command, the diff) and the choices, and puts the cursor on it so
   you can read first. Press a choice's number, or `RET` on it; `SPC a p`
   picks from a list. While you're typing, vmac only tells you it's asking.
+- **Past sessions:** `SPC a h` reopens one of this project's, `SPC a H`
+  one from any project (also on the dashboard, `s`). With Claude Code these
+  are all its sessions, from the CLI and the desktop app too: vmac reads
+  them from `~/.claude/projects`, titled as Claude titled them, newest
+  first. Other agents list their own. Picking one starts the agent in that
+  session's folder and replays the conversation into `*agent*`, to carry on.
 - `SPC a c` (or `C-c` in `*agent*`) cancels the run, `SPC a n` starts a new
   conversation, `SPC a k` stops the agent, `SPC a o` shows `*agent*`.
   `:agent PROMPT` asks from the command line.

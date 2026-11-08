@@ -32,6 +32,7 @@
         (list "p" "Switch project" 'project-switch)
         (list "o" "Open a folder" 'project-add)
         (list "a" "Ask the agent" 'agent-ask)
+        (list "s" "Agent sessions" 'agent-history-all)
         (list "c" "Open config" 'open-config)
         (list "q" "Quit" 'quit)))
 

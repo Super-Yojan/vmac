@@ -10,6 +10,7 @@ mod lsp;
 mod markdown;
 mod picker;
 mod review;
+mod sessions;
 mod plugins;
 mod projects;
 mod shell;

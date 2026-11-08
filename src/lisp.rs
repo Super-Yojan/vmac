@@ -1575,6 +1575,8 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "agent-activate", |s| s.agent_activate());
     prim!(reg, editor, "agent-toggle-at-point", |s| s.agent_toggle_at_point());
     prim!(reg, editor, "agent-new-session", |s| s.agent_new_session());
+    prim!(reg, editor, "agent-sessions", |s, all: bool| s.agent_sessions(all));
+    prim!(reg, editor, "agent-open-session", |s, n: isize| s.agent_open_session(n.max(0) as usize));
     prim!(reg, editor, "agent-root", |s| {
         s.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| s.agent_root()).display().to_string()
     });
@@ -3430,6 +3432,67 @@ mod tests {
         assert!(editor.lock().preview_rect().is_some(), "from another file, it keeps showing the last Markdown file");
         typed(&mut lisp, " mp");
         assert!(editor.lock().preview_rect().is_none(), "closed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn past_sessions_are_listed_and_reopened() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-sessions-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&dir.join("a.txt")).unwrap();
+        lisp.eval(&format!("(agent-define \"fake\" \"{}\")", config.line())).unwrap();
+        lisp.eval("(agent-use \"fake\")").unwrap();
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
+            for _ in 0..250 {
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&mut editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let picker_items = |editor: &Editor| editor.lock().picker.as_ref().map(|p| p.title().to_string());
+
+        // An agent that lists its own (ACP session/list).
+        typed(&mut lisp, " ah");
+        assert!(pump(&mut lisp, &|s| s.picker.is_some()), "{}", editor.lock().message);
+        assert_eq!(picker_items(&editor).as_deref(), Some("Agent sessions"));
+        let first = editor.lock().picker.as_ref().unwrap().selection().unwrap().to_string();
+        assert!(first.starts_with("1. Second session  ·  "), "{first}");
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("reopened the session"))));
+        let t = editor.lock().agent.as_ref().unwrap().transcript();
+        assert!(t.contains("— Reopening “Second session”"), "{t}");
+        assert!(t.contains("› earlier question s-new\n\n▸ ✓ Read old.txt\n"), "the history, replayed: {t}");
+        assert!(t.contains("earlier answer"), "{t}");
+        editor.lock().agent_prompt("and now?");
+        assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("You said: and now?"))), "carries on");
+
+        // Claude Code's sessions come from its files, any project's.
+        let projects = dir.join("claude-projects");
+        std::fs::create_dir_all(projects.join("-proj")).unwrap();
+        let entry = |v: serde_json::Value| format!("{v}\n");
+        std::fs::write(
+            projects.join("-proj").join("cli-session-7.jsonl"),
+            entry(serde_json::json!({ "type": "user", "cwd": dir.display().to_string(), "message": { "content": "from the CLI" } }))
+                + &entry(serde_json::json!({ "type": "ai-title", "aiTitle": "Work done in the terminal" })),
+        )
+        .unwrap();
+        editor.lock().claude_dir = Some(projects);
+        lisp.eval(&format!("(agent-define \"claude\" \"{}\")", config.line())).unwrap();
+        lisp.eval("(agent-use \"claude\")").unwrap();
+        lisp.eval("(call-binding 'agent-history-all)").unwrap();
+        lisp.run_events();
+        let first = editor.lock().picker.as_ref().map(|p| p.selection().unwrap_or("").to_string());
+        assert!(first.as_deref().is_some_and(|f| f.starts_with("1. Work done in the terminal  ·  ")), "{first:?}");
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("earlier question cli-session-7"))),
+            "the agent was asked to load Claude's session by its id: {:?}", editor.lock().agent.as_ref().map(|a| a.transcript()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
