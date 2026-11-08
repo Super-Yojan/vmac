@@ -119,6 +119,19 @@ impl Session {
                 }
                 st.scroll_window_by(window, lines);
             }
+            Input::PdfDoubleClick { window, page, x, y } => {
+                let mut st = self.editor.lock();
+                let Some(buffer) = st.window_by_id(window).map(|w| w.buffer) else { return };
+                let Some(pdf) = st.buffer_by_id(buffer).and_then(|b| b.file()).map(|f| f.display().to_string()) else {
+                    return;
+                };
+                // The PDF's window is the one acted from.
+                st.select_window(window);
+                st.push_event("lua-event", vec!["pdf_double_click".into(), pdf, page.to_string(), x.to_string(), y.to_string()]);
+                drop(st);
+                // Now, not at the next tick: the jump follows the click.
+                self.lisp.run_events();
+            }
             Input::ReviewSelect { path, modified, line } => self.editor.lock().review_select(&path, modified, line),
             Input::ReviewCommentAt { path, modified, line } => {
                 let side = if modified { "modified" } else { "original" };
@@ -801,6 +814,57 @@ mod tests {
             other => panic!("not media: {other:?}"),
         }
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_double_click_in_a_latex_pdf_goes_to_its_source_line() {
+        let have = |c: &str| std::process::Command::new(c).arg("--version").output().is_ok();
+        if !have("pdflatex") || !have("synctex") {
+            eprintln!("skipped: needs pdflatex and synctex");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vmac-synctex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tex = dir.join("paper.tex");
+        std::fs::write(
+            &tex,
+            "\\documentclass{article}\n\\begin{document}\nFirst paragraph here.\n\nSecond paragraph, a bit longer.\n\nThird paragraph is the one we jump to.\n\\end{document}\n",
+        )
+        .unwrap();
+        let built = std::process::Command::new("pdflatex")
+            .args(["-synctex=1", "-interaction=nonstopmode", "paper.tex"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(dir.join("paper.synctex.gz").exists(), "built: {}", String::from_utf8_lossy(&built.stdout));
+
+        let mut s = session_with("");
+        s.editor.lock().open_file(&tex).unwrap();
+        s.editor.lock().toggle_file_beside(&dir.join("paper.pdf")).unwrap();
+        let frame = s.frame(VIEW);
+        assert_eq!(frame.windows.len(), 2);
+        let pdf_window = frame.windows[1].id;
+        let at = |s: &Session| {
+            let st = s.editor.lock();
+            (st.buffer().name().to_string(), st.buffer().line() + 1, st.window_count())
+        };
+
+        // Line 7's paragraph, about 158 points down page 1 (synctex view says).
+        s.handle(Input::PdfDoubleClick { window: pdf_window, page: 1, x: 180., y: 158. });
+        assert_eq!(at(&s), ("paper.tex".into(), 7, 2), "in the source's window, on its line");
+        s.handle(Input::PdfDoubleClick { window: pdf_window, page: 1, x: 150., y: 130. });
+        assert_eq!(at(&s), ("paper.tex".into(), 3, 2), "the first paragraph");
+
+        // The PDF alone: the source opens beside it.
+        s.editor.lock().select_window(pdf_window);
+        s.editor.lock().only_window();
+        s.handle(Input::PdfDoubleClick { window: pdf_window, page: 1, x: 180., y: 158. });
+        assert_eq!(at(&s), ("paper.tex".into(), 7, 2));
+
+        // Nowhere near any text: said so, and nothing moves.
+        s.handle(Input::PdfDoubleClick { window: pdf_window, page: 9, x: 1., y: 1. });
+        assert!(s.editor.lock().message.starts_with("No source found"), "{}", s.editor.lock().message);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

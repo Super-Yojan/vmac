@@ -13,7 +13,7 @@ use gpui_kit::{
     StyledImage as _, Window, div, img, list, point, prelude::FluentBuilder as _, px,
 };
 use crate::frame::{ROW_HEIGHT, WindowId};
-use gpui_kit::{App, DispatchPhase, ScrollWheelEvent, canvas};
+use gpui_kit::{App, DispatchPhase, MouseButton, MouseDownEvent, ScrollWheelEvent, canvas};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -153,10 +153,16 @@ pub struct PdfView {
     on_zoom: OnZoom,
     /// Ctrl-wheel movement short of a whole line, kept for the next event.
     zoom_wheel: Rc<Cell<f32>>,
+    /// What to call with a double-click on a page (SyncTeX).
+    on_double_click: OnPageClick,
 }
 
+/// What a PDF view calls with a double-click on a page: the window, the
+/// page (from 1), and the point in PDF points from the page's top left.
+pub type OnPageClick = Rc<dyn Fn(WindowId, usize, f32, f32, &mut App)>;
+
 impl PdfView {
-    pub fn new(path: PathBuf, scrolled: u64, on_zoom: OnZoom) -> Self {
+    pub fn new(path: PathBuf, scrolled: u64, on_zoom: OnZoom, on_double_click: OnPageClick) -> Self {
         let now = stamp(&path);
         let sizes = crate::pdf::page_sizes(&path);
         let count = sizes.as_ref().map_or(0, Vec::len);
@@ -180,6 +186,7 @@ impl PdfView {
             window: 0,
             on_zoom,
             zoom_wheel: Rc::new(Cell::new(0.)),
+            on_double_click,
         }
     }
 
@@ -414,13 +421,15 @@ impl PdfView {
             .child(
                 div()
                     .flex_none()
+                    .relative()
                     .w(px(shown))
                     .aspect_ratio(w / h.max(1.))
                     .bg(paper)
                     .border_1()
                     .border_color(border)
                     .shadow_sm()
-                    .child(body),
+                    .child(body)
+                    .child(self.double_click_catcher(ix, (w, h))),
             )
             .child(div().pt(px(4.)).text_xs().text_color(muted).child(format!("{}", ix + 1)))
             .into_any_element()
@@ -428,6 +437,32 @@ impl PdfView {
 }
 
 impl PdfView {
+    /// Hears double-clicks on page `ix` (`size` in points), where it's drawn
+    /// and in view, and hands on the point on the page.
+    fn double_click_catcher(&self, ix: usize, size: (f32, f32)) -> impl IntoElement {
+        let (window_id, on_click) = (self.window, self.on_double_click.clone());
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                // Only the part of the page in view (it's clipped to the list).
+                let visible = bounds.intersect(&window.content_mask().bounds);
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                    let hit = event.button == MouseButton::Left && event.click_count == 2;
+                    if phase != DispatchPhase::Bubble || !hit || !visible.contains(&event.position) {
+                        return;
+                    }
+                    let width = f32::from(bounds.size.width).max(1.);
+                    let height = f32::from(bounds.size.height).max(1.);
+                    let x = f32::from(event.position.x - bounds.origin.x) / width * size.0;
+                    let y = f32::from(event.position.y - bounds.origin.y) / height * size.1;
+                    on_click(window_id, ix + 1, x, y, cx);
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+    }
+
     fn zoom_catcher(&self) -> impl IntoElement {
         zoom_catcher(self.window, self.on_zoom.clone(), self.zoom_wheel.clone())
     }
@@ -724,7 +759,7 @@ mod tests {
 
     #[test]
     fn pages_fit_the_window_then_grow_with_the_zoom() {
-        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0, Rc::new(|_, _, _| {}));
+        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0, Rc::new(|_, _, _| {}), Rc::new(|_, _, _, _, _| {}));
         view.sizes = Ok(vec![(612., 792.), (1200., 800.)]);
         view.width = 2000.;
         assert_eq!(view.page_width(0), 612., "its own width when there's room");

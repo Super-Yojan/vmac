@@ -912,6 +912,35 @@ impl EditorState {
         opened.map(|()| true)
     }
 
+    /// Shows a file in a window other than this one (the source of the PDF
+    /// shown here): one showing it already, else the one before it, else a
+    /// new split. That window is selected.
+    pub fn show_file_elsewhere(&mut self, path: &Path) -> std::io::Result<()> {
+        let path = self.resolve(path);
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canonical(&path);
+        let here = self.selected;
+        let others: Vec<WindowId> =
+            self.window_order().into_iter().filter(|&w| w != here && !self.is_sidebar(w)).collect();
+        let showing = others.iter().copied().find(|&w| {
+            let file = self.window_by_id(w).and_then(|w| self.buffer_by_id(w.buffer)).and_then(|b| b.file());
+            file.is_some_and(|f| canonical(f) == want)
+        });
+        if let Some(w) = showing {
+            self.select_window(w);
+            return Ok(());
+        }
+        // The window before this one (source | PDF), else the first other.
+        let order = self.window_order();
+        let i = order.iter().position(|&w| w == here).unwrap_or(0);
+        let before = order[..i].iter().rev().copied().find(|w| others.contains(w));
+        match before.or(others.first().copied()) {
+            Some(w) => self.select_window(w),
+            None => self.split_window(Axis::Row),
+        }
+        self.open_file(&path)
+    }
+
     /// Closes the selected window. The last one in the layout can't be closed.
     pub fn close_window(&mut self) -> bool {
         if self.is_sidebar(self.selected) {

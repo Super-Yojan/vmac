@@ -476,6 +476,15 @@ writes a broken file leaves the last good version up; the old pages stay
 until the new ones are drawn, so it doesn't flash; and a PDF opened before
 it exists shows up when it's first built.
 
+**From the PDF to the source.** Double-click a page to jump to the line it
+was built from, in the source's window (opened beside the PDF if it isn't
+showing). This is SyncTeX, so it's for LaTeX: build with `-synctex=1`
+(`latexmk -pvc -pdf -synctex=1 paper.tex`), which leaves `paper.synctex.gz`
+beside the PDF, and have TeX Live's `synctex` on your `PATH` (MacTeX and
+Homebrew's TeX Live include it). Typst doesn't write SyncTeX.
+`vmac.hooks.pdf_double_click(pdf, page, x, y)` can be replaced for another
+tool.
+
 **Colors.** PDF pages take the theme's colors, paper as its background and
 ink as its text; `SPC t p` (or `vmac.set_pdf_themed(false)`) shows them black
 on white, as printed, for PDFs full of photos.

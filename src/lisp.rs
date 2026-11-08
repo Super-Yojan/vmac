@@ -895,6 +895,13 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         }
     });
     prim!(reg, editor, "other-window", |s, n: isize| s.other_window(n));
+    // A file in a window other than this one, selected: "" or what went wrong.
+    prim!(reg, editor, "show-file-elsewhere", |s, path: String| {
+        match s.show_file_elsewhere(&expand_home(&path)) {
+            Ok(()) => String::new(),
+            Err(e) => format!("{path}: {e}"),
+        }
+    });
     // A file in a window on the right, the cursor staying here, or that
     // window closed if there is one: "opened", "closed", or what went wrong.
     prim!(reg, editor, "toggle-file-beside", |s, path: String| {

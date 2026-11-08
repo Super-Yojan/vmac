@@ -74,6 +74,8 @@ struct WindowHit {
     lines: Vec<(usize, f32, f32, Vec<usize>)>,
     /// Drawn by gpui-kit (rendered Markdown, the review), which has its own mouse.
     custom: bool,
+    /// An image or PDF, whose view handles double-clicks itself (SyncTeX).
+    media: bool,
 }
 
 impl WindowHit {
@@ -91,6 +93,7 @@ impl WindowHit {
             text_left: w.text_left,
             lines,
             custom: !matches!(w.content, Content::Text(_)),
+            media: matches!(w.content, Content::Media { .. }),
         }
     }
 
@@ -317,6 +320,11 @@ impl Shell {
         let (x, y): (f32, f32) = (event.position.x.into(), event.position.y.into());
         let Some(hit) = self.hit_at(x, y) else { return };
         window.focus(&self.focus, cx);
+        // A double-click on a PDF is its view's (to the source, by SyncTeX);
+        // the first click selected the window.
+        if hit.media && event.click_count > 1 {
+            return;
+        }
         let button = match event.button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -432,9 +440,16 @@ impl Shell {
                 // Scrolls asked for before this view existed are done with.
                 let seen = scroll.last().map_or(0, |(n, _)| *n);
                 let on_zoom = Self::zoom_sender(cx);
+                // A double-click on a page: to the session, for SyncTeX.
+                let shell = cx.entity().downgrade();
+                let on_double_click: crate::media::OnPageClick =
+                    std::rc::Rc::new(move |window, page, x, y, cx: &mut gpui_kit::App| {
+                        let input = Input::PdfDoubleClick { window, page, x, y };
+                        let _ = shell.update(cx, |shell, cx| shell.send(input, cx));
+                    });
                 gpui_kit::AppContext::new(cx, |cx| {
                     crate::media::PdfView::start_watching(cx);
-                    crate::media::PdfView::new(path.to_path_buf(), seen, on_zoom)
+                    crate::media::PdfView::new(path.to_path_buf(), seen, on_zoom, on_double_click)
                 })
             })
             .clone();

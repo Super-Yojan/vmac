@@ -104,3 +104,37 @@ vmac.command("preview", function()
   local markdown = vmac.buffer_language() == "markdown" or vmac.markdown_preview()
   vmac.run(markdown and "markdown-preview" or "pdf-preview")
 end)
+
+---- From the PDF to the source: SyncTeX
+--
+-- Double-click a PDF's page to jump to the source line it was built from,
+-- in the source's window. It asks TeX Live's synctex, so it works for PDFs
+-- built by pdflatex, xelatex or lualatex with -synctex=1 (latexmk -pvc
+-- -pdf -synctex=1 paper.tex; many setups have it on already), which leaves
+-- paper.synctex.gz beside the PDF. Typst doesn't write SyncTeX.
+-- vmac.hooks.pdf_double_click(pdf, page, x, y) is called with the page
+-- (from 1) and the point in PDF points from its top left: replace it for
+-- another tool.
+
+-- Where synctex says a point on a page came from: file, line, column (or nil).
+function core.synctex_edit(pdf, page, x, y)
+  local out = vmac.exec("synctex", { "edit", "-o", page .. ":" .. x .. ":" .. y .. ":" .. pdf })
+  local file = out:match("\nInput:([^\n]+)") or out:match("^Input:([^\n]+)")
+  local line = tonumber(out:match("\nLine:(%-?%d+)") or "")
+  if not file or not line or line < 1 then return nil end
+  local column = tonumber(out:match("\nColumn:(%-?%d+)") or "") or 0
+  -- "./paper.tex" and the like are from the PDF's folder.
+  if not file:match("^/") then file = pdf:match("^(.*)/") .. "/" .. file:gsub("^%./", "") end
+  return file, line, math.max(column, 0)
+end
+
+vmac.hooks.pdf_double_click = function(pdf, page, x, y)
+  local file, line, column = core.synctex_edit(pdf, page, x, y)
+  if not file then
+    return vmac.message("No source found there: is synctex installed, and was the PDF built with -synctex=1?")
+  end
+  local err = vmac.show_file_elsewhere(file)
+  if err ~= "" then return vmac.message(err) end
+  vmac.goto_line_column(line, column + 1)
+  vmac.message(file:match("[^/]+$") .. ":" .. line)
+end

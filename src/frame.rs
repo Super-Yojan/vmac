@@ -58,6 +58,9 @@ pub enum Input {
     /// What the window's machine has: its fonts, the themes it loaded
     /// (name, dark?), and theme files that didn't load.
     Client { fonts: Vec<String>, themes: Vec<(String, bool)>, errors: Vec<String> },
+    /// A double-click on a PDF's page: the page (from 1) and the point, in
+    /// PDF points from its top left (SyncTeX finds the source there).
+    PdfDoubleClick { window: WindowId, page: usize, x: f32, y: f32 },
     /// Whether the system is in dark mode.
     Appearance { dark: bool },
     /// The theme's text and background colors (0xRRGGBB), for terminal
