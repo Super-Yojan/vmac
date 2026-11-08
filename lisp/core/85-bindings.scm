@@ -31,6 +31,8 @@
         ((equal? name 'insert) (define-key insert-map key binding))
         ((equal? name 'terminal) (define-key terminal-map key binding))
         ((equal? name 'terminal-normal) (define-key terminal-normal-map key binding))
+        ((equal? name 'review) (define-key review-map key binding))
+        ((equal? name 'agent) (define-key agent-map key binding))
         (else (define-key minibuffer-map key binding))))
 
 (for-each (lambda (pair)

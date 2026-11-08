@@ -13,3 +13,7 @@
 ;; vmac.map(state, keys, command).
 (define (lua-define-key state keys command)
   (keymap-define! state keys command))
+
+;; Events Rust raises for Lua (the Diff's comment button...): ("lua-event"
+;; hook arg ...) calls vmac.hooks[hook](arg, ...).
+(define (lua-event args) (lua-hook (car args) (cdr args)))

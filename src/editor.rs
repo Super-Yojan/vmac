@@ -365,6 +365,10 @@ pub struct EditorState {
     reviews: Vec<crate::review::Review>,
     review_buffer: Option<BufferId>,
     review_lines: Vec<Option<(PathBuf, usize)>>,
+    /// Each review buffer line's place in a file (for comments, the Diff).
+    pub review_rows: Vec<Option<ReviewRow>>,
+    /// Your comments on lines (of changes, or any file), to send the agent.
+    pub review_comments: Vec<ReviewComment>,
     review_shown: u64,
     /// Recent files and projects (in memory only until `set_state_dir`).
     pub history: crate::projects::History,
@@ -383,6 +387,23 @@ pub struct EditorState {
     /// raised where Rust can't call Scheme (server replies).
     events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
+}
+
+/// A line of the review: its file, on the new (modified) or old side, 1-based.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewRow {
+    pub path: PathBuf,
+    pub rel: String,
+    pub modified: bool,
+    pub line: usize,
+}
+
+/// A comment on a line, waiting to be sent to the agent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub at: ReviewRow,
+    pub text: String,
 }
 
 /// The Markdown preview's share of the editor's width.
@@ -510,6 +531,8 @@ impl EditorState {
             reviews: Vec::new(),
             review_buffer: None,
             review_lines: Vec::new(),
+            review_rows: Vec::new(),
+            review_comments: Vec::new(),
             review_shown: 0,
             history: Default::default(),
             project: None,
@@ -2014,11 +2037,12 @@ impl EditorState {
             return false;
         }
         self.review_shown = signature;
-        let root = self.agent.as_ref().map(|a| a.root.clone());
+        let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| self.agent_root());
         let mut text = String::new();
         let mut faces: Vec<(usize, usize, &str)> = Vec::new();
         let mut lines: Vec<Option<(PathBuf, usize)>> = Vec::new();
-        let mut push = |text: &mut String, line: &str, face: Option<&'static str>, target: Option<(PathBuf, usize)>| {
+        let mut rows: Vec<Option<ReviewRow>> = Vec::new();
+        let mut push = |text: &mut String, line: &str, face: Option<&'static str>, target: Option<(PathBuf, usize)>, row: Option<ReviewRow>| {
             let start = text.chars().count();
             text.push_str(line);
             text.push('\n');
@@ -2026,33 +2050,60 @@ impl EditorState {
                 faces.push((start, start + line.chars().count(), f));
             }
             lines.push(target);
+            rows.push(row);
         };
+        // A unified diff of each file (what gpui-kit's Diff draws), each row
+        // knowing its file line and hunk.
         for (path, buffer) in ids {
             let Some(buffer) = buffer else { continue };
-            let Some((_, hunks)) = self.review_of(buffer) else { continue };
+            let Some((i, hunks)) = self.review_of(buffer) else { continue };
             if hunks.is_empty() {
                 continue;
             }
-            let shown = root.as_ref().and_then(|r| path.strip_prefix(r).ok()).unwrap_or(&path).display().to_string();
-            let plural = if hunks.len() == 1 { "" } else { "s" };
-            push(&mut text, &format!("{shown}  ({} change{plural})", hunks.len()), Some("agent-heading"), None);
-            for (n, h) in hunks.iter().enumerate() {
-                let target = Some((path.clone(), n));
-                push(&mut text, &format!("@@ line {}", h.new.start + 1), Some("cyan"), target.clone());
-                for l in h.old_text.lines() {
-                    push(&mut text, &format!("- {l}"), Some("red"), target.clone());
-                }
-                for l in h.new_text.lines() {
-                    push(&mut text, &format!("+ {l}"), Some("green"), target.clone());
+            let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+            let base = self.reviews[i].base.clone();
+            let current = self.buffer_by_id(buffer).map(|b| b.text().to_string()).unwrap_or_default();
+            let patch = similar::TextDiff::from_lines(&base, &current)
+                .unified_diff()
+                .context_radius(3)
+                .header(&format!("a/{rel}"), &format!("b/{rel}"))
+                .to_string();
+            push(&mut text, &format!("diff --git a/{rel} b/{rel}"), Some("agent-heading"), None, None);
+            let (mut old, mut new) = (1usize, 1usize);
+            let row = |modified: bool, line: usize| Some(ReviewRow { path: path.clone(), rel: rel.clone(), modified, line });
+            for line in patch.lines() {
+                if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with('\\') {
+                    push(&mut text, line, Some("dim"), None, None);
+                } else if let Some(rest) = line.strip_prefix("@@ ") {
+                    // "-o,ol +n,nl @@": where the hunk starts on each side.
+                    let start_of = |sign: char| {
+                        rest.split_whitespace()
+                            .find(|w| w.starts_with(sign))
+                            .and_then(|w| w[1..].split(',').next()?.parse::<usize>().ok())
+                            .unwrap_or(1)
+                    };
+                    (old, new) = (start_of('-').max(1), start_of('+').max(1));
+                    push(&mut text, line, Some("cyan"), None, None);
+                } else if let Some(body) = line.strip_prefix('-') {
+                    let hunk = hunks.iter().position(|h| h.old.contains(&(old - 1)));
+                    push(&mut text, &format!("-{body}"), Some("red"), hunk.map(|n| (path.clone(), n)), row(false, old));
+                    old += 1;
+                } else if let Some(body) = line.strip_prefix('+') {
+                    let hunk = hunks.iter().position(|h| h.covers(new - 1));
+                    push(&mut text, &format!("+{body}"), Some("green"), hunk.map(|n| (path.clone(), n)), row(true, new));
+                    new += 1;
+                } else {
+                    push(&mut text, line, None, None, row(true, new));
+                    old += 1;
+                    new += 1;
                 }
             }
-            push(&mut text, "", None, None);
+            push(&mut text, "", None, None, None);
         }
         if text.is_empty() {
-            push(&mut text, "Nothing to review.", Some("dim"), None);
-        } else {
-            push(&mut text, "ga accept · gx reject · ]h [h move · RET go to it · SPC a A / SPC a X all", Some("dim"), None);
+            push(&mut text, "Nothing to review.", Some("dim"), None, None);
         }
+        self.review_rows = rows;
         let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("checked above").1;
         let point = b.point();
         b.set_text(&text);
@@ -2064,13 +2115,152 @@ impl EditorState {
         true
     }
 
+    /// Where a comment goes: the review row under the cursor, or the line
+    /// under the cursor in a file.
+    fn comment_place(&self) -> Option<ReviewRow> {
+        let line = self.buffer().line();
+        if self.review_here() {
+            return self.review_rows.get(line).cloned().flatten();
+        }
+        let path = self.buffer().file()?.clone();
+        let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| self.agent_root());
+        let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        Some(ReviewRow { path, rel, modified: true, line: line + 1 })
+    }
+
+    /// gc: a comment on the line under the cursor (in the review, or a file).
+    pub fn review_comment_add(&mut self, text: &str) -> bool {
+        let Some(at) = self.comment_place() else {
+            self.message = "No line to comment on here".into();
+            return false;
+        };
+        self.review_comment_at(at, text)
+    }
+
+    /// A comment on a line given by its file (relative to the project),
+    /// side and line: what the Diff's comment button passes.
+    pub fn review_comment_at_line(&mut self, rel: &str, modified: bool, line: usize, text: &str) -> bool {
+        let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| self.agent_root());
+        let path = root.join(rel);
+        self.review_comment_at(ReviewRow { path, rel: rel.to_string(), modified, line }, text)
+    }
+
+    fn review_comment_at(&mut self, at: ReviewRow, text: &str) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        let id = self.review_comments.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        self.message = format!("Comment on {}:{} ({} waiting; SPC a S sends them)", at.rel, at.line, self.review_comments.len() + 1);
+        self.review_comments.push(ReviewComment { id, at, text: text.to_string() });
+        self.review_shown = 0;
+        true
+    }
+
+    /// gC: removes the comments on the line under the cursor.
+    pub fn review_comment_delete(&mut self) {
+        let Some(at) = self.comment_place() else { return };
+        let before = self.review_comments.len();
+        self.review_comments.retain(|c| !(c.at.path == at.path && c.at.modified == at.modified && c.at.line == at.line));
+        let gone = before - self.review_comments.len();
+        self.message = if gone == 0 { "No comment on this line".into() } else { format!("Deleted {gone} comment{}", if gone == 1 { "" } else { "s" }) };
+        self.review_shown = 0;
+    }
+
+    /// Lines of a buffer that have comments (0-based), for their marks.
+    pub fn comment_lines(&self, id: BufferId) -> Vec<usize> {
+        let Some(file) = self.buffer_by_id(id).and_then(|b| b.file()) else { return Vec::new() };
+        self.review_comments.iter().filter(|c| c.at.modified && c.at.path == *file).map(|c| c.at.line.saturating_sub(1)).collect()
+    }
+
+    /// The text of a commented line, for the agent: from the buffer (new
+    /// side) or the text before the agent's change (old side).
+    fn commented_code(&self, at: &ReviewRow) -> String {
+        let line = at.line.saturating_sub(1);
+        let text = if at.modified {
+            self.buffer_visiting(&at.path).and_then(|id| self.buffer_by_id(id)).map(|b| b.text().to_string())
+        } else {
+            self.reviews.iter().find(|r| r.path == at.path).map(|r| r.base.clone())
+        };
+        text.and_then(|t| t.lines().nth(line).map(|l| l.trim().to_string())).unwrap_or_default()
+    }
+
+    /// SPC a S: sends your comments to the agent, asking it to revise its
+    /// changes by them; ACP or CLI, whichever is in use.
+    pub fn review_comments_send(&mut self) {
+        if self.review_comments.is_empty() {
+            self.message = "No comments to send (gc comments on a line)".into();
+            return;
+        }
+        let comments = std::mem::take(&mut self.review_comments);
+        let n = comments.len();
+        let side = |c: &ReviewComment| if c.at.modified { "" } else { " (the old version)" };
+        if self.agent_config.terminal {
+            let list: Vec<String> = comments
+                .iter()
+                .map(|c| format!("{} line {}{}: {}", c.at.rel, c.at.line, side(c), c.text))
+                .collect();
+            self.agent_cli_send(&format!("Please revise your changes to address my review comments: {}", list.join("; ")));
+        } else {
+            let mut text = String::from("Please revise your changes to address my review comments:\n\n");
+            for c in &comments {
+                let code = self.commented_code(&c.at);
+                text.push_str(&format!("- `{}:{}`{}: {}\n", c.at.rel, c.at.line, side(c), c.text));
+                if !code.is_empty() {
+                    text.push_str(&format!("  > `{code}`\n"));
+                }
+            }
+            let shown = format!("Revise by my {n} review comment{}", if n == 1 { "" } else { "s" });
+            if let Err(e) = self.agent_start() {
+                self.message = e;
+                self.review_comments = comments;
+                return;
+            }
+            self.agent_show();
+            if let Some(agent) = self.agent.as_mut() {
+                agent.prompt_with(&shown, &text, &[]);
+            }
+            self.agent_refresh();
+        }
+        self.message = format!("Sent {n} comment{} to {}", if n == 1 { "" } else { "s" }, self.agent_config.name);
+        self.review_shown = 0;
+    }
+
     /// RET in the review buffer: the change in its file.
     pub fn review_visit(&mut self) {
         let line = self.buffer().line();
+        // A row of the new text: that very line.
+        if let Some(Some(row)) = self.review_rows.get(line).cloned()
+            && row.modified
+        {
+            self.agent_visit(&row.path, Some(row.line as u64));
+            return;
+        }
         let Some(Some((path, n))) = self.review_lines.get(line).cloned() else { return };
         let Some(id) = self.buffer_visiting(&path) else { return };
         let start = self.review_of(id).and_then(|(_, h)| h.get(n).map(|h| h.new.start)).unwrap_or(0);
         self.agent_visit(&path, Some(start as u64 + 1));
+    }
+
+    /// Raises an event for Scheme (and, through lua-event, Lua) to handle.
+    pub fn push_event(&mut self, name: &str, args: Vec<String>) {
+        self.events.push((name.to_string(), args));
+    }
+
+    /// Puts the review buffer's cursor on the row for a file line (a click
+    /// in the Diff).
+    pub fn review_select(&mut self, rel: &str, modified: bool, line: usize) {
+        let Some(row) = self.review_rows.iter().position(|r| r.as_ref().is_some_and(|r| r.rel == rel && r.modified == modified && r.line == line)) else { return };
+        let Some(id) = self.review_buffer_id() else { return };
+        let Some(w) = self.windows.iter().find(|w| w.buffer == id).map(|w| w.id) else { return };
+        self.select_window(w);
+        let pos = self.buffer().line_to_pos(row);
+        self.buffer_mut().goto_char(pos);
+        self.window_mut().point = pos;
+    }
+
+    pub fn review_buffer_id(&self) -> Option<BufferId> {
+        self.review_buffer.filter(|&id| self.buffer_by_id(id).is_some())
     }
 
     pub fn review_here(&self) -> bool {

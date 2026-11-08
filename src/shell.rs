@@ -42,9 +42,19 @@ pub struct Shell {
     /// the system's appearance change.
     applied_mode: Option<(gpui_kit::component::ThemeMode, String)>,
     _appearance: gpui_kit::Subscription,
+    /// TODO: Markdown buffers shouldn't show rendered in normal mode, only in preview mode, or preview pane. 
     /// Markdown buffers shown rendered (in normal state): their gpui-kit
     /// view, the text it last got and the cursor line it last revealed.
     md_views: std::collections::HashMap<crate::editor::BufferId, MdView>,
+    /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
+    /// parsed from, and the cursor line it last selected.
+    review_view: Option<ReviewView>,
+}
+
+struct ReviewView {
+    state: gpui_kit::Entity<gpui_kit::component::diff::DiffState>,
+    revision: u64,
+    selected: Option<usize>,
 }
 
 struct MdView {
@@ -101,6 +111,7 @@ impl Shell {
             applied_mode: None,
             _appearance: appearance,
             md_views: Default::default(),
+            review_view: None,
         };
         shell.apply_theme(window, cx);
         shell
@@ -802,6 +813,42 @@ impl Render for Shell {
         let live: std::collections::HashSet<crate::editor::BufferId> = st.buffer_ids().into_iter().collect();
         self.md_views.retain(|id, _| live.contains(id));
 
+        // *agent-review* as gpui-kit's Diff, the cursor's row selected in it.
+        let review_state = st.review_buffer_id().filter(|id| rects.iter().any(|(w, _)| st.window_by_id(*w).is_some_and(|w| w.buffer == *id))).map(|id| {
+            use gpui_kit::component::diff::{DiffFile, DiffLinePosition, DiffLineRange, DiffSide, DiffState};
+            let buffer = st.buffer_by_id(id).expect("checked above");
+            let revision = buffer.revision();
+            let patch: String = buffer.text().to_string().lines().filter(|l| !l.is_empty() && *l != "Nothing to review.").map(|l| format!("{l}\n")).collect();
+            let files = DiffFile::parse(&patch).unwrap_or_default();
+            let view = self.review_view.get_or_insert_with(|| {
+                let files = files.clone();
+                let state = gpui_kit::AppContext::new(cx, |cx| DiffState::new(files, cx));
+                ReviewView { state, revision, selected: None }
+            });
+            if view.revision != revision {
+                view.revision = revision;
+                view.selected = None;
+                view.state.update(cx, |s, cx| s.set_files(files, cx));
+            }
+            let window_line = rects
+                .iter()
+                .find_map(|(w, _)| st.window_by_id(*w).filter(|w| w.buffer == id).map(|w| w.id))
+                .map(|w| buffer.text().char_to_line(st.window_point(w).min(buffer.len())))
+                .unwrap_or(0);
+            if view.selected != Some(window_line) {
+                view.selected = Some(window_line);
+                if let Some(Some(row)) = st.review_rows.get(window_line) {
+                    let side = if row.modified { DiffSide::Modified } else { DiffSide::Original };
+                    let (rel, line) = (row.rel.clone(), row.line);
+                    view.state.update(cx, |s, cx| {
+                        s.set_selected_lines(Some(DiffLineRange::new(rel.clone(), side, line, line)), cx);
+                        s.scroll_to_line(DiffLinePosition::new(rel, side, line), cx);
+                    });
+                }
+            }
+            view.state.clone()
+        });
+
         let syntax_theme = self.lisp.syntax_theme();
         let syntax = &mut self.syntax;
         let theme = cx.theme();
@@ -822,6 +869,17 @@ impl Render for Shell {
                 (!marks.is_empty()).then_some((*id, marks))
             })
             .collect();
+
+        // Lines with your comments on them, per window.
+        let comment_marks: std::collections::HashMap<crate::editor::WindowId, Vec<usize>> = rects
+            .iter()
+            .filter_map(|(id, _)| {
+                let lines = st.comment_lines(st.window_by_id(*id)?.buffer);
+                (!lines.is_empty()).then_some((*id, lines))
+            })
+            .collect();
+        let comments: Vec<crate::editor::ReviewComment> = st.review_comments.clone();
+        let review_id = st.review_buffer_id();
 
         let windows: Vec<_> = rects
             .iter()
@@ -965,6 +1023,10 @@ impl Render for Shell {
                         .when(deleted_above, |d| d.child(
                             div().absolute().left(px(-6.)).right_0().top_0().h(px(2.)).bg(theme.red),
                         ))
+                        // A comment on this line: a yellow mark in the margin.
+                        .when(comment_marks.get(id).is_some_and(|l| l.contains(&i)), |d| d.child(
+                            div().absolute().left(px(-6.)).top(px(3.)).w(px(4.)).h(px(10.)).rounded(px(1.)).bg(theme.yellow),
+                        ))
                         .child(row)
                     })
                     .collect();
@@ -982,9 +1044,60 @@ impl Render for Shell {
                         .h(px(r.h * area))
                         .when(r.x > 0., |d| d.border_l_1().border_color(theme.border))
                         .when(is_sidebar, |d| d.bg(theme.sidebar))
-                        .child(match rendered.get(id) {
+                        .child(match (rendered.get(id), review_state.as_ref().filter(|_| Some(w.buffer) == review_id)) {
+                            (_, Some(state)) => {
+                                use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffLinePosition, DiffSide};
+                                let annotations: Vec<DiffAnnotation> = comments
+                                    .iter()
+                                    .map(|c| {
+                                        let side = if c.at.modified { DiffSide::Modified } else { DiffSide::Original };
+                                        DiffAnnotation::line(gpui_kit::SharedString::from(format!("comment-{}", c.id)), DiffLinePosition::new(c.at.rel.clone(), side, c.at.line))
+                                    })
+                                    .collect();
+                                let texts: std::collections::HashMap<String, String> =
+                                    comments.iter().map(|c| (format!("comment-{}", c.id), c.text.clone())).collect();
+                                let editor_add = self.editor.clone();
+                                let editor_click = self.editor.clone();
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(
+                                        Diff::new(state)
+                                            .size_full()
+                                            .annotations(annotations)
+                                            .render_annotation(move |a, _, cx| {
+                                                let t = cx.theme();
+                                                let text = texts.get(&a.id().to_string()).cloned().unwrap_or_default();
+                                                h_flex()
+                                                    .gap(px(8.))
+                                                    .px(px(10.))
+                                                    .py(px(6.))
+                                                    .border_l_2()
+                                                    .border_color(t.yellow)
+                                                    .bg(t.yellow.opacity(0.08))
+                                                    .child(div().text_color(t.yellow).child("comment"))
+                                                    .child(div().child(text))
+                                            })
+                                            // The + beside a hovered line: a comment on it.
+                                            .on_add_annotation(move |range, window, _| {
+                                                let side = if range.side() == DiffSide::Modified { "modified" } else { "original" };
+                                                editor_add.lock().push_event(
+                                                    "lua-event",
+                                                    vec!["review_comment_at".into(), range.path().to_string(), side.into(), range.start().to_string()],
+                                                );
+                                                window.refresh();
+                                            })
+                                            // A click puts the cursor on that row.
+                                            .on_line_click(move |pos, _, window, _| {
+                                                editor_click.lock().review_select(pos.path(), pos.side() == DiffSide::Modified, pos.line());
+                                                window.refresh();
+                                            }),
+                                    )
+                                    .into_any_element()
+                            }
+                            (Some(state), None) => {
                             // Rendered Markdown: images, code blocks, tables, HTML.
-                            Some(state) => {
+
                                 let folder = buffer.file().and_then(|f| f.parent()).map(|d| d.to_path_buf()).unwrap_or_default();
                                 div()
                                     .flex_1()
@@ -1005,7 +1118,7 @@ impl Render for Shell {
                                     )
                                     .into_any_element()
                             }
-                            None => v_flex().flex_1().overflow_hidden().px(px(8.)).children(lines).into_any_element(),
+                            (None, None) => v_flex().flex_1().overflow_hidden().px(px(8.)).children(lines).into_any_element(),
                         })
                         .child(
                             h_flex()

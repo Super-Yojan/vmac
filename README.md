@@ -256,7 +256,16 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   the cursor, `gx` rejects it (the old lines come back and are saved; `u`
   undoes that). `SPC a r` lists every change as a diff in `*agent-review*`,
   where the same keys work and `RET` goes to one; `SPC a A` and `SPC a X`
-  accept or reject them all. `*agent*` counts what's left. To accept edits
+  accept or reject them all. `*agent*` counts what's left.
+  `*agent-review*` is drawn with gpui-kit's Diff (word-level changes, line
+  numbers, a header per file); Vim keys move through it, and the line under
+  the cursor is selected in it.
+- **Comment, and let it revise.** `gc` comments on the line under the
+  cursor, in the review or in any file (`c` in the review, or the Diff's `+`
+  beside a hovered line). Comments show under their line in the review and
+  as a yellow mark in the file; `gC` deletes them. `SPC a S` (`S` in the
+  review) sends them all to the agent, each with the code it's on, asking
+  it to revise its changes by them. This works with ACP and CLI agents alike. To accept edits
   as they're made: `(set-agent-review #f)` or `vmac.set_agent_review(false)`.
 - **When it needs permission** (to edit, to run a command, to start coding
   after a plan), `*agent*` shows the question with what it's about (the

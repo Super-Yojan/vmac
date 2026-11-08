@@ -21,6 +21,7 @@ use steel::steel_vm::register_fn::RegisterFn;
 /// checkout, so edits there load on the next start.
 const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("agents.lua", include_str!("../lua/core/agents.lua")),
+    ("review.lua", include_str!("../lua/core/review.lua")),
 ];
 
 /// The Lua core's files, in name order: (name, code).
@@ -547,6 +548,10 @@ impl Lisp {
             if let Err(e) = self.engine.call_function_by_name_with_args(&name, vec![list]) {
                 self.editor.lock().message = format!("{name}: {e}");
             }
+            // What the handler queued (a Lua prompt's minibuffer) happens now,
+            // not on the next key.
+            self.run_pending_scheme();
+            self.run_pending_evals();
         }
         any
     }
@@ -1016,6 +1021,17 @@ end
 --   read(handle) -> the screen as text
 --   alive(handle) -> bool     (optional)
 --   kill(handle)              (optional; also called for attached terminals)
+-- vmac.prompt(label, fn, initial): asks for a line in the minibuffer and
+-- calls fn with it (when you press RET; ESC drops it).
+function vmac.prompt(label, fn, initial)
+  vmac.hooks._prompt = function(text) fn(text) end
+  local code = "(read-from-minibuffer " .. quote(label) .. " (lambda (text) (lua-hook \"_prompt\" (list text))))"
+  if initial and initial ~= "" then
+    code = code .. " (insert " .. quote(initial) .. ")"
+  end
+  vmac.scheme(code)
+end
+
 -- Agent backends: vmac.agent_backend("codex", { command = "codex-acp" })
 -- (or just the command line) for an ACP agent in *agent*, or
 -- { terminal = "pi", resume = "pi --resume {id}" } for a CLI agent in a
@@ -1680,6 +1696,29 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "dashboard-project", |s, n: isize| s.dashboard_project(n.max(0) as usize));
     // Reviewing the agent's changes.
     prim!(reg, editor, "review-show", |s| s.review_show());
+    // Comments on lines, sent to the agent to revise by.
+    prim!(reg, editor, "review-comment-add", |s, text: String| s.review_comment_add(&text));
+    prim!(reg, editor, "review-comment-at-line", |s, rel: String, modified: bool, line: isize, text: String| {
+        s.review_comment_at_line(&rel, modified, line.max(1) as usize, &text)
+    });
+    prim!(reg, editor, "review-comment-delete", |s| s.review_comment_delete());
+    prim!(reg, editor, "review-comments-send", |s| s.review_comments_send());
+    prim!(reg, editor, "review-comment-count", |s| s.review_comments.len() as isize);
+    prim!(reg, editor, "review-comment-text-here", |s| {
+        // The comments on the line under the cursor, joined.
+        let line = s.buffer().line();
+        let file = s.buffer().file().cloned();
+        let row = if s.review_here() { s.review_rows.get(line).cloned().flatten() } else { None };
+        s.review_comments
+            .iter()
+            .filter(|c| match &row {
+                Some(r) => c.at.path == r.path && c.at.modified == r.modified && c.at.line == r.line,
+                None => c.at.modified && Some(&c.at.path) == file.as_ref() && c.at.line == line + 1,
+            })
+            .map(|c| c.text.clone())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    });
     prim!(reg, editor, "review-here?", |s| s.review_here());
     prim!(reg, editor, "review-visit", |s| s.review_visit());
     prim!(reg, editor, "review-decide", |s, accept: bool| s.review_decide(accept));
@@ -3195,16 +3234,27 @@ mod tests {
         typed(&mut lisp, " ar");
         assert_eq!(editor.lock().buffer().name(), "*agent-review*");
         let review = text(&editor);
-        assert!(review.contains("a.txt  (1 change)\n@@ line 6\n+ added"), "{review}");
-        assert!(review.contains("b.txt  (3 changes)\n@@ line 2\n- two\n+ TWO"), "{review}");
+        assert!(review.contains("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -3,3 +3,4 @@\n three\n four\n five\n+added"), "{review}");
+        assert!(review.contains("@@ -1,5 +1,5 @@\n one\n-two\n+TWO\n three\n-four"), "{review}");
+        // gpui-kit's Diff reads it: one file each.
+        let patch: String = review.lines().filter(|l| !l.is_empty()).map(|l| format!("{l}\n")).collect();
+        let files = gpui_kit::component::diff::DiffFile::parse(&patch).expect("a patch gpui-kit parses");
+        assert_eq!(files.iter().map(|f| f.path().to_string()).collect::<Vec<_>>(), vec!["a.txt", "b.txt"]);
         typed(&mut lisp, "gg]h");
         typed(&mut lisp, "gx");
         assert_eq!(disk(&file), "one\nTWO\nthree\nfour\nfive\n", "rejected from the list");
         assert!(!text(&editor).contains("a.txt"), "{}", text(&editor));
-        typed(&mut lisp, "]h");
+        typed(&mut lisp, "gg]h");
+        assert_eq!(text(&editor).lines().nth(editor.lock().buffer().line()), Some("-two"));
         lisp.dispatch_key("RET", "");
         assert_eq!(editor.lock().buffer().name(), "b.txt");
-        assert_eq!(editor.lock().buffer().line(), 1, "RET went to the change");
+        assert_eq!(editor.lock().buffer().line(), 1, "RET on a removed line goes to where it was");
+        typed(&mut lisp, " ar");
+        let added = text(&editor).lines().position(|l| l == "+added").unwrap();
+        let pos = editor.lock().buffer().line_to_pos(added);
+        editor.lock().buffer_mut().goto_char(pos);
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().line(), 4, "RET on an added line goes to that line");
 
         // SPC a A takes the rest.
         typed(&mut lisp, " aA");
@@ -3678,6 +3728,82 @@ for line in sys.stdin:
         assert!(pump(&mut lisp, &|s| s.buffer_text_named("*claude-cli*").is_some_and(|t| t.contains("resumed sess-42"))),
             "{:?}", editor.lock().buffer_text_named("*claude-cli*"));
         typed(&mut lisp, " ak");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn comments_on_changes_go_to_the_agent() {
+        let dir = std::env::temp_dir().join(format!("vmac-review-comments-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let file = dir.join("b.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().agent_config = config;
+        editor.lock().open_file(&file).unwrap();
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
+            for _ in 0..250 {
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&mut editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        editor.lock().agent_prompt(&format!("patch {}", file.display()));
+        assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.review_count() == 3));
+
+        // The review's rows know their file line: "-two" is old line 2, "+TWO" new line 2.
+        typed(&mut lisp, " ar");
+        let review = text(&editor);
+        let row_of = |needle: &str| review.lines().position(|l| l == needle).unwrap();
+        let rows = editor.lock().review_rows.clone();
+        let at = |r: &Option<crate::editor::ReviewRow>| r.as_ref().map(|r| (r.rel.clone(), r.modified, r.line));
+        assert_eq!(at(&rows[row_of("-two")]), Some(("b.txt".into(), false, 2)));
+        assert_eq!(at(&rows[row_of("+TWO")]), Some(("b.txt".into(), true, 2)));
+
+        // c in the review comments on the row under the cursor.
+        let pos = editor.lock().buffer().line_to_pos(row_of("+TWO"));
+        editor.lock().buffer_mut().goto_char(pos);
+        typed(&mut lisp, "c");
+        typed(&mut lisp, "keep it lowercase");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().review_comments.len(), 1, "{}", editor.lock().message);
+
+        // gc in the file, on line 5; the + button in the Diff (through Lua).
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, "4jgc");
+        typed(&mut lisp, "why move this?");
+        lisp.dispatch_key("RET", "");
+        let id = editor.lock().window().buffer;
+        assert_eq!(editor.lock().comment_lines(id), vec![1, 4], "marked in the file");
+        editor.lock().push_event("lua-event", vec!["review_comment_at".into(), "b.txt".into(), "original".into(), "4".into()]);
+        lisp.run_events();
+        typed(&mut lisp, "bring four back");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().review_comments.len(), 3);
+        // gC deletes the one on this line.
+        typed(&mut lisp, "gC");
+        assert_eq!(editor.lock().review_comments.len(), 2);
+        typed(&mut lisp, "gg4jgc");
+        typed(&mut lisp, "why add this?");
+        lisp.dispatch_key("RET", "");
+
+        // SPC a S: sent to the agent, with the code they're on; then cleared.
+        typed(&mut lisp, " aS");
+        assert!(editor.lock().review_comments.is_empty());
+        assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("You said: Please revise"))));
+        let t = editor.lock().agent.as_ref().unwrap().transcript();
+        assert!(t.contains("› Revise by my 3 review comments"), "{t}");
+        assert!(t.contains("- `b.txt:2`: keep it lowercase"), "{t}");
+        assert!(t.contains("> `TWO`"), "with the code: {t}");
+        assert!(t.contains("- `b.txt:4` (the old version): bring four back"), "{t}");
+        assert!(t.contains("> `four`"), "the old side's code: {t}");
+        assert!(t.contains("- `b.txt:5`: why add this?"), "{t}");
+        typed(&mut lisp, " aS");
+        assert!(editor.lock().message.contains("No comments to send"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
