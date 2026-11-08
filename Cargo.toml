@@ -14,12 +14,14 @@ edition = "2024"
 # The window. Without it (--no-default-features) vmac is only the server, for
 # remote machines: `vmac connect` installs that one.
 default = ["gui"]
-gui = ["dep:gpui-kit"]
+gui = ["dep:gpui-kit", "dep:image", "dep:objc2-core-graphics", "dep:objc2-core-foundation"]
 
 [dependencies]
 anyhow = "1.0.104"
 fuzzy-matcher = "0.3"
 gpui-kit = { version = "=0.8.0", optional = true }
+# PDF pages handed to GPUI as pictures.
+image = { version = "0.25", default-features = false, optional = true }
 ignore = "0.4"
 libc = "0.2"
 libloading = "0.8"
@@ -42,3 +44,16 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
+
+# PDF pages drawn by macOS's CoreGraphics.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFURL", "CFCGTypes"], optional = true }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGImage",
+    "CGPDFDocument",
+    "CGPDFPage",
+], optional = true }

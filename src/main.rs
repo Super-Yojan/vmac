@@ -27,6 +27,10 @@ mod projects;
 mod remote;
 mod remote_agent;
 #[cfg(feature = "gui")]
+mod media;
+#[cfg(feature = "gui")]
+mod pdf;
+#[cfg(feature = "gui")]
 mod shell;
 mod syntax;
 mod terminal;

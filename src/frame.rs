@@ -149,6 +149,26 @@ pub enum Content {
     /// cursor's line, and the folder images are found from.
     Markdown { source: String, revision: u64, cursor_line: usize, folder: PathBuf },
     Review(ReviewView),
+    /// An image or a PDF, drawn by the window from the file.
+    Media { path: PathBuf, kind: MediaKind },
+}
+
+/// Files shown as what they are rather than as text.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Pdf,
+}
+
+/// Whether a file is an image or a PDF, by its extension. SVG is left out:
+/// it is text, and edited as such.
+pub fn media_kind(path: &std::path::Path) -> Option<MediaKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" => Some(MediaKind::Image),
+        "pdf" => Some(MediaKind::Pdf),
+        _ => None,
+    }
 }
 
 /// *agent-review*, drawn as a diff.

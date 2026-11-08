@@ -370,10 +370,12 @@ impl Session {
                     })
                     .unwrap_or_default();
                 let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
-                let is_custom = rendered.contains(id) || (review_id.is_some() && Some(w.buffer) == review_id);
+                let media = buffer.file().and_then(|f| crate::frame::media_kind(f).map(|k| (f.clone(), k)));
+                let is_custom =
+                    rendered.contains(id) || media.is_some() || (review_id.is_some() && Some(w.buffer) == review_id);
                 // Line numbers, in a gutter: for files, when they're on.
                 let numbers = match st.line_numbers.as_str() {
-                    "on" | "relative" if buffer.file().is_some() && !is_sidebar && !rendered.contains(id) => {
+                    "on" | "relative" if buffer.file().is_some() && !is_sidebar && !is_custom => {
                         Some(st.line_numbers == "relative")
                     }
                     _ => None,
@@ -398,6 +400,8 @@ impl Session {
 
                 let content = if let Some(review) = review.as_ref().filter(|_| Some(w.buffer) == review_id) {
                     Content::Review(review.clone())
+                } else if let Some((path, kind)) = media {
+                    Content::Media { path, kind }
                 } else if rendered.contains(id) {
                     Content::Markdown {
                         source: text.to_string(),
@@ -769,6 +773,23 @@ mod tests {
             Content::Text(lines) => lines,
             other => panic!("not text: {other:?}"),
         }
+    }
+
+    #[test]
+    fn images_and_pdfs_are_left_for_the_window_to_draw() {
+        use crate::frame::MediaKind;
+        let mut s = session_with("");
+        let path = std::env::temp_dir().join(format!("vmac-session-{}.pdf", std::process::id()));
+        std::fs::write(&path, b"%PDF-1.4").unwrap();
+        s.editor.lock().open_file(&path).unwrap();
+        let frame = s.frame(VIEW);
+        match &frame.windows[0].content {
+            Content::Media { path: shown, kind } => {
+                assert_eq!((shown.as_path(), *kind), (std::path::absolute(&path).unwrap().as_path(), MediaKind::Pdf))
+            }
+            other => panic!("not media: {other:?}"),
+        }
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

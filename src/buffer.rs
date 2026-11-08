@@ -75,7 +75,9 @@ impl Buffer {
     /// its file (and project) whatever the working directory.
     pub fn from_file(path: PathBuf) -> std::io::Result<Self> {
         let path = std::path::absolute(&path).unwrap_or(path);
-        let text = match std::fs::read_to_string(&path) {
+        // Images and PDFs aren't read as text: the window draws them.
+        let media = crate::frame::media_kind(&path).is_some();
+        let text = match if media { Ok(String::new()) } else { std::fs::read_to_string(&path) } {
             Ok(s) => Rope::from_str(&s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Rope::new(),
             Err(e) => return Err(e),
@@ -91,7 +93,7 @@ impl Buffer {
             goal_column: None,
             file: Some(path),
             modified: false,
-            read_only: false,
+            read_only: media,
             faces: Vec::new(),
             edit: 0,
             edits_made: 0,
@@ -109,6 +111,10 @@ impl Buffer {
             .file
             .clone()
             .ok_or_else(|| std::io::Error::other("buffer has no file"))?;
+        // Its text is empty, not the file's: writing it would wipe the file.
+        if crate::frame::media_kind(&path).is_some() {
+            return Err(std::io::Error::other("an image or PDF can't be saved"));
+        }
         std::fs::write(&path, self.text.to_string())?;
         self.modified = false;
         self.saves += 1;
@@ -528,6 +534,23 @@ mod tests {
         let b = Buffer::from_file(PathBuf::from("Cargo.toml")).unwrap();
         assert!(b.file().unwrap().is_absolute());
         assert_eq!(b.name(), "Cargo.toml");
+    }
+
+    #[test]
+    fn images_and_pdfs_open_read_only_and_are_never_written() {
+        let dir = std::env::temp_dir().join(format!("vmac-media-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["logo.png", "paper.PDF"] {
+            let path = dir.join(name);
+            let bytes = [0x89u8, b'P', b'N', b'G', 0xff, 0x00];
+            std::fs::write(&path, bytes).unwrap();
+            let mut b = Buffer::from_file(path.clone()).expect("binary files open");
+            assert!(b.is_read_only() && b.text().len_chars() == 0, "{name}");
+            assert!(b.save().is_err(), "{name}: saving would wipe it");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}: untouched");
+        }
+        assert_eq!(Buffer::from_file(dir.join("icon.svg")).unwrap().is_read_only(), false, "SVG is text");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

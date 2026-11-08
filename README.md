@@ -452,6 +452,16 @@ A plugin is just config that can be shared: `vmac.command` and
 `vmac.map`, like init.lua. To publish one, put
 its folder in a git repository.
 
+## Images and PDFs
+
+Opening an image (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.ico`)
+shows it, as large as the window allows and never larger than it is. A PDF
+shows its pages one under the other, to scroll through with the trackpad or
+wheel; pages are drawn as they come into view, and a PDF that changes on disk
+(rebuilt by LaTeX, say) reloads where you were. Both are read-only, and `:w`
+won't write them. SVG files open as text. PDFs need macOS (CoreGraphics draws
+them), and both show only in a window on the machine that has the file.
+
 ## Markdown
 
 `.md` files are styled in place, still fully editable: headings are larger,

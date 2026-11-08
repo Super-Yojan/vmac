@@ -4,7 +4,7 @@
 //! keys do, and holds none of the editor's state.
 
 use crate::frame::{
-    CHAR_WIDTH, Content, Echo, FONT_SIZE, Face, Frame, FrameLine, FrameWindow, Input, Mods, PickerView, ROW_HEIGHT,
+    CHAR_WIDTH, Content, Echo, FONT_SIZE, Face, Frame, FrameLine, FrameWindow, Input, MediaKind, Mods, PickerView, ROW_HEIGHT,
     ThemeRequest, Viewport, WindowId,
 };
 use crate::server::{Host, LSP_POLL, RELOAD_POLL, TERMINAL_POLL};
@@ -38,6 +38,8 @@ pub struct Shell {
     /// the default hides the markup instead): their gpui-kit
     /// view, the text it last got and the cursor line it last revealed.
     md_views: std::collections::HashMap<crate::frame::BufferId, MdView>,
+    /// PDFs shown in windows, by buffer: their pages, drawn as they come into view.
+    pdf_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::media::PdfView>>,
     /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
     /// parsed from, and the cursor line it last selected.
     review_view: Option<ReviewView>,
@@ -163,6 +165,7 @@ impl Shell {
             told_dark: None,
             _appearance: appearance,
             md_views: Default::default(),
+            pdf_views: Default::default(),
             review_view: None,
             hits: Vec::new(),
             modal: false,
@@ -365,6 +368,27 @@ impl Shell {
         let (line, col, _) = hit.at(x, y);
         let mods = mouse_mods(&event.modifiers);
         self.send(Input::Wheel { window: hit.id, lines: n as isize, line, col, mods }, cx);
+    }
+
+    /// The PDF view of a buffer, made the first time and read again when
+    /// the file changes.
+    fn pdf_view(
+        &mut self,
+        buffer: crate::frame::BufferId,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Entity<crate::media::PdfView> {
+        let stale = self.pdf_views.get(&buffer).is_some_and(|v| v.read(cx).path() != path);
+        if stale {
+            self.pdf_views.remove(&buffer);
+        }
+        let view = self
+            .pdf_views
+            .entry(buffer)
+            .or_insert_with(|| gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf())))
+            .clone();
+        view.update(cx, |v, cx| v.refresh(cx));
+        view
     }
 
     /// Keeps the rendered Markdown view of a buffer in step with its text,
@@ -895,6 +919,7 @@ impl Render for Shell {
         self.modal = frame.modal;
         let live: std::collections::HashSet<_> = frame.buffers.iter().copied().collect();
         self.md_views.retain(|id, _| live.contains(id));
+        self.pdf_views.retain(|id, _| live.contains(id));
 
         let this = cx.entity().downgrade();
         let windows: Vec<_> = frame
@@ -983,6 +1008,11 @@ impl Render for Shell {
                                     }),
                             )
                             .into_any_element()
+                    }
+                    Content::Media { path, kind: MediaKind::Image } => crate::media::image_element(path, cx),
+                    Content::Media { path, kind: MediaKind::Pdf } => {
+                        let view = self.pdf_view(w.buffer, path, cx);
+                        div().flex_1().overflow_hidden().child(view).into_any_element()
                     }
                     Content::Text(lines) => v_flex()
                         .flex_1()
