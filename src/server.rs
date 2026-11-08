@@ -64,6 +64,8 @@ pub trait Host {
     fn take_notices(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// The machines the window knows, and how each is (SPC S m lists them).
+    fn set_machines(&mut self, _machines: Vec<crate::machines::MachineInfo>) {}
 }
 
 /// What a session asks of the window it's shown in.
@@ -77,6 +79,9 @@ pub enum WindowRequest {
     Last,
     /// Kill another machine's session.
     Kill { name: String, force: bool },
+    /// Check how the remembered machines are, or forget one.
+    CheckMachines,
+    ForgetMachine(String),
 }
 
 impl Host for Server {
@@ -114,6 +119,9 @@ impl Host for Server {
     }
     fn take_notices(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notices)
+    }
+    fn set_machines(&mut self, machines: Vec<crate::machines::MachineInfo>) {
+        Server::set_machines(self, machines)
     }
     fn switch_to(&mut self, name: &str) {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
@@ -255,6 +263,18 @@ impl Server {
         }
     }
 
+    /// The machines the window knows: each session gets them, and hears
+    /// that they changed (an open machines picker shows them anew).
+    pub fn set_machines(&mut self, machines: Vec<crate::machines::MachineInfo>) {
+        for e in &self.list {
+            let mut st = e.session.editor().lock();
+            if st.machines != machines {
+                st.machines = machines.clone();
+                st.push_event("machines-changed", Vec::new());
+            }
+        }
+    }
+
     /// Each session: its project, buffers and unsaved files.
     pub fn infos(&self) -> Vec<SessionInfo> {
         self.list
@@ -339,6 +359,8 @@ impl Server {
                 None => self.message(format!("No session {name}")),
             },
             SessionRequest::Connect { host, target } => self.window_requests.push(WindowRequest::Connect { host, target }),
+            SessionRequest::CheckMachines => self.window_requests.push(WindowRequest::CheckMachines),
+            SessionRequest::ForgetMachine(host) => self.window_requests.push(WindowRequest::ForgetMachine(host)),
             // In a window with other machines' sessions, it knows which was last.
             SessionRequest::Last if !self.foreign.is_empty() => self.window_requests.push(WindowRequest::Last),
             SessionRequest::Last => match self.last.filter(|id| self.list.iter().any(|e| e.id == *id)) {

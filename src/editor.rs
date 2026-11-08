@@ -398,6 +398,8 @@ pub struct EditorState {
     pub session_names: Vec<String>,
     /// Each of them (named as in `session_names`): project, buffers, unsaved.
     pub session_details: Vec<crate::frame::SessionInfo>,
+    /// The machines the window knows (connected to before), and how each is.
+    pub machines: Vec<crate::machines::MachineInfo>,
     pub session_requests: Vec<SessionRequest>,
     pub in_server: bool,
     pub session_per_project: bool,
@@ -419,6 +421,9 @@ pub enum SessionRequest {
     Project(PathBuf),
     /// Add another machine's sessions to the window (`:connect`).
     Connect { host: String, target: String },
+    /// Check the machines connected to before (SPC S m), or forget one.
+    CheckMachines,
+    ForgetMachine(String),
 }
 
 /// A line of the review: its file, on the new (modified) or old side, 1-based.
@@ -577,6 +582,7 @@ impl EditorState {
             session_name: "main".into(),
             session_names: Vec::new(),
             session_details: Vec::new(),
+            machines: Vec::new(),
             session_requests: Vec::new(),
             in_server: false,
             session_per_project: true,

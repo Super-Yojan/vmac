@@ -1425,6 +1425,16 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "session-rename", |s, name: String| s.session_requests.push(SessionRequest::Rename(name)));
     prim!(reg, editor, "set-session-per-project", |s, on: bool| s.session_per_project = on);
+    // The machines the window knows: {host, how it is, "connected" or ""}.
+    prim!(reg, editor, "machines", |s| s
+        .machines
+        .iter()
+        .map(|m| vec![m.host.clone(), m.state.describe(), if m.connected { "connected".into() } else { String::new() }])
+        .collect::<Vec<Vec<String>>>());
+    prim!(reg, editor, "machines-check", |s| s.session_requests.push(SessionRequest::CheckMachines));
+    prim!(reg, editor, "machine-forget", |s, host: String| s.session_requests.push(SessionRequest::ForgetMachine(host)));
+    prim!(reg, editor, "picker-title", |s| s.picker.as_ref().map(|p| p.title().to_string()).unwrap_or_default());
+
     // Adds another machine's sessions to the window (`vmac connect`'s).
     prim!(reg, editor, "connect", |s, host: String, target: String| {
         s.session_requests.push(SessionRequest::Connect { host, target })

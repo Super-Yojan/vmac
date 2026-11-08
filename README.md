@@ -229,6 +229,10 @@ names it; with several, the modeline starts with `[name]`.
   with its project and files (and how many are unsaved); `RET` goes to one.
 - `SPC S k` kills one, on any machine (not with unsaved files: `SPC S K`
   kills it anyway).
+- `SPC S m` (or `:machines`) lists the machines you've connected to before
+  and how each is: offline, online without a vmac server, or online with its
+  sessions (checked in the background; the list fills in), the connected
+  ones marked. `RET` connects to one. `:forget-machine HOST` drops one.
 - `SPC S c` (or `:connect HOST [TARGET]`) adds another machine's sessions
   to the window, over ssh (see below). The switcher then lists them all:
   this machine's by name, the other's as `host:name`, and, while you're in
@@ -248,6 +252,7 @@ vmac attach ~/git/app  # ... on that project's session (made the first time)
 vmac attach notes      # ... on the session named notes (made if none)
 vmac ls                # the server's sessions, with their projects and files
 vmac ls me@devbox      # ... another machine's
+vmac ls --all          # this machine's and every machine connected to before
 vmac kill-server       # stop it, and everything running in it
 ```
 

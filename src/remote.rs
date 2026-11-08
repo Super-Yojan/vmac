@@ -193,6 +193,8 @@ pub fn connect(host: &str, target: Option<String>, restart: bool) -> Result<Clie
     }
     let (reader, writer, ssh) = dial(host, &path)?;
     let mut client = Client::over(reader, writer, target, PathBuf::new(), ssh)?;
+    // For vmac ls --all and the machines picker (SPC S m).
+    crate::machines::remember(host);
     // A dropped connection (sleep, a network change) is made again.
     let (host, path) = (host.to_string(), path.clone());
     client.set_redial(std::sync::Arc::new(move || dial(&host, &path)));

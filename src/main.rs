@@ -11,6 +11,7 @@ mod daemon;
 mod editor;
 mod lisp;
 mod lsp;
+mod machines;
 mod markdown;
 mod packages;
 mod patch;
@@ -54,6 +55,8 @@ usage: vmac [FILE]              edit FILE (or show the dashboard) in this window
        vmac ls [HOST]           list the server's sessions (HOST's, over ssh):
                                 the active one starred, each one's project,
                                 buffers and unsaved files
+       vmac ls --all            the same for this machine and every machine
+                                connected to before, and which are offline
        vmac kill-server         stop the server and everything in it
        vmac --server            run the server here, without a window
 
@@ -100,7 +103,25 @@ fn main() {
             open_window(Box::new(client));
         }
         Some("proxy") => daemon::proxy(&socket).unwrap_or_else(|e| fail(&e)),
-        Some("ls" | "list") => match args.get(1) {
+        Some("ls" | "list") => match args.get(1).map(String::as_str) {
+            // For other vmacs to read (machines.rs asks a machine this way).
+            Some("--json") => match daemon::list(&socket) {
+                Ok((_, details)) => println!("{}", serde_json::to_string(&details).unwrap_or_default()),
+                Err(_) => fail(&"no server running"),
+            },
+            // This machine's server and every machine connected to before.
+            Some("--all" | "-a") => {
+                match daemon::list(&socket) {
+                    Ok((active, details)) => print!("this machine\n{}", describe_sessions(&active, &details)),
+                    Err(_) => println!("this machine: no server running"),
+                }
+                for (host, state) in machines::check_all(&machines::remembered()) {
+                    match state {
+                        machines::State::Online(sessions) => print!("\n{host}\n{}", describe_sessions("", &sessions)),
+                        other => println!("\n{host}: {}", other.describe()),
+                    }
+                }
+            }
             // Another machine's: its own vmac says.
             Some(host) => print!("{}", remote::list(host).unwrap_or_else(|e| fail(&e))),
             None => match daemon::list(&socket) {

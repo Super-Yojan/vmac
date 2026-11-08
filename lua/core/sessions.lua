@@ -10,6 +10,8 @@
 --   SPC S k   kill a session (any machine's) SPC S K   kill it, unsaved files and all
 --   SPC S c   connect to another machine (:connect HOST [TARGET]), over
 --             ssh: its sessions join this window's
+--   SPC S m   the machines connected to before (:machines): which are
+--             online and their sessions; RET connects. :forget-machine HOST
 --
 -- The switcher lists every machine's sessions: this machine's by name,
 -- another's as host:name (and, from another machine, this one's as
@@ -99,7 +101,54 @@ core.ex_commands["connect"] = function(arg)
   if arg == "" then core.call_binding("connect-command") else connect(arg) end
 end
 
+-- SPC S m: the machines connected to before, how each is (checked in the
+-- background: the list fills in as answers come), the connected ones
+-- marked. RET connects to one (or shows it, when connected).
+local MACHINES = "Machines (RET connects)"
+
+local function machine_rows()
+  local list = vmac.machines()
+  local width = 0
+  for _, m in ipairs(list) do width = math.max(width, utf8.len(m[1]) or #m[1]) end
+  local rows, hosts = {}, {}
+  for _, m in ipairs(list) do
+    local mark = m[3] == "connected" and "● " or "  "
+    local row = mark .. m[1] .. string.rep(" ", width - (utf8.len(m[1]) or #m[1])) .. "   " .. m[2]
+    rows[#rows + 1] = row
+    hosts[row] = m[1]
+  end
+  return rows, hosts
+end
+
+local function open_machines()
+  local rows, hosts = machine_rows()
+  if #rows == 0 then
+    return vmac.message("No machines yet: SPC S c connects to one")
+  end
+  vmac.pick(MACHINES, rows, function(row) vmac.connect(hosts[row], "") end)
+end
+
+vmac.command("machines-command", function()
+  vmac.machines_check()
+  open_machines()
+end)
+core.ex_commands["machines"] = function() core.call_binding("machines-command") end
+core.ex_commands["forget-machine"] = function(host)
+  if host == "" then return vmac.message("Forget which machine? (:forget-machine HOST)") end
+  vmac.machine_forget(host)
+end
+
+-- Answers came: the open list shows them.
+core.events["machines-changed"] = function()
+  if vmac.picker_active() and vmac.picker_title() == MACHINES then
+    core.close_picker()
+    vmac.minibuffer_close()
+    open_machines()
+  end
+end
+
 vmac.map("normal", "SPC S c", "connect-command")
+vmac.map("normal", "SPC S m", "machines-command")
 vmac.map("normal", "SPC S s", "session-switch-command")
 vmac.map("normal", "SPC S a", "session-list-command")
 vmac.map("normal", "SPC S l", "session-last-command")

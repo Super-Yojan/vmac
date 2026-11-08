@@ -14,6 +14,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 struct Machine {
     /// "" for the window's own; else the host connected to, without user@.
     label: String,
+    /// As connected to ("me@devbox"); "" for the window's own.
+    address: String,
     host: Box<dyn Host>,
 }
 
@@ -29,22 +31,95 @@ pub struct Hosts {
     /// (machine's label, session).
     shown: Option<(String, String)>,
     last: Option<(String, String)>,
+    /// The machines connected to before (machines.rs), how each was found,
+    /// and checks of them under way in the background.
+    known: Vec<crate::machines::MachineInfo>,
+    checked: Receiver<Vec<(String, crate::machines::State)>>,
+    check: Sender<Vec<(String, crate::machines::State)>>,
+    checking: bool,
+    /// Where the remembered machines come from (machines.rs; tests' own).
+    remembered: fn() -> Vec<String>,
 }
 
 const LOCAL: &str = "local";
 
 impl Hosts {
     pub fn new(home: Box<dyn Host>) -> Self {
+        Self::remembering(home, crate::machines::remembered)
+    }
+
+    fn remembering(home: Box<dyn Host>, remembered: fn() -> Vec<String>) -> Self {
         let (connect, connected) = channel();
-        Self {
-            machines: vec![Machine { label: String::new(), host: home }],
+        let (check, checked) = channel();
+        let mut hosts = Self {
+            machines: vec![Machine { label: String::new(), address: String::new(), host: home }],
             active: 0,
             connected,
             connect,
             notice: None,
             shown: None,
             last: None,
+            known: Vec::new(),
+            checked,
+            check,
+            checking: false,
+            remembered,
+        };
+        hosts.check_machines();
+        hosts
+    }
+
+    /// Checks the machines connected to before, in the background.
+    fn check_machines(&mut self) {
+        use crate::machines::{MachineInfo, State};
+        let remembered = (self.remembered)();
+        for host in &remembered {
+            if !self.known.iter().any(|m| &m.host == host) {
+                self.known.push(MachineInfo { host: host.clone(), state: State::Checking, connected: false });
+            }
         }
+        // In the order remembered (the latest first).
+        self.known.sort_by_key(|m| remembered.iter().position(|h| *h == m.host).unwrap_or(usize::MAX));
+        if self.checking || remembered.is_empty() {
+            return;
+        }
+        self.checking = true;
+        let done = self.check.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(crate::machines::check_all(&remembered));
+        });
+    }
+
+    /// Takes finished checks, marks the machines this window has connected
+    /// (with their sessions as they are), and tells every machine's server.
+    fn tend_machines(&mut self) -> bool {
+        use crate::machines::{MachineInfo, State};
+        let before = self.known.clone();
+        while let Ok(results) = self.checked.try_recv() {
+            self.checking = false;
+            for (host, state) in results {
+                if let Some(m) = self.known.iter_mut().find(|m| m.host == host) {
+                    m.state = state;
+                }
+            }
+        }
+        for m in &mut self.known {
+            m.connected = false;
+        }
+        for machine in self.machines.iter().skip(1) {
+            let state = State::Online(machine.host.sessions());
+            match self.known.iter_mut().find(|m| m.host == machine.address) {
+                Some(m) => {
+                    m.state = state;
+                    m.connected = true;
+                }
+                None => self.known.insert(0, MachineInfo { host: machine.address.clone(), state, connected: true }),
+            }
+        }
+        for machine in &mut self.machines {
+            machine.host.set_machines(self.known.clone());
+        }
+        self.known != before
     }
 
     /// `name` (a session of machine `of`) as machine `seen_from` lists it.
@@ -102,7 +177,7 @@ impl Hosts {
                 Ok(client) => {
                     let label = self.label_for(&host);
                     self.notice = Some(format!("Connected to {host}"));
-                    self.machines.push(Machine { label, host: Box::new(client) });
+                    self.machines.push(Machine { label, address: host.clone(), host: Box::new(client) });
                     self.active = self.machines.len() - 1;
                 }
                 Err(e) => self.notice = Some(format!("{host}: {e}")),
@@ -121,6 +196,15 @@ impl Hosts {
                     },
                     WindowRequest::Connect { host, target } => self.start_connect(host, target),
                     WindowRequest::Last => self.go_back(),
+                    WindowRequest::CheckMachines => self.check_machines(),
+                    WindowRequest::ForgetMachine(host) => {
+                        self.known.retain(|m| m.host != host);
+                        self.notice = Some(if crate::machines::forget(&host) {
+                            format!("Forgot {host}")
+                        } else {
+                            format!("{host} wasn't remembered")
+                        });
+                    }
                     WindowRequest::Kill { name, force } => match self.find(&name, i) {
                         Some((machine, session)) => self.machines[machine].host.kill_session(&session, force),
                         None => self.notice = Some(format!("No session {name}")),
@@ -152,6 +236,7 @@ impl Hosts {
             }
         }
         self.tell_foreign();
+        changed |= self.tend_machines();
         changed
     }
 
@@ -291,7 +376,7 @@ impl Host for Hosts {
 impl Hosts {
     /// Another machine, as :connect adds one.
     fn add(&mut self, label: &str, host: Box<dyn Host>) {
-        self.machines.push(Machine { label: label.into(), host });
+        self.machines.push(Machine { label: label.into(), address: label.into(), host });
         self.tend();
     }
 }
@@ -383,7 +468,8 @@ mod tests {
                 while UnixStream::connect(&socket).is_err() {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                let mut hosts = Hosts::new(Box::new(Server::new(fresh(), Box::new(fresh))));
+                let mut hosts =
+                    Hosts::remembering(Box::new(Server::new(fresh(), Box::new(fresh))), || vec!["vmac-no-such-host.invalid".into()]);
                 let far = Client::attach(&socket, Some("notes".into())).unwrap();
                 hosts.add("box", Box::new(far));
                 let mut seen = Vec::new();
@@ -412,6 +498,17 @@ mod tests {
                 // Every machine's sessions, described.
                 ex(&mut hosts, "lua local t = {} for _, d in ipairs(vmac.session_details()) do t[#t+1] = d[1] .. ':' .. d[3] end print(table.concat(t, ' '))");
                 seen.push(said(&mut hosts));
+                // The machines: the connected one with its sessions, the
+                // unreachable one offline (once its check is back).
+                for _ in 0..100 {
+                    hosts.pump_terminals();
+                    if !hosts.checking {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                ex(&mut hosts, "lua local t = {} for _, m in ipairs(vmac.machines()) do t[#t+1] = m[1] .. '=' .. m[2] .. '=' .. m[3] end print(table.concat(t, ' / '))");
+                seen.push(said(&mut hosts));
                 // Killing the other machine's session from this one's switcher.
                 ex(&mut hosts, "lua vmac.session_kill('box:notes', false)");
                 seen.push(said(&mut hosts));
@@ -432,8 +529,9 @@ mod tests {
         assert_eq!(seen[5], "1 notes", "SPC S l goes back to the other machine's session");
         assert_eq!(seen[6], "0 main", "and back again");
         assert_eq!(seen[7], "main:0 box:main:0 box:notes:0", "each with its files");
-        assert_eq!(seen[8], "Killed session notes", "the other machine says what came of it");
-        assert_eq!(seen[9], "main", "gone from there");
+        assert_eq!(seen[8], "box=2 sessions: main, notes=connected / vmac-no-such-host.invalid=offline=", "{}", seen[8]);
+        assert_eq!(seen[9], "Killed session notes", "the other machine says what came of it");
+        assert_eq!(seen[10], "main", "gone from there");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

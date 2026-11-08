@@ -49,6 +49,8 @@ pub enum ToServer {
     Switch(String),
     /// Kill this server's session (asked from another machine's switcher).
     Kill { name: String, force: bool },
+    /// The machines the window knows, and how each is.
+    Machines(Vec<crate::machines::MachineInfo>),
     /// A patch didn't fit the frame the window has: send it whole.
     Resync,
     /// Ask for the sessions' names (and then the server hangs up).
@@ -89,7 +91,7 @@ pub enum ToClient {
 /// Bumped when the messages change in a way older servers can't read: each
 /// version has its own socket, so a newer window never talks to an older
 /// server (stop that one with its own `vmac kill-server`).
-const PROTOCOL: u32 = 7;
+const PROTOCOL: u32 = 8;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.
@@ -306,6 +308,10 @@ fn run(
                     }
                     changed = true;
                 }
+                Some(ToServer::Machines(machines)) => {
+                    server.set_machines(machines);
+                    changed = true;
+                }
                 Some(ToServer::List) => {
                     let (active, all) = server.names();
                     client.send(&ToClient::Sessions { active, all, details: server.infos() });
@@ -411,6 +417,7 @@ pub struct Client {
     window_requests: Vec<crate::server::WindowRequest>,
     foreign: Vec<crate::frame::SessionInfo>,
     notices: Vec<String>,
+    machines: Vec<crate::machines::MachineInfo>,
     frame: Option<Frame>,
     /// The frame as JSON, for patches to apply to.
     frame_value: Option<serde_json::Value>,
@@ -478,6 +485,7 @@ impl Client {
             window_requests: Vec::new(),
             foreign: Vec::new(),
             notices: Vec::new(),
+            machines: Vec::new(),
             frame: None,
             frame_value: None,
             viewport: Some(viewport),
@@ -571,6 +579,7 @@ impl Client {
             ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd: PathBuf::new(), viewport, agents: self.remote };
         self.frame_value = None;
         self.foreign.clear();
+        self.machines.clear();
         self.waiting = 1;
         self.send(&hello);
         true
@@ -809,6 +818,13 @@ impl Host for Client {
 
     fn kill_session(&mut self, name: &str, force: bool) {
         self.send(&ToServer::Kill { name: name.to_string(), force });
+    }
+
+    fn set_machines(&mut self, machines: Vec<crate::machines::MachineInfo>) {
+        if machines != self.machines {
+            self.machines = machines.clone();
+            self.send(&ToServer::Machines(machines));
+        }
     }
 
     fn take_notices(&mut self) -> Vec<String> {
