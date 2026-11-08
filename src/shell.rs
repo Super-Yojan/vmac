@@ -47,7 +47,7 @@ impl Shell {
         Self { editor, lisp, focus, syntax: Syntax::default() }
     }
 
-    /// Reloads core.scm / init.scm when they change on disk.
+    /// Reloads lisp/core/ and init.scm when they change on disk.
     fn watch_sources(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {

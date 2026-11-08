@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 fuzzy-matcher = "0.3"
 gpui-kit = "=0.8.0"
 ignore = "0.4"
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 regex = "1"
 ropey = "1.6"
 serde_json = "1"

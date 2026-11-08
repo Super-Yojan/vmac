@@ -195,6 +195,9 @@ pub struct EditorState {
     /// Scheme source queued by `eval-string` (the primitive can't re-enter the
     /// engine that is calling it), run by the host after the current command.
     pub pending_eval: Vec<String>,
+    /// Scheme queued by Lua (gmacs.scheme): run silently after the current
+    /// command, or after init.lua loads.
+    pub pending_scheme: Vec<String>,
     pub quit_requested: bool,
     /// The open fuzzy picker, if any; its query is the minibuffer's text.
     pub picker: Option<Picker>,
@@ -231,6 +234,7 @@ impl EditorState {
             message: String::new(),
             kill_ring: Vec::new(),
             pending_eval: Vec::new(),
+            pending_scheme: Vec::new(),
             quit_requested: false,
             picker: None,
             lsp: Lsp::default(),

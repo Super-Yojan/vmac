@@ -39,7 +39,7 @@ fn main() {
             };
             gpui_kit::open_window(options, cx, move |window, cx| {
                 let editor = Editor::new(buffer);
-                let lisp = Lisp::new(editor.clone(), Lisp::default_sources());
+                let lisp = Lisp::with_lua(editor.clone(), Lisp::default_sources(), Lisp::default_lua_sources());
                 cx.new(|cx| Shell::new(editor, lisp, window, cx))
             })
             .expect("failed to open window");

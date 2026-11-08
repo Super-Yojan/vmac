@@ -9,18 +9,17 @@ cargo run -- path/to/file
 
 ## How it is split
 
-| Layer              | Where                       | What                                                                      |
-|--------------------|-----------------------------|---------------------------------------------------------------------------|
-| Text storage, undo | `src/buffer.rs` (Rust)      | a rope, the point, undo snapshots                                         |
-| Primitives         | `src/lisp.rs` (Rust)        | `insert`, `char-at`, `delete-region`, `undo`, `find-file`, `message`, ... |
-| Window             | `src/shell.rs` (Rust, GPUI) | draws lines, modeline, echo area; sends every key to Scheme               |
-| Everything else    | `lisp/core.scm`             | states, commands, keymaps, the dispatcher, the modeline                   |
-| Your config        | `~/.config/gmacs/init.scm`  | loaded after core.scm                                                     |
+| Layer | Where | What |
+|---|---|---|
+| Text, undo | `src/buffer.rs` | a rope, the point, undo snapshots |
+| Editor state | `src/editor.rs` | buffers, windows and splits, LSP, the picker |
+| Primitives | `src/lisp.rs` | `insert`, `char-at`, `delete-region`, `find-file`, ... in both Scheme and Lua |
+| Window | `src/shell.rs` | draws windows, modelines, popups; sends every key to Scheme |
+| The editor | `lisp/core/*.scm` | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
+| Your config | `~/.config/gmacs/init.scm`, `~/.config/gmacs/init.lua` | loaded after the core |
 
-Rust calls Scheme functions by name: `(dispatch-key key text)`,
-`(modeline)`, `(cursor-shape)`, `(selection)`, `(search-highlight)` and
-`(syntax-theme)`. Redefine any of them to change how keys
-are read or what the window shows.
+The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
+`75-file-tree.scm`, ...), loaded as one program in name order.
 
 ## Keys
 
@@ -83,7 +82,7 @@ and TOML (picked by file extension; the modeline shows which). Colors come
 from `(syntax-theme)` in Scheme: capture names to faces.
 
 ```scheme
-;; Comments in yellow, strings in red; everything else as core.scm says.
+;; Comments in yellow, strings in red; everything else as the core says.
 (define (syntax-theme)
   (list (list "comment" 'yellow) (list "string" 'red)
         (list "keyword" 'magenta) (list "function" 'blue) (list "type" 'cyan)))
@@ -92,7 +91,7 @@ from `(syntax-theme)` in Scheme: capture names to faces.
 ## Language servers (LSP)
 
 Opening a file starts its language's server for the project (from
-`(lsp-servers)` in core.scm: rust-analyzer, pyright, typescript-language-server,
+`(lsp-servers)` in `lisp/core/80-lsp.scm`: rust-analyzer, pyright, typescript-language-server,
 clangd, gopls). Errors and warnings get colored squiggles; the one under the
 cursor shows in the echo area, the modeline counts them (`E2 W1`), `]d`/`[d`
 jump between them and `SPC c x` lists them in the picker. `gd` goes to the
@@ -136,8 +135,8 @@ The styles are faces, defined in Scheme with attributes:
 
 ## Customizing
 
-core.scm and init.scm are watched: save either and gmacs reloads both, keeping
-the buffer. If a save doesn't load, gmacs shows the error and keeps running
+The core, init.scm and init.lua are watched: save any of them and gmacs
+reloads, keeping your buffers. If a save doesn't load, gmacs shows the error and keeps running
 the last version that did. Or evaluate code live with `SPC ;`.
 
 ```scheme
@@ -160,7 +159,27 @@ the last version that did. Or evaluate code live with `SPC ;`.
         (list (buffer-name) 'strong)))
 ```
 
-**Define commands with `defcommand`, not `define`.** Steel resolves calls
+### In Lua
+
+Lua sits beside the Scheme, not instead of it: write either, or both.
+`~/.config/gmacs/init.lua` gets the same primitives in the `gmacs` table
+(Scheme's names with `-` as `_`: `gmacs.buffer_name()`, `gmacs.pos_to_line(p)`),
+and its commands and keys mix with Scheme's. See `examples/init.lua`:
+
+```lua
+gmacs.command("insert-date", function() gmacs.insert(os.date("%Y-%m-%d")) end)
+gmacs.map("normal", "SPC i d", "insert-date")       -- or a function
+gmacs.hooks.modeline = function()                   -- replaces Scheme's
+  return { { gmacs.buffer_name(), "strong" }, { gmacs.buffer_language(), "dim" } }
+end
+```
+
+`gmacs.hooks` can replace `modeline`, `lsp_servers` and `syntax_theme`.
+`gmacs.run("name")` runs any command and `gmacs.scheme(code)` any Scheme; both
+happen right after the current command (Lua can't call into Scheme midway
+through one). `:lua 1 + 2` evaluates Lua; `print` shows in the echo area.
+
+**In Scheme, define commands with `defcommand`, not `define`.** Steel resolves calls
 between Scheme functions when it compiles them, so redefining a plain
 function later doesn't change what code loaded earlier calls. `defcommand`
 also registers the command by name, and keys look it up on every press, so

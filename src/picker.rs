@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(root, PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         let files = project_files(&root);
         assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
-        assert!(files.contains(&"lisp/core.scm".to_string()));
+        assert!(files.contains(&"lisp/core/95-modeline.scm".to_string()));
         assert!(!files.iter().any(|f| f.starts_with("target/")), "target is gitignored");
     }
 

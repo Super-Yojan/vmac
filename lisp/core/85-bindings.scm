@@ -1,0 +1,133 @@
+;;;; Default bindings
+
+;; Motions move in normal and visual state, and complete an operator.
+(for-each-pair (lambda (key motion)
+                 (define-key normal-map key (lambda () (move-by motion)))
+                 (define-key visual-map key (lambda () (move-by motion)))
+                 (define-key operator-map key (operator-motion motion)))
+               motion-keys)
+
+;; Operators: start one in normal state, act on the selection in visual.
+(for-each-pair (lambda (key op)
+                 (define-key normal-map key (start-operator key op))
+                 (define-key visual-map key (visual-operator op))
+                 (define-key operator-map key (lambda () (operator-lines))))
+               operators)
+
+;; Text objects: after an operator, or to select in visual state.
+(for-each-pair (lambda (key object)
+                 (define-key operator-map (string-append "i " key) (operator-object object #t))
+                 (define-key operator-map (string-append "a " key) (operator-object object #f))
+                 (define-key visual-map (string-append "i " key) (visual-object object #t))
+                 (define-key visual-map (string-append "a " key) (visual-object object #f)))
+               object-keys)
+
+;; f t F T ; , / ? * #: the same keys move, extend a selection, or complete
+;; an operator; only what is done with the motion differs.
+(define (keymap-define! name key binding)
+  (cond ((equal? name 'normal) (define-key normal-map key binding))
+        ((equal? name 'visual) (define-key visual-map key binding))
+        ((equal? name 'operator) (define-key operator-map key binding))
+        ((equal? name 'insert) (define-key insert-map key binding))
+        (else (define-key minibuffer-map key binding))))
+
+(for-each (lambda (pair)
+            (let ((keymap-name (car pair)) (then (second pair)))
+              (for-each (lambda (kind)
+                          (keymap-define! keymap-name kind ((find-with then) kind)))
+                        '("f" "t" "F" "T"))
+              (keymap-define! keymap-name ";" (repeat-find then #f))
+              (keymap-define! keymap-name "," (repeat-find then #t))
+              (keymap-define! keymap-name "/" (search-prompt #t then))
+              (keymap-define! keymap-name "?" (search-prompt #f then))
+              (keymap-define! keymap-name "*" (search-word #t then))
+              (keymap-define! keymap-name "#" (search-word #f then))))
+          (list (list 'normal move-by) (list 'visual move-by) (list 'operator operator-run)))
+
+(define (shorthand op motion) (lambda () ((start-operator "" op)) ((operator-motion motion))))
+
+(for-each-pair (lambda (k b) (define-key normal-map k b))
+  (list (list "i" 'insert-state) (list "a" 'insert-after)
+        (list "I" 'insert-line-start) (list "A" 'insert-line-end)
+        (list "o" 'open-below) (list "O" 'open-above)
+        (list "v" (enter-visual 'visual)) (list "V" (enter-visual 'visual-line))
+        (list "C-v" (enter-visual 'visual-block))
+        ;; A procedure binding runs once, whatever the count; it reads the count.
+        (list "." (lambda () (repeat-last-change)))
+        (list "x" 'delete-char-under)
+        (list "D" (shorthand op-delete 'line-end))
+        (list "C" (shorthand op-change 'line-end))
+        (list "Y" (lambda () ((start-operator "y" op-yank)) (operator-lines)))
+        (list "p" 'paste-after) (list "P" 'paste-before)
+        (list "u" 'evil-undo) (list "C-r" 'evil-redo)
+        (list ":" 'ex) (list "ESC" 'keyboard-quit)
+        ;; Doom's leader
+        (list "SPC :" 'execute-extended-command) (list "SPC ;" 'eval-expression)
+        (list "SPC f f" 'find-file-command) (list "SPC SPC" 'find-file-command)
+        (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
+        (list "SPC m a" 'table-align)
+        ;; Language servers
+        (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
+        (list "g d" 'goto-definition) (list "g r" 'find-references)
+        (list "SPC c r" 'rename-symbol) (list "SPC c a" 'code-actions)
+        (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
+        (list "SPC c x" 'diagnostic-list)
+        ;; Buffers
+        (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)
+        (list "SPC b n" 'buffer-next) (list "SPC b p" 'buffer-previous)
+        (list "] b" 'buffer-next) (list "[ b" 'buffer-previous)
+        (list "SPC b k" 'buffer-kill) (list "SPC b d" 'buffer-kill) (list "SPC b N" 'buffer-new)
+        ;; Windows
+        (list "C-w v" 'split-right) (list "C-w s" 'split-below)
+        (list "C-w h" 'window-left) (list "C-w j" 'window-down)
+        (list "C-w k" 'window-up) (list "C-w l" 'window-right)
+        (list "C-w C-h" 'window-left) (list "C-w C-j" 'window-down)
+        (list "C-w C-k" 'window-up) (list "C-w C-l" 'window-right)
+        (list "C-w w" 'window-next) (list "C-w C-w" 'window-next) (list "C-w W" 'window-previous)
+        (list "C-w c" 'window-close) (list "C-w q" 'quit-window) (list "C-w o" 'window-only)
+        (list "SPC w v" 'split-right) (list "SPC w s" 'split-below)
+        (list "SPC w h" 'window-left) (list "SPC w j" 'window-down)
+        (list "SPC w k" 'window-up) (list "SPC w l" 'window-right)
+        (list "SPC w w" 'window-next) (list "SPC w d" 'window-close)
+        (list "SPC w c" 'window-close) (list "SPC w o" 'window-only)
+        ;; Scrolling
+        (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
+        (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
+        (list "C-e" 'scroll-line-down) (list "C-y" 'scroll-line-up)
+        (list "z z" 'recenter-center) (list "z t" 'recenter-top) (list "z b" 'recenter-bottom) (list "SPC f s" 'save) (list "SPC q q" 'quit)))
+
+(for-each-pair (lambda (k b) (define-key visual-map k b))
+  (list (list "v" (enter-visual 'visual)) (list "V" (enter-visual 'visual-line))
+        (list "C-v" (enter-visual 'visual-block))
+        (list "o" 'visual-swap-ends) (list "O" 'visual-swap-columns)
+        (list "I" 'block-insert-start) (list "A" 'block-append)
+        (list "x" (visual-operator op-delete))
+        (list "p" 'visual-paste) (list "ESC" 'exit-visual) (list ":" 'ex)
+        (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
+        (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
+        (list "z z" 'recenter-center) (list "SPC c a" 'code-actions)))
+
+(define-key operator-map "ESC" 'keyboard-quit)
+
+(for-each-pair (lambda (k b) (define-key insert-map k b))
+  '(("ESC" normal-state) ("RET" newline) ("TAB" table-next-cell) ("S-TAB" table-previous-cell)
+    ("DEL" delete-backward) ("<delete>" delete-forward)
+    ("<left>" char-left) ("<right>" char-right) ("<down>" line-down-cmd) ("<up>" line-up)))
+
+(for-each-pair (lambda (k b) (define-key minibuffer-map k b))
+  '(("RET" minibuffer-exit) ("ESC" minibuffer-escape)
+    ("DEL" delete-backward) ("<left>" char-left) ("<right>" char-right)
+    ("C-n" picker-next) ("C-j" picker-next) ("<down>" picker-next)
+    ("C-p" picker-previous) ("C-k" picker-previous) ("<up>" picker-previous)))
+
+(for-each-pair (lambda (k b) (define-key picker-normal-map k b))
+  (list (list "j" (lambda () (picker-move current-count)))
+        (list "k" (lambda () (picker-move (- 0 current-count))))
+        (list "<down>" (lambda () (picker-move current-count)))
+        (list "<up>" (lambda () (picker-move (- 0 current-count))))
+        (list "C-n" 'picker-next) (list "C-p" 'picker-previous)
+        (list "C-j" 'picker-next) (list "C-k" 'picker-previous)
+        (list "g g" 'picker-first) (list "G" 'picker-last)
+        (list "C-d" 'picker-page-down) (list "C-u" 'picker-page-up)
+        (list "RET" 'minibuffer-exit) (list "q" 'keyboard-quit) (list "ESC" 'keyboard-quit)))
+

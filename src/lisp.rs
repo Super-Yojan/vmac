@@ -1,22 +1,66 @@
 //! The Steel interpreter and the primitives it gets from the Rust core.
 //!
 //! Rust exposes small, fast primitives (`insert`, `forward-char`, ...). Every
-//! command, keymap and the modeline are defined in Scheme (`lisp/core.scm`,
+//! command, keymap and the modeline are defined in Scheme (`lisp/core/*.scm`,
 //! then the user's `~/.config/gmacs/init.scm`) and can be redefined while the
 //! editor runs.
 
 use crate::buffer::Buffer;
 use crate::editor::Editor;
 use crate::picker::Picker;
+use mlua::Lua;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 
-const CORE_EMBEDDED: &str = include_str!("../lisp/core.scm");
+/// The core, one file per area (lisp/core/), built into the binary for
+/// running outside a checkout. They load as one program, in name order, so
+/// a function may call one defined in a later file.
+const CORE_FILES: &[(&str, &str)] = &[
+    ("00-helpers.scm", include_str!("../lisp/core/00-helpers.scm")),
+    ("05-commands.scm", include_str!("../lisp/core/05-commands.scm")),
+    ("10-keymaps.scm", include_str!("../lisp/core/10-keymaps.scm")),
+    ("15-states.scm", include_str!("../lisp/core/15-states.scm")),
+    ("20-dispatch.scm", include_str!("../lisp/core/20-dispatch.scm")),
+    ("30-motions.scm", include_str!("../lisp/core/30-motions.scm")),
+    ("35-search.scm", include_str!("../lisp/core/35-search.scm")),
+    ("40-text-objects.scm", include_str!("../lisp/core/40-text-objects.scm")),
+    ("45-operators.scm", include_str!("../lisp/core/45-operators.scm")),
+    ("50-visual.scm", include_str!("../lisp/core/50-visual.scm")),
+    ("55-editing.scm", include_str!("../lisp/core/55-editing.scm")),
+    ("60-minibuffer.scm", include_str!("../lisp/core/60-minibuffer.scm")),
+    ("65-picker.scm", include_str!("../lisp/core/65-picker.scm")),
+    ("70-windows.scm", include_str!("../lisp/core/70-windows.scm")),
+    ("75-file-tree.scm", include_str!("../lisp/core/75-file-tree.scm")),
+    ("80-lsp.scm", include_str!("../lisp/core/80-lsp.scm")),
+    ("85-bindings.scm", include_str!("../lisp/core/85-bindings.scm")),
+    ("90-tables.scm", include_str!("../lisp/core/90-tables.scm")),
+    ("92-syntax.scm", include_str!("../lisp/core/92-syntax.scm")),
+    ("95-modeline.scm", include_str!("../lisp/core/95-modeline.scm")),
+    ("97-lua.scm", include_str!("../lisp/core/97-lua.scm")),
+];
 
-/// A Scheme file the editor loads, in order, at start and on every reload.
+/// The core files joined, each under a comment naming it (errors show the
+/// line in the joined program).
+fn join_core(files: impl Iterator<Item = (String, String)>) -> String {
+    files.map(|(name, text)| format!(";;;; ==== {name} ====\n{text}")).collect::<Vec<_>>().join("\n")
+}
+
+/// The `.scm` files in a folder, by name.
+fn scheme_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    files.retain(|p| p.extension().is_some_and(|e| e == "scm"));
+    files.sort();
+    files
+}
+
+/// Scheme the editor loads, in order, at start and on every reload: a file,
+/// a folder of files (loaded as one program), or the built-in core.
 #[derive(Debug, Clone)]
 pub struct Source {
     pub label: String,
@@ -26,12 +70,25 @@ pub struct Source {
 impl Source {
     fn read(&self) -> Option<String> {
         match &self.path {
+            Some(p) if p.is_dir() => Some(join_core(scheme_files(p).into_iter().filter_map(|f| {
+                let name = f.file_name()?.to_string_lossy().into_owned();
+                Some((name, std::fs::read_to_string(&f).ok()?))
+            }))),
             Some(p) => std::fs::read_to_string(p).ok(),
-            None => Some(CORE_EMBEDDED.to_string()),
+            None => Some(join_core(CORE_FILES.iter().map(|(n, t)| (n.to_string(), t.to_string())))),
         }
     }
+
+    /// When it last changed: for a folder, its newest file (or the folder
+    /// itself, when a file is added or removed).
     fn mtime(&self) -> Option<SystemTime> {
-        self.path.as_ref()?.metadata().ok()?.modified().ok()
+        let path = self.path.as_ref()?;
+        let modified = |p: &std::path::Path| p.metadata().ok()?.modified().ok();
+        if path.is_dir() {
+            scheme_files(path).iter().filter_map(|f| modified(f)).chain(modified(path)).max()
+        } else {
+            modified(path)
+        }
     }
 }
 
@@ -97,34 +154,114 @@ pub struct Segment {
 
 pub struct Lisp {
     engine: Engine,
+    /// Lua, beside Scheme: same primitives, its own commands, keys and hooks.
+    lua: Arc<Mutex<Lua>>,
     editor: Editor,
     sources: Vec<Source>,
     stamps: Vec<Option<SystemTime>>,
+    /// Lua files loaded after the Scheme (init.lua), and when they last changed.
+    lua_sources: Vec<PathBuf>,
+    lua_stamps: Vec<Option<SystemTime>>,
     /// The source texts of the last load that succeeded, to fall back on.
     last_good: Option<Vec<String>>,
 }
 
 impl Lisp {
+    #[cfg(test)]
     pub fn new(editor: Editor, sources: Vec<Source>) -> Self {
+        Self::with_lua(editor, sources, Vec::new())
+    }
+
+    pub fn with_lua(editor: Editor, sources: Vec<Source>, lua_sources: Vec<PathBuf>) -> Self {
+        let lua = Arc::new(Mutex::new(fresh_lua(&editor)));
         let mut lisp = Self {
-            engine: fresh_engine(&editor),
+            engine: fresh_engine(&editor, &lua),
+            lua,
             editor,
             stamps: vec![None; sources.len()],
             sources,
+            lua_stamps: vec![None; lua_sources.len()],
+            lua_sources,
             last_good: None,
         };
         lisp.reload();
         lisp
     }
 
-    /// The default sources: the core (the repo's `lisp/core.scm` when running
+    /// The user's Lua: ~/.config/gmacs/init.lua.
+    pub fn default_lua_sources() -> Vec<PathBuf> {
+        std::env::var_os("HOME")
+            .map(|home| vec![PathBuf::from(home).join(".config/gmacs/init.lua")])
+            .unwrap_or_default()
+    }
+
+    /// Loads the Lua files into a fresh Lua (so a reload starts clean, like
+    /// Scheme's), then runs the Scheme they queued. Returns the files loaded.
+    fn load_lua(&mut self) -> Vec<String> {
+        *self.lua.lock().unwrap_or_else(|e| e.into_inner()) = fresh_lua(&self.editor);
+        let mut loaded = Vec::new();
+        for (i, path) in self.lua_sources.clone().iter().enumerate() {
+            self.lua_stamps[i] = path.metadata().ok().and_then(|m| m.modified().ok());
+            let Ok(code) = std::fs::read_to_string(path) else { continue };
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let result = {
+                let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+                lua.load(code).set_name(&name).exec()
+            };
+            match result {
+                Ok(()) => loaded.push(name),
+                Err(e) => {
+                    self.run_pending_scheme();
+                    self.editor.lock().message = format!("{name}: {}", first_line(&e));
+                    return loaded;
+                }
+            }
+        }
+        self.run_pending_scheme();
+        loaded
+    }
+
+    /// Runs the Scheme Lua queued (gmacs.scheme), quietly unless it fails.
+    fn run_pending_scheme(&mut self) {
+        let pending = std::mem::take(&mut self.editor.lock().pending_scheme);
+        for code in pending {
+            if let Err(e) = self.engine.run(code.clone()) {
+                self.editor.lock().message = format!("{code}: {e}");
+            }
+        }
+    }
+
+    /// Evaluates Lua and returns what it shows.
+    #[cfg(test)]
+    pub fn eval_lua(&mut self, code: &str) -> Result<String, String> {
+        let result = {
+            let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+            eval_lua_in(&lua, code).map_err(|e| first_line(&e))
+        };
+        self.run_pending_scheme();
+        result
+    }
+
+    /// A function Lua put in `gmacs.hooks` to replace Scheme's, if any.
+    fn lua_hook<R: mlua::FromLuaMulti>(&self, name: &str) -> Option<mlua::Result<R>> {
+        let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+        let hook = lua
+            .globals()
+            .get::<mlua::Table>("gmacs")
+            .and_then(|g| g.get::<mlua::Table>("hooks"))
+            .and_then(|h| h.get::<mlua::Function>(name))
+            .ok()?;
+        Some(hook.call::<R>(()))
+    }
+
+    /// The default sources: the core (the repo's `lisp/core/` when running
     /// from a checkout, so it live-reloads; else the copy built in), then the
     /// user's init file.
     pub fn default_sources() -> Vec<Source> {
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lisp/core.scm");
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lisp/core");
         let core = Source {
-            label: "core.scm".into(),
-            path: dev.exists().then_some(dev),
+            label: "core".into(),
+            path: dev.is_dir().then_some(dev),
         };
         let mut out = vec![core];
         if let Some(home) = std::env::var_os("HOME") {
@@ -146,16 +283,22 @@ impl Lisp {
             self.stamps[i] = src.mtime();
         }
         match self.load(&texts) {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
                 self.last_good = Some(texts.into_iter().flatten().collect());
-                self.editor.lock().message = format!("loaded {}", loaded.join(", "));
+                self.editor.lock().message.clear();
+                loaded.extend(self.load_lua());
+                let mut st = self.editor.lock();
+                if st.message.is_empty() {
+                    st.message = format!("loaded {}", loaded.join(", "));
+                }
             }
             Err(error) => {
                 if let Some(good) = self.last_good.clone() {
-                    self.engine = fresh_engine(&self.editor);
+                    self.engine = fresh_engine(&self.editor, &self.lua);
                     for code in good {
                         let _ = self.engine.run(code);
                     }
+                    self.load_lua();
                     self.editor.lock().message = format!("{error} (kept the last version that loaded)");
                 } else {
                     self.editor.lock().message = error;
@@ -176,11 +319,12 @@ impl Lisp {
 
     /// Reloads when any source file changed since the last load.
     pub fn reload_if_changed(&mut self) -> bool {
-        let changed = self
-            .sources
+        let lua_changed = self
+            .lua_sources
             .iter()
-            .zip(&self.stamps)
-            .any(|(s, old)| s.mtime() != *old);
+            .zip(&self.lua_stamps)
+            .any(|(p, old)| p.metadata().ok().and_then(|m| m.modified().ok()) != *old);
+        let changed = lua_changed || self.sources.iter().zip(&self.stamps).any(|(s, old)| s.mtime() != *old);
         if changed {
             self.reload();
         }
@@ -196,6 +340,7 @@ impl Lisp {
         if let Err(e) = self.engine.call_function_by_name_with_args("dispatch-key", args) {
             self.editor.lock().message = format!("{key}: {e}");
         }
+        self.run_pending_scheme();
         self.run_pending_evals();
     }
 
@@ -274,17 +419,44 @@ impl Lisp {
         }
     }
 
+    /// A Lua hook's list of lists of strings (`{{"keyword", "magenta"}, ...}`).
+    fn lua_hook_rows(&self, name: &str) -> Option<Result<Vec<Vec<String>>, String>> {
+        let result = self.lua_hook::<mlua::Table>(name)?;
+        Some(
+            result
+                .and_then(|rows| {
+                    rows.sequence_values::<mlua::Table>()
+                        .map(|row| row.and_then(|r| r.sequence_values::<String>().collect()))
+                        .collect()
+                })
+                .map_err(|e| first_line(&e)),
+        )
+    }
+
     /// Calls Scheme's `(syntax-theme)`: (capture face) pairs saying how
-    /// tree-sitter captures look.
+    /// tree-sitter captures look. A Lua `gmacs.hooks.syntax_theme` replaces it.
     pub fn syntax_theme(&mut self) -> Vec<(String, String)> {
+        if let Some(Ok(rows)) = self.lua_hook_rows("syntax_theme") {
+            return rows.into_iter().filter_map(|r| Some((r.first()?.clone(), r.get(1)?.clone()))).collect();
+        }
         match self.engine.call_function_by_name_with_args("syntax-theme", vec![]) {
             Ok(v) => parse_segments(&v).into_iter().map(|s| (s.text, s.face)).collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    /// Calls Scheme's `(lsp-servers)`: `(language command arg ...)` lists.
+    /// Calls Scheme's `(lsp-servers)`: `(language command arg ...)` lists. A
+    /// Lua `gmacs.hooks.lsp_servers` replaces it.
     pub fn lsp_servers(&mut self) -> Vec<crate::lsp::ServerConfig> {
+        if let Some(Ok(rows)) = self.lua_hook_rows("lsp_servers") {
+            return rows
+                .into_iter()
+                .filter_map(|r| {
+                    let mut words = r.into_iter();
+                    Some(crate::lsp::ServerConfig { language: words.next()?, command: words.next()?, args: words.collect() })
+                })
+                .collect();
+        }
         let Ok(SteelVal::ListV(items)) = self.engine.call_function_by_name_with_args("lsp-servers", vec![]) else {
             return vec![];
         };
@@ -310,8 +482,21 @@ impl Lisp {
         }
     }
 
-    /// Calls Scheme's `(modeline)`: a list of `(text face)` pairs.
+    /// Calls Scheme's `(modeline)`: a list of `(text face)` pairs. A Lua
+    /// `gmacs.hooks.modeline` returning `{{text, face}, ...}` replaces it.
     pub fn modeline(&mut self) -> Vec<Segment> {
+        match self.lua_hook_rows("modeline") {
+            Some(Ok(rows)) => {
+                return rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        Some(Segment { text: r.first()?.clone(), face: r.get(1).cloned().unwrap_or("default".into()) })
+                    })
+                    .collect();
+            }
+            Some(Err(e)) => return vec![Segment { text: format!("modeline (lua): {e}"), face: "error".into() }],
+            None => {}
+        }
         match self.engine.call_function_by_name_with_args("modeline", vec![]) {
             Ok(v) => parse_segments(&v),
             Err(e) => vec![Segment {
@@ -344,73 +529,228 @@ fn parse_segments(v: &SteelVal) -> Vec<Segment> {
 
 /// Registers a primitive that gets the editor. `$args` are the Scheme
 /// arguments with their Rust types.
+/// Where primitives get registered: Steel, Lua's `gmacs` table, or both.
+struct Registry<'a> {
+    engine: Option<&'a mut Engine>,
+    lua: Option<(&'a Lua, mlua::Table)>,
+}
+
+/// A primitive's Lua name: `buffer-name` -> `buffer_name`, `pos->line` ->
+/// `pos_to_line`, `minibuffer-active?` -> `minibuffer_active`.
+pub fn lua_name(scheme: &str) -> String {
+    scheme.replace("->", "_to_").trim_end_matches(['?', '!']).replace('-', "_")
+}
+
+/// Registers a primitive that gets the editor, in each interpreter of the
+/// registry. `$args` are its arguments with their Rust types.
 macro_rules! prim {
-    ($engine:ident, $editor:ident, $name:literal, |$st:ident $(, $a:ident : $t:ty)*| $body:expr) => {{
-        let ed = $editor.clone();
-        $engine.register_fn($name, move |$($a: $t),*| {
-            #[allow(unused_mut)]
-            let mut $st = ed.lock();
-            $body
-        });
+    ($reg:ident, $editor:ident, $name:literal, |$st:ident $(, $a:ident : $t:ty)*| $body:expr) => {{
+        if let Some(engine) = $reg.engine.as_mut() {
+            let ed = $editor.clone();
+            engine.register_fn($name, move |$($a: $t),*| {
+                #[allow(unused_mut)]
+                let mut $st = ed.lock();
+                $body
+            });
+        }
+        if let Some((lua, gmacs)) = $reg.lua.as_ref() {
+            let ed = $editor.clone();
+            #[allow(unused_parens)]
+            let f = lua
+                .create_function(move |_, ($($a,)*): ($($t,)*)| {
+                    #[allow(unused_mut)]
+                    let mut $st = ed.lock();
+                    // An inner closure, so a `return` in the body returns its value.
+                    #[allow(clippy::redundant_closure_call)]
+                    let value = (|| $body)();
+                    Ok(value)
+                })
+                .expect("a Lua function");
+            gmacs.set(lua_name($name), f).expect("set in gmacs");
+        }
     }};
 }
 
-fn fresh_engine(editor: &Editor) -> Engine {
+/// Registers a primitive that doesn't need the editor, in each interpreter.
+macro_rules! pure {
+    ($reg:ident, $name:literal, |$($a:ident : $t:ty),*| $body:expr) => {{
+        if let Some(engine) = $reg.engine.as_mut() {
+            engine.register_fn($name, move |$($a: $t),*| $body);
+        }
+        if let Some((lua, gmacs)) = $reg.lua.as_ref() {
+            let f = lua.create_function(move |_, ($($a,)*): ($($t,)*)| Ok($body)).expect("a Lua function");
+            gmacs.set(lua_name($name), f).expect("set in gmacs");
+        }
+    }};
+}
+
+/// A Steel engine with the primitives, and the bridge to Lua.
+fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
     let mut engine = Engine::new();
-    register_primitives(&mut engine, editor);
+    {
+        let mut reg = Registry { engine: Some(&mut engine), lua: None };
+        register_primitives(&mut reg, editor);
+    }
+    // These hold no editor lock while Lua runs: Lua calls primitives, which take it.
+    let (ed, l) = (editor.clone(), lua.clone());
+    engine.register_fn("lua-call", move |name: String| {
+        let result = {
+            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
+            lua_command(&lua, &name)
+        };
+        if let Err(e) = result {
+            ed.lock().message = format!("{name}: {}", first_line(&e));
+        }
+    });
+    let (ed, l) = (editor.clone(), lua.clone());
+    engine.register_fn("lua-eval", move |code: String| {
+        let result = {
+            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
+            eval_lua_in(&lua, &code)
+        };
+        let mut st = ed.lock();
+        match result {
+            // No value (print, statements): keep whatever the code showed.
+            Ok(v) if v.is_empty() => {}
+            Ok(v) => st.message = v,
+            Err(e) => st.message = format!("lua: {}", first_line(&e)),
+        }
+    });
     engine
 }
 
-fn register_primitives(engine: &mut Engine, editor: &Editor) {
+/// A Lua state with the primitives in `gmacs`, and the Lua side of the
+/// bridge (`gmacs.command`, `gmacs.map`, `gmacs.hooks`, ...).
+fn fresh_lua(editor: &Editor) -> Lua {
+    let lua = Lua::new();
+    let gmacs = lua.create_table().expect("a table");
+    {
+        let mut reg = Registry { engine: None, lua: Some((&lua, gmacs.clone())) };
+        register_primitives(&mut reg, editor);
+    }
+    lua.globals().set("gmacs", gmacs).expect("set gmacs");
+    lua.load(LUA_PRELUDE).set_name("prelude.lua").exec().expect("the Lua prelude runs");
+    lua
+}
+
+/// The Lua side of the bridge to Scheme.
+const LUA_PRELUDE: &str = r##"
+gmacs.commands = {}
+-- Functions that replace Scheme's: modeline, lsp_servers, syntax_theme.
+gmacs.hooks = {}
+
+local function quote(s)
+  return '"' .. (s:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
+end
+
+-- A command callable by name from anywhere (keys, SPC :, Scheme).
+function gmacs.command(name, fn)
+  gmacs.commands[name] = fn
+  gmacs.scheme("(register-lua-command! '" .. name .. ")")
+end
+
+-- Binds keys ("SPC i d") in a state (normal, insert, visual, operator)
+-- to a command name or a function.
+local anonymous = 0
+function gmacs.map(state, keys, command)
+  if type(command) == "function" then
+    anonymous = anonymous + 1
+    local name = "lua-command-" .. anonymous
+    gmacs.command(name, command)
+    command = name
+  end
+  gmacs.scheme("(lua-define-key '" .. state .. " " .. quote(keys) .. " '" .. command .. ")")
+end
+
+-- Runs a command (Scheme's or Lua's) right after this one.
+function gmacs.run(name)
+  gmacs.scheme("(call-binding '" .. name .. ")")
+end
+
+-- print shows in the echo area.
+function print(...)
+  local parts = {}
+  for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+  gmacs.message(table.concat(parts, " "))
+end
+"##;
+
+fn first_line(e: &impl std::fmt::Display) -> String {
+    e.to_string().lines().next().unwrap_or("").to_string()
+}
+
+/// Runs a Lua command registered with gmacs.command.
+fn lua_command(lua: &Lua, name: &str) -> mlua::Result<()> {
+    let gmacs: mlua::Table = lua.globals().get("gmacs")?;
+    let commands: mlua::Table = gmacs.get("commands")?;
+    let f: mlua::Function = commands.get(name)?;
+    f.call::<()>(())
+}
+
+/// Evaluates Lua and shows the result: an expression's value, else "".
+fn eval_lua_in(lua: &Lua, code: &str) -> mlua::Result<String> {
+    // Try it as an expression first (:lua 1 + 2 shows 3), then as statements.
+    let value: mlua::Value = match lua.load(format!("return {code}")).set_name("eval").eval() {
+        Ok(v) => v,
+        Err(_) => lua.load(code).set_name("eval").eval()?,
+    };
+    Ok(match value {
+        mlua::Value::Nil => String::new(),
+        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+        other => other.to_string()?,
+    })
+}
+
+fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // Editing the current buffer (the minibuffer while it is open).
-    prim!(engine, editor, "insert", |s, text: String| s.current().insert(&text));
-    prim!(engine, editor, "delete-backward-char", |s, n: isize| s
+    prim!(reg, editor, "insert", |s, text: String| s.current().insert(&text));
+    prim!(reg, editor, "delete-backward-char", |s, n: isize| s
         .current()
         .delete_backward(n.max(0) as usize));
-    prim!(engine, editor, "delete-char", |s, n: isize| s
+    prim!(reg, editor, "delete-char", |s, n: isize| s
         .current()
         .delete_forward(n.max(0) as usize));
-    prim!(engine, editor, "forward-char", |s, n: isize| s.current().forward_char(n));
-    prim!(engine, editor, "forward-line", |s, n: isize| s.current().forward_line(n));
-    prim!(engine, editor, "beginning-of-line", |s| s.current().beginning_of_line());
-    prim!(engine, editor, "end-of-line", |s| s.current().end_of_line());
-    prim!(engine, editor, "goto-char", |s, pos: isize| s.current().goto_char(pos.max(0) as usize));
-    prim!(engine, editor, "point", |s| s.current().point() as isize);
-    prim!(engine, editor, "point-max", |s| s.current().len() as isize);
-    prim!(engine, editor, "char-at", |s, pos: isize| s.current().char_at(pos.max(0) as usize));
-    prim!(engine, editor, "buffer-substring", |s, a: isize, b: isize| s
+    prim!(reg, editor, "forward-char", |s, n: isize| s.current().forward_char(n));
+    prim!(reg, editor, "forward-line", |s, n: isize| s.current().forward_line(n));
+    prim!(reg, editor, "beginning-of-line", |s| s.current().beginning_of_line());
+    prim!(reg, editor, "end-of-line", |s| s.current().end_of_line());
+    prim!(reg, editor, "goto-char", |s, pos: isize| s.current().goto_char(pos.max(0) as usize));
+    prim!(reg, editor, "point", |s| s.current().point() as isize);
+    prim!(reg, editor, "point-max", |s| s.current().len() as isize);
+    prim!(reg, editor, "char-at", |s, pos: isize| s.current().char_at(pos.max(0) as usize));
+    prim!(reg, editor, "buffer-substring", |s, a: isize, b: isize| s
         .current()
         .substring(a.max(0) as usize, b.max(0) as usize));
-    prim!(engine, editor, "line-beginning-position", |s, pos: isize| s
+    prim!(reg, editor, "line-beginning-position", |s, pos: isize| s
         .current()
         .line_start(pos.max(0) as usize) as isize);
-    prim!(engine, editor, "line-end-position", |s, pos: isize| s
+    prim!(reg, editor, "line-end-position", |s, pos: isize| s
         .current()
         .line_end(pos.max(0) as usize) as isize);
-    prim!(engine, editor, "delete-region", |s, a: isize, b: isize| s
+    prim!(reg, editor, "delete-region", |s, a: isize, b: isize| s
         .current()
         .delete_range(a.max(0) as usize, b.max(0) as usize));
-    prim!(engine, editor, "char-class", |s, pos: isize| s
+    prim!(reg, editor, "char-class", |s, pos: isize| s
         .current()
         .char_class(pos.max(0) as usize)
         .to_string());
-    prim!(engine, editor, "pos->line", |s, pos: isize| s.current().line_of(pos.max(0) as usize) as isize);
-    prim!(engine, editor, "line->pos", |s, line: isize| s
+    prim!(reg, editor, "pos->line", |s, pos: isize| s.current().line_of(pos.max(0) as usize) as isize);
+    prim!(reg, editor, "line->pos", |s, line: isize| s
         .current()
         .line_to_pos(line.max(0) as usize) as isize);
-    prim!(engine, editor, "line-count", |s| s.current().line_count() as isize);
+    prim!(reg, editor, "line-count", |s| s.current().line_count() as isize);
     // Search, always in the file buffer: regex, smartcase. -1 when nothing matches.
-    prim!(engine, editor, "search-forward", |s, pattern: String, from: isize| {
+    prim!(reg, editor, "search-forward", |s, pattern: String, from: isize| {
         let Some(re) = s.search_regex(&pattern) else { return -1 };
         s.buffer().search_forward(&re, from.max(0) as usize).map_or(-1, |p| p as isize)
     });
-    prim!(engine, editor, "search-backward", |s, pattern: String, before: isize| {
+    prim!(reg, editor, "search-backward", |s, pattern: String, before: isize| {
         let Some(re) = s.search_regex(&pattern) else { return -1 };
         s.buffer().search_backward(&re, before.max(0) as usize).map_or(-1, |p| p as isize)
     });
-    engine.register_fn("regex-quote", |text: String| regex::escape(&text));
+    pure!(reg, "regex-quote", |text: String| regex::escape(&text));
     // The fuzzy picker. Scheme opens it and decides what picking does.
-    prim!(engine, editor, "project-root", |s| {
+    prim!(reg, editor, "project-root", |s| {
         let start = s
             .buffer()
             .file()
@@ -419,67 +759,67 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
             .unwrap_or_default();
         crate::picker::project_root(&start).display().to_string()
     });
-    engine.register_fn("project-files", |root: String| crate::picker::project_files(Path::new(&root)));
-    prim!(engine, editor, "picker-open", |s, title: String, items: Vec<String>, root: String| {
+    pure!(reg, "project-files", |root: String| crate::picker::project_files(Path::new(&root)));
+    prim!(reg, editor, "picker-open", |s, title: String, items: Vec<String>, root: String| {
         let root = (!root.is_empty()).then(|| PathBuf::from(root));
         s.picker = Some(Picker::new(title, items, root));
     });
-    prim!(engine, editor, "picker-close", |s| s.picker = None);
-    prim!(engine, editor, "picker-active?", |s| s.picker.is_some());
-    prim!(engine, editor, "picker-filter", |s, query: String| {
+    prim!(reg, editor, "picker-close", |s| s.picker = None);
+    prim!(reg, editor, "picker-active?", |s| s.picker.is_some());
+    prim!(reg, editor, "picker-filter", |s, query: String| {
         if let Some(p) = s.picker.as_mut() {
             p.filter(&query);
         }
     });
-    prim!(engine, editor, "picker-move", |s, n: isize| {
+    prim!(reg, editor, "picker-move", |s, n: isize| {
         if let Some(p) = s.picker.as_mut() {
             p.move_selection(n);
         }
     });
-    prim!(engine, editor, "picker-select", |s, index: isize| {
+    prim!(reg, editor, "picker-select", |s, index: isize| {
         if let Some(p) = s.picker.as_mut() {
             p.select(index);
         }
     });
-    prim!(engine, editor, "picker-selection", |s| s
+    prim!(reg, editor, "picker-selection", |s| s
         .picker
         .as_ref()
         .and_then(|p| p.selection().map(str::to_string))
         .unwrap_or_default());
-    prim!(engine, editor, "undo-boundary", |s| s.current().undo_boundary());
-    prim!(engine, editor, "undo", |s| s.current().undo());
-    prim!(engine, editor, "redo", |s| s.current().redo());
+    prim!(reg, editor, "undo-boundary", |s| s.current().undo_boundary());
+    prim!(reg, editor, "undo", |s| s.current().undo());
+    prim!(reg, editor, "redo", |s| s.current().redo());
     // The register: the last deleted or yanked text.
-    prim!(engine, editor, "register-set", |s, text: String| s.kill_ring.push(text));
-    prim!(engine, editor, "register-get", |s| s.kill_ring.last().cloned().unwrap_or_default());
-    prim!(engine, editor, "buffer-string", |s| s.current().text().to_string());
+    prim!(reg, editor, "register-set", |s, text: String| s.kill_ring.push(text));
+    prim!(reg, editor, "register-get", |s| s.kill_ring.last().cloned().unwrap_or_default());
+    prim!(reg, editor, "buffer-string", |s| s.current().text().to_string());
 
     // About the file buffer (not the minibuffer).
-    prim!(engine, editor, "buffer-name", |s| s.buffer().name().to_string());
-    prim!(engine, editor, "buffer-file-name", |s| s
+    prim!(reg, editor, "buffer-name", |s| s.buffer().name().to_string());
+    prim!(reg, editor, "buffer-file-name", |s| s
         .buffer()
         .file()
         .map(|p| p.display().to_string())
         .unwrap_or_default());
-    prim!(engine, editor, "buffer-read-only?", |s| s.buffer().is_read_only());
-    prim!(engine, editor, "buffer-revision", |s| s.buffer().revision() as isize);
-    prim!(engine, editor, "buffer-modified?", |s| s.buffer().is_modified());
-    prim!(engine, editor, "buffer-language", |s| s
+    prim!(reg, editor, "buffer-read-only?", |s| s.buffer().is_read_only());
+    prim!(reg, editor, "buffer-revision", |s| s.buffer().revision() as isize);
+    prim!(reg, editor, "buffer-modified?", |s| s.buffer().is_modified());
+    prim!(reg, editor, "buffer-language", |s| s
         .buffer()
         .file()
         .and_then(|f| crate::syntax::language_for_path(f))
         .unwrap_or("text")
         .to_string());
-    prim!(engine, editor, "line-number", |s| s.buffer().line() as isize + 1);
-    prim!(engine, editor, "column-number", |s| s.buffer().column() as isize);
-    prim!(engine, editor, "find-file", |s, path: String| {
+    prim!(reg, editor, "line-number", |s| s.buffer().line() as isize + 1);
+    prim!(reg, editor, "column-number", |s| s.buffer().column() as isize);
+    prim!(reg, editor, "find-file", |s, path: String| {
         let path = expand_home(&path);
         s.message = match s.open_file(&path) {
             Ok(()) => format!("opened {}", path.display()),
             Err(e) => format!("{}: {e}", path.display()),
         };
     });
-    prim!(engine, editor, "save-buffer", |s| {
+    prim!(reg, editor, "save-buffer", |s| {
         s.message = match s.buffer_mut().save() {
             Ok(p) => format!("wrote {}", p.display()),
             Err(e) => format!("not saved: {e}"),
@@ -487,14 +827,14 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     });
 
     // Buffers.
-    prim!(engine, editor, "buffer-list", |s| s.buffer_names());
-    prim!(engine, editor, "switch-to-buffer", |s, name: String| s.switch_to_buffer(&name));
-    prim!(engine, editor, "next-buffer", |s, n: isize| s.next_buffer(n));
-    prim!(engine, editor, "new-buffer", |s, name: String| {
+    prim!(reg, editor, "buffer-list", |s| s.buffer_names());
+    prim!(reg, editor, "switch-to-buffer", |s, name: String| s.switch_to_buffer(&name));
+    prim!(reg, editor, "next-buffer", |s, n: isize| s.next_buffer(n));
+    prim!(reg, editor, "new-buffer", |s, name: String| {
         let id = s.add_buffer(Buffer::new(name));
         s.show_buffer(id);
     });
-    prim!(engine, editor, "kill-buffer", |s, force: bool| {
+    prim!(reg, editor, "kill-buffer", |s, force: bool| {
         s.message = match s.kill_buffer(force) {
             Ok(name) => format!("closed {name}"),
             Err(e) => e,
@@ -502,11 +842,11 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     });
 
     // Windows: split, move between, close; scrolling.
-    prim!(engine, editor, "split-window", |s, side: String| s.split_window(
+    prim!(reg, editor, "split-window", |s, side: String| s.split_window(
         if side == "below" { crate::editor::Axis::Column } else { crate::editor::Axis::Row }
     ));
-    prim!(engine, editor, "window-in-direction?", |s, dir: String| s.window_in_direction(&dir).is_some());
-    prim!(engine, editor, "select-window-in-direction", |s, dir: String| {
+    prim!(reg, editor, "window-in-direction?", |s, dir: String| s.window_in_direction(&dir).is_some());
+    prim!(reg, editor, "select-window-in-direction", |s, dir: String| {
         match s.window_in_direction(&dir) {
             Some(id) => {
                 s.select_window(id);
@@ -515,48 +855,48 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
             None => false,
         }
     });
-    prim!(engine, editor, "other-window", |s, n: isize| s.other_window(n));
-    prim!(engine, editor, "delete-window", |s| s.close_window());
-    prim!(engine, editor, "delete-other-windows", |s| s.only_window());
-    prim!(engine, editor, "window-count", |s| s.window_count() as isize);
-    prim!(engine, editor, "window-height", |s| s.window().rows.max(1) as isize);
-    prim!(engine, editor, "window-top-line", |s| s.window().scroll_top as isize);
-    prim!(engine, editor, "scroll-window", |s, n: isize| s.scroll(n));
-    prim!(engine, editor, "recenter", |s, place: String| s.recenter(&place));
+    prim!(reg, editor, "other-window", |s, n: isize| s.other_window(n));
+    prim!(reg, editor, "delete-window", |s| s.close_window());
+    prim!(reg, editor, "delete-other-windows", |s| s.only_window());
+    prim!(reg, editor, "window-count", |s| s.window_count() as isize);
+    prim!(reg, editor, "window-height", |s| s.window().rows.max(1) as isize);
+    prim!(reg, editor, "window-top-line", |s| s.window().scroll_top as isize);
+    prim!(reg, editor, "scroll-window", |s, n: isize| s.scroll(n));
+    prim!(reg, editor, "recenter", |s, place: String| s.recenter(&place));
 
     // Buffers by name, for buffers Scheme draws itself (the file tree).
-    prim!(engine, editor, "ensure-buffer", |s, name: String| {
+    prim!(reg, editor, "ensure-buffer", |s, name: String| {
         s.ensure_buffer(&name);
     });
-    prim!(engine, editor, "set-buffer-text", |s, name: String, text: String| {
+    prim!(reg, editor, "set-buffer-text", |s, name: String, text: String| {
         if let Some(b) = s.buffer_named_mut(&name) {
             b.set_text(&text);
         }
     });
-    prim!(engine, editor, "set-buffer-read-only", |s, name: String, read_only: bool| {
+    prim!(reg, editor, "set-buffer-read-only", |s, name: String, read_only: bool| {
         if let Some(b) = s.buffer_named_mut(&name) {
             b.set_read_only(read_only);
         }
     });
-    prim!(engine, editor, "add-face", |s, name: String, start: isize, end: isize, face: String| {
+    prim!(reg, editor, "add-face", |s, name: String, start: isize, end: isize, face: String| {
         if let Some(b) = s.buffer_named_mut(&name) {
             b.add_face(start.max(0) as usize, end.max(0) as usize, face);
         }
     });
 
     // The sidebar: a window at the left edge, outside the splits.
-    prim!(engine, editor, "sidebar-open", |s, name: String| {
+    prim!(reg, editor, "sidebar-open", |s, name: String| {
         let id = s.ensure_buffer(&name);
         s.open_sidebar(id);
     });
-    prim!(engine, editor, "sidebar-close", |s| s.close_sidebar());
-    prim!(engine, editor, "sidebar-open?", |s| s.sidebar().is_some());
-    prim!(engine, editor, "sidebar-selected?", |s| s.is_sidebar(s.selected_window()));
-    prim!(engine, editor, "select-main-window", |s| s.select_main_window());
+    prim!(reg, editor, "sidebar-close", |s| s.close_sidebar());
+    prim!(reg, editor, "sidebar-open?", |s| s.sidebar().is_some());
+    prim!(reg, editor, "sidebar-selected?", |s| s.is_sidebar(s.selected_window()));
+    prim!(reg, editor, "select-main-window", |s| s.select_main_window());
 
     // Files and folders.
-    engine.register_fn("directory-entries", |dir: String| directory_entries(Path::new(&dir)));
-    prim!(engine, editor, "create-path", |s, path: String| {
+    pure!(reg, "directory-entries", |dir: String| directory_entries(Path::new(&dir)));
+    prim!(reg, editor, "create-path", |s, path: String| {
         let path = PathBuf::from(path);
         let made = if path.to_string_lossy().ends_with('/') {
             std::fs::create_dir_all(&path)
@@ -573,7 +913,7 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
             }
         }
     });
-    prim!(engine, editor, "rename-path", |s, from: String, to: String| {
+    prim!(reg, editor, "rename-path", |s, from: String, to: String| {
         match std::fs::rename(&from, &to) {
             Ok(()) => true,
             Err(e) => {
@@ -582,7 +922,7 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
             }
         }
     });
-    prim!(engine, editor, "delete-path", |s, path: String| {
+    prim!(reg, editor, "delete-path", |s, path: String| {
         let p = Path::new(&path);
         let gone = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
         match gone {
@@ -595,24 +935,24 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     });
 
     // Markdown tables, aligned like Org mode.
-    prim!(engine, editor, "table-at-point?", |s| {
+    prim!(reg, editor, "table-at-point?", |s| {
         let b = s.current();
         let line = b.line();
         crate::markdown::is_table_row(&b.text().line(line).to_string())
     });
-    prim!(engine, editor, "align-table", |s, move_cells: isize| align_table_at_point(s.current(), move_cells));
+    prim!(reg, editor, "align-table", |s, move_cells: isize| align_table_at_point(s.current(), move_cells));
 
     // Language servers.
-    prim!(engine, editor, "lsp-status", |s| s.lsp.status().to_string());
-    prim!(engine, editor, "lsp-goto-definition", |s| s.lsp_request(crate::lsp::RequestKind::Definition));
-    prim!(engine, editor, "lsp-hover", |s| s.lsp_request(crate::lsp::RequestKind::Hover));
-    prim!(engine, editor, "lsp-references", |s| s.lsp_request(crate::lsp::RequestKind::References));
-    prim!(engine, editor, "goto-location", |s, item: String| s.goto_location(&item));
-    prim!(engine, editor, "lsp-rename", |s, name: String| s.lsp_rename(&name));
-    prim!(engine, editor, "lsp-code-actions", |s, start: isize, end: isize| s
+    prim!(reg, editor, "lsp-status", |s| s.lsp.status().to_string());
+    prim!(reg, editor, "lsp-goto-definition", |s| s.lsp_request(crate::lsp::RequestKind::Definition));
+    prim!(reg, editor, "lsp-hover", |s| s.lsp_request(crate::lsp::RequestKind::Hover));
+    prim!(reg, editor, "lsp-references", |s| s.lsp_request(crate::lsp::RequestKind::References));
+    prim!(reg, editor, "goto-location", |s, item: String| s.goto_location(&item));
+    prim!(reg, editor, "lsp-rename", |s, name: String| s.lsp_rename(&name));
+    prim!(reg, editor, "lsp-code-actions", |s, start: isize, end: isize| s
         .lsp_code_actions(start.max(0) as usize, end.max(0) as usize));
-    prim!(engine, editor, "apply-code-action", |s, index: isize| s.apply_code_action(index.max(0) as usize));
-    prim!(engine, editor, "word-at-point", |s| {
+    prim!(reg, editor, "apply-code-action", |s, index: isize| s.apply_code_action(index.max(0) as usize));
+    prim!(reg, editor, "word-at-point", |s| {
         let b = s.buffer();
         let word = |p: usize| b.char_at(p).chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_');
         let (mut a, mut z) = (b.point(), b.point());
@@ -625,26 +965,24 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
         b.substring(a, z)
     });
     // Completion while typing.
-    prim!(engine, editor, "lsp-complete", |s| s.lsp_complete());
-    prim!(engine, editor, "completion-active?", |s| s.completion.is_some());
-    prim!(engine, editor, "completion-refresh", |s| s.completion_refresh());
-    prim!(engine, editor, "completion-move", |s, n: isize| s.completion_move(n));
-    prim!(engine, editor, "completion-accept", |s| s.completion_accept());
-    prim!(engine, editor, "completion-close", |s| s.completion = None);
-    engine.register_fn("word-char?", |text: String| {
-        text.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_')
-    });
-    prim!(engine, editor, "jump-back", |s| {
+    prim!(reg, editor, "lsp-complete", |s| s.lsp_complete());
+    prim!(reg, editor, "completion-active?", |s| s.completion.is_some());
+    prim!(reg, editor, "completion-refresh", |s| s.completion_refresh());
+    prim!(reg, editor, "completion-move", |s, n: isize| s.completion_move(n));
+    prim!(reg, editor, "completion-accept", |s| s.completion_accept());
+    prim!(reg, editor, "completion-close", |s| s.completion = None);
+    pure!(reg, "word-char?", |text: String| text.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_'));
+    prim!(reg, editor, "jump-back", |s| {
         if !s.jump_back() {
             s.message = "No earlier position".into();
         }
     });
-    prim!(engine, editor, "lsp-servers-here", |s| s
+    prim!(reg, editor, "lsp-servers-here", |s| s
         .buffer()
         .file()
         .map(|f| s.lsp.servers_for(f).join(" "))
         .unwrap_or_default());
-    prim!(engine, editor, "diagnostic-summary", |s| {
+    prim!(reg, editor, "diagnostic-summary", |s| {
         let list = s.buffer_diagnostics();
         let count = |sev: u8| list.iter().filter(|(_, d)| d.severity == sev).count();
         let (errors, warnings) = (count(1), count(2));
@@ -658,7 +996,7 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
         parts.join(" ")
     });
     // Jumps to the next (1) or previous (-1) diagnostic, wrapping, and shows it.
-    prim!(engine, editor, "diagnostic-goto", |s, dir: isize| {
+    prim!(reg, editor, "diagnostic-goto", |s, dir: isize| {
         let list = s.buffer_diagnostics();
         let point = s.buffer().point();
         let found = if dir >= 0 {
@@ -679,7 +1017,7 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
         }
     });
     // "line:col  severity: message" for each, for the picker.
-    prim!(engine, editor, "diagnostic-items", |s| {
+    prim!(reg, editor, "diagnostic-items", |s| {
         let rope = s.buffer().text().clone();
         s.buffer_diagnostics()
             .into_iter()
@@ -690,7 +1028,7 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
             })
             .collect::<Vec<_>>()
     });
-    prim!(engine, editor, "goto-line-column", |s, line: isize, col: isize| {
+    prim!(reg, editor, "goto-line-column", |s, line: isize, col: isize| {
         let b = s.buffer_mut();
         let pos = b.line_to_pos((line - 1).max(0) as usize) + (col - 1).max(0) as usize;
         let end = b.line_end(pos.min(b.len()));
@@ -698,19 +1036,21 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     });
 
     // The echo area and minibuffer.
-    prim!(engine, editor, "message", |s, text: String| s.message = text);
-    prim!(engine, editor, "current-message", |s| s.message.clone());
-    prim!(engine, editor, "minibuffer-open", |s, prompt: String| {
+    prim!(reg, editor, "message", |s, text: String| s.message = text);
+    prim!(reg, editor, "current-message", |s| s.message.clone());
+    prim!(reg, editor, "minibuffer-open", |s, prompt: String| {
         s.minibuffer.set_text("");
         s.minibuffer_prompt = Some(prompt);
     });
-    prim!(engine, editor, "minibuffer-close", |s| s.minibuffer_prompt = None);
-    prim!(engine, editor, "minibuffer-active?", |s| s.minibuffer_prompt.is_some());
-    prim!(engine, editor, "minibuffer-contents", |s| s.minibuffer.text().to_string());
+    prim!(reg, editor, "minibuffer-close", |s| s.minibuffer_prompt = None);
+    prim!(reg, editor, "minibuffer-active?", |s| s.minibuffer_prompt.is_some());
+    prim!(reg, editor, "minibuffer-contents", |s| s.minibuffer.text().to_string());
 
+    // Scheme for Lua to run (gmacs.scheme), silently, after the current command.
+    prim!(reg, editor, "scheme", |s, code: String| s.pending_scheme.push(code));
     // Runs Scheme source after the current command (see `pending_eval`).
-    prim!(engine, editor, "eval-string", |s, code: String| s.pending_eval.push(code));
-    prim!(engine, editor, "quit-editor", |s| s.quit_requested = true);
+    prim!(reg, editor, "eval-string", |s, code: String| s.pending_eval.push(code));
+    prim!(reg, editor, "quit-editor", |s| s.quit_requested = true);
 }
 
 /// Aligns the table around the point (its rows are the lines around it that
@@ -787,7 +1127,7 @@ mod tests {
         buf.insert(text);
         buf.goto_char(0);
         let editor = Editor::new(buf);
-        let core = Source { label: "core.scm".into(), path: None };
+        let core = Source { label: "core".into(), path: None };
         (Lisp::new(editor.clone(), vec![core]), editor)
     }
 
@@ -798,7 +1138,7 @@ mod tests {
     #[test]
     fn core_loads() {
         let (_lisp, editor) = lisp_with("");
-        assert_eq!(editor.lock().message, "loaded core.scm");
+        assert_eq!(editor.lock().message, "loaded core");
     }
 
     fn typed(lisp: &mut Lisp, text: &str) {
@@ -1240,12 +1580,12 @@ mod tests {
             assert_eq!(p.title(), "Find file");
             assert!(p.total() > 5);
         }
-        typed(&mut lisp, "corescm");
-        assert_eq!(editor.lock().picker.as_ref().unwrap().selection(), Some("lisp/core.scm"));
+        typed(&mut lisp, "95modeline");
+        assert_eq!(editor.lock().picker.as_ref().unwrap().selection(), Some("lisp/core/95-modeline.scm"));
         lisp.dispatch_key("RET", "");
         let st = editor.lock();
         assert!(st.picker.is_none(), "picking closes it");
-        assert_eq!(st.buffer().name(), "core.scm");
+        assert_eq!(st.buffer().name(), "95-modeline.scm");
     }
 
     #[test]
@@ -1275,7 +1615,7 @@ mod tests {
         std::fs::write(&init, "(defcommand (hi) (insert \"hi\"))").unwrap();
         let editor = Editor::new(Buffer::new("t"));
         let sources = vec![
-            Source { label: "core.scm".into(), path: None },
+            Source { label: "core".into(), path: None },
             Source { label: "init.scm".into(), path: Some(init.clone()) },
         ];
         let mut lisp = Lisp::new(editor.clone(), sources);
@@ -2153,6 +2493,139 @@ mod tests {
             "the server ran it and sent the edit back"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_built_in_core_matches_lisp_core() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lisp/core");
+        let on_disk: Vec<String> =
+            scheme_files(&dir).iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let built_in: Vec<String> = CORE_FILES.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(on_disk, built_in, "add new lisp/core files to CORE_FILES in lisp.rs");
+        let from_dir = Source { label: "core".into(), path: Some(dir) }.read().unwrap();
+        let embedded = Source { label: "core".into(), path: None }.read().unwrap();
+        assert_eq!(from_dir, embedded);
+    }
+
+    #[test]
+    fn lua_names_follow_scheme_names() {
+        assert_eq!(lua_name("buffer-name"), "buffer_name");
+        assert_eq!(lua_name("minibuffer-active?"), "minibuffer_active");
+        assert_eq!(lua_name("pos->line"), "pos_to_line");
+        assert_eq!(lua_name("set-faces!"), "set_faces");
+    }
+
+    #[test]
+    fn lua_has_the_same_primitives() {
+        let (mut lisp, editor) = lisp_with("hello");
+        assert_eq!(lisp.eval_lua("gmacs.buffer_name()").unwrap(), "test");
+        assert_eq!(lisp.eval_lua("gmacs.char_at(1)").unwrap(), "e");
+        lisp.eval_lua("gmacs.goto_char(5); gmacs.insert(' world')").unwrap();
+        assert_eq!(text(&editor), "hello world");
+        assert_eq!(lisp.eval_lua("gmacs.pos_to_line(3)").unwrap(), "0");
+        assert_eq!(lisp.eval_lua("#gmacs.buffer_list()").unwrap(), "1", "lists become tables");
+    }
+
+    #[test]
+    fn lua_commands_and_keys_work_beside_scheme() {
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval_lua(r#"
+            gmacs.command("insert-greeting", function() gmacs.insert("hi from lua") end)
+            gmacs.map("normal", "SPC i g", "insert-greeting")
+            gmacs.map("normal", "Q", function() gmacs.insert("Q!") end)
+        "#)
+        .unwrap();
+        typed(&mut lisp, " ig");
+        assert_eq!(text(&editor), "hi from lua");
+        typed(&mut lisp, "Q");
+        assert_eq!(text(&editor), "hi from luaQ!", "an anonymous function works too");
+        typed(&mut lisp, "u");
+        typed(&mut lisp, "0 :insert-greeting\n");
+        assert_eq!(text(&editor).matches("hi from lua").count(), 2, "Lua commands run from M-x too: {:?}", text(&editor));
+        // Scheme binds a Lua command by name, and Lua runs a Scheme command.
+        lisp.eval(r#"(define-key normal-map "Z" 'insert-greeting)"#).unwrap();
+        lisp.eval_lua(r#"gmacs.map("normal", "W", function() gmacs.run("delete-char-under") end)"#).unwrap();
+        let before = text(&editor).len();
+        typed(&mut lisp, "0W");
+        assert_eq!(text(&editor).len(), before - 1);
+    }
+
+    #[test]
+    fn colon_lua_evaluates_and_errors_are_shown() {
+        let (mut lisp, editor) = lisp_with("");
+        typed(&mut lisp, ":lua 1 + 2\n");
+        assert_eq!(editor.lock().message, "3");
+        typed(&mut lisp, ":lua print('a', 1)\n");
+        assert_eq!(editor.lock().message, "a 1", "print shows in the echo area");
+        typed(&mut lisp, ":lua nope(\n");
+        assert!(editor.lock().message.starts_with("lua:"), "{}", editor.lock().message.clone());
+        lisp.eval_lua(r#"gmacs.command("broken", function() error("oops") end)"#).unwrap();
+        typed(&mut lisp, " :broken\n");
+        { let m = editor.lock().message.clone(); assert!(m.contains("oops"), "{m}"); }
+        typed(&mut lisp, "ix");
+        assert_eq!(text(&editor), "x", "the editor keeps working");
+    }
+
+    #[test]
+    fn lua_hooks_replace_the_modeline_servers_and_theme() {
+        let (mut lisp, _editor) = lisp_with("");
+        lisp.eval_lua(r#"
+            gmacs.hooks.modeline = function() return { {gmacs.buffer_name(), "accent"}, {"lua!", "dim"} } end
+            gmacs.hooks.lsp_servers = function() return { {"python", "pylsp"}, {"rust", "ra", "--flag"} } end
+            gmacs.hooks.syntax_theme = function() return { {"keyword", "red"} } end
+        "#)
+        .unwrap();
+        assert_eq!(
+            lisp.modeline(),
+            vec![Segment { text: "test".into(), face: "accent".into() }, Segment { text: "lua!".into(), face: "dim".into() }]
+        );
+        let servers = lisp.lsp_servers();
+        assert_eq!(servers[1].command, "ra");
+        assert_eq!(servers[1].args, vec!["--flag"]);
+        assert_eq!(lisp.syntax_theme(), vec![("keyword".to_string(), "red".to_string())]);
+        lisp.eval_lua("gmacs.hooks.modeline = function() error('bad') end").unwrap();
+        assert!(lisp.modeline()[0].text.contains("bad"), "a broken hook shows its error");
+    }
+
+    #[test]
+    fn init_lua_loads_after_scheme_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("gmacs-init-lua-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = dir.join("init.lua");
+        std::fs::write(&init, r#"gmacs.map("normal", "Q", function() gmacs.insert("one") end)"#).unwrap();
+        let editor = Editor::new(Buffer::new("t"));
+        let core = Source { label: "core".into(), path: None };
+        let mut lisp = Lisp::with_lua(editor.clone(), vec![core], vec![init.clone()]);
+        assert_eq!(editor.lock().message, "loaded core, init.lua");
+        typed(&mut lisp, "Q");
+        assert_eq!(text(&editor), "one");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&init, r#"gmacs.map("normal", "Q", function() gmacs.insert("two") end)"#).unwrap();
+        assert!(lisp.reload_if_changed());
+        typed(&mut lisp, "0Q");
+        assert_eq!(text(&editor), "twoone");
+        std::fs::write(&init, "this is not lua").unwrap();
+        lisp.reload();
+        { let m = editor.lock().message.clone(); assert!(m.starts_with("init.lua:"), "{m}"); }
+        typed(&mut lisp, "ix");
+        assert!(text(&editor).contains('x'), "Scheme still works when init.lua is broken");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_example_init_lua_works() {
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/init.lua");
+        let editor = Editor::new(Buffer::new("notes"));
+        let mut lisp = Lisp::with_lua(editor.clone(), vec![Source { label: "core".into(), path: None }], vec![example]);
+        assert_eq!(editor.lock().message, "loaded core, init.lua");
+        typed(&mut lisp, " it");
+        assert_eq!(text(&editor), "TODO: ");
+        assert_eq!(lisp.cursor_shape(), "bar", "the Scheme command it ran put it in insert state");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "0 id");
+        assert_eq!(text(&editor).len(), "TODO: ".len() + "2026-01-01".len());
+        let modeline = lisp.modeline();
+        assert_eq!(modeline[0].text, "notes ●");
     }
 
     #[test]
