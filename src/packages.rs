@@ -735,6 +735,24 @@ mod tests {
         }
         for name in &names {
             assert!(is_installed(name), "{name}: {notices:?}");
+            // Grammars: their highlights compile against them.
+            if let Some(lang) = name.strip_prefix("tree-sitter-") {
+                let (language, query) = load_grammar(lang).unwrap();
+                tree_sitter::Query::new(&language, &query).unwrap_or_else(|e| panic!("{lang} highlights: {e:?}"));
+            }
+            // Servers: each command's script runs its program (126/127: it couldn't).
+            if let Some(server) = server_named(name) {
+                for c in server.commands {
+                    let status = Command::new(dir.join("bin").join(c))
+                        .arg("--version")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap_or_else(|e| panic!("{c}: {e}"));
+                    assert!(!matches!(status.code(), Some(126 | 127)), "{c} didn't run: {status}");
+                }
+            }
         }
         std::fs::remove_dir_all(&dir).ok();
     }
