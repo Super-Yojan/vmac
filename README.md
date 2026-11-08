@@ -62,7 +62,7 @@ name order. Its state and functions are in the global `core` table.
 
 ## Keys
 
-- **Motions:** `h j k l`, `w b e` and `W B E`, `0 ^ $`, `gg G`, with counts (`3j`).
+- **Motions:** `h j k l`, `w b e` and `W B E`, `0 ^ $`, `gg G`, with counts (`3j`; `5G` and `5gg` go to line 5).
 - **Operators:** `d c y > <`, followed by a motion (`dw`, `c$`, `y2j`, `dG`),
   a text object (`ciw`, `da(`, `yi"`), or themselves for lines (`dd`, `3yy`, `>>`).
   Shorthands `D C Y`. `cw` changes to the end of the word, like Vim.

@@ -34,17 +34,23 @@ function core.column_at(pos) return pos - core.line_start_at(pos) end
 -- linewise (whole lines). core.define_motion(name, type, step), then bind
 -- it in core.motion_keys, and it works for moving, in visual mode and after
 -- an operator (d, c, y).
+--
+-- A counted motion's step is called once, with the count when one was
+-- typed (nil otherwise), rather than once per repetition: G and gg take
+-- it as a line (5G). core.define_motion(name, type, step, true).
 
 core.motions = {}
 
-function core.define_motion(name, kind, step) core.motions[name] = { kind, step } end
+function core.define_motion(name, kind, step, counted) core.motions[name] = { kind, step, counted } end
 
 function core.motion_type(name) return core.motions[name][1] end
 
 -- Where n repetitions land, or nil when the motion can't go (f with no
--- such character, a search with no match).
-function core.motion_target(name, pos, n)
-  local step = core.motions[name][2]
+-- such character, a search with no match). `given`: n was typed (a counted
+-- motion gets it, else nil).
+function core.motion_target(name, pos, n, given)
+  local _, step, counted = table.unpack(core.motions[name])
+  if counted then return step(pos, given and n or nil) end
   local p = pos
   for _ = 1, n do
     if not p then return nil end
@@ -104,8 +110,15 @@ M("word-backward", "exclusive", function(p) return word_backward(p, false) end)
 M("WORD-backward", "exclusive", function(p) return word_backward(p, true) end)
 M("word-end", "inclusive", function(p) return word_end(p, false) end)
 M("WORD-end", "inclusive", function(p) return word_end(p, true) end)
-M("buffer-start", "linewise", function() return 0 end)
-M("buffer-end", "linewise", function() return V.line_to_pos(V.line_count() - 1) end)
+-- gg and G: the first and last line, or line n with a count (5G, 5gg).
+local function line_or(default)
+  return function(_, n)
+    local line = n and math.min(n, V.line_count()) - 1 or default()
+    return V.line_to_pos(math.max(line, 0))
+  end
+end
+M("buffer-start", "linewise", line_or(function() return 0 end), true)
+M("buffer-end", "linewise", line_or(function() return V.line_count() - 1 end), true)
 
 core.motion_keys = {
   { "h", "left" }, { "l", "right" }, { "j", "down" }, { "k", "up" },
@@ -130,10 +143,9 @@ function core.move_by(motion)
     V.forward_line(core.count)
   elseif motion == "up" then
     V.forward_line(-core.count)
-  elseif motion == "buffer-end" then
-    V.goto_char(core.first_non_blank_at(core.motion_target(motion, V.point(), 1)))
-  elseif motion == "buffer-start" then
-    V.goto_char(0)
+  elseif motion == "buffer-end" or motion == "buffer-start" then
+    -- Like Vim: to the line's first non-blank.
+    V.goto_char(core.first_non_blank_at(core.motion_target(motion, V.point(), core.count, core.count_given)))
   else
     local target = core.motion_target(motion, V.point(), core.count)
     if target then V.goto_char(target) end

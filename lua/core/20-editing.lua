@@ -101,11 +101,13 @@ core.operators = {
 
 core.pending_operator = nil
 core.operator_count = 1
+core.operator_count_given = false
 
 function core.start_operator(op)
   return function()
     core.pending_operator = op
     core.operator_count = core.count
+    core.operator_count_given = core.count_given
     core.state = "operator"
   end
 end
@@ -126,7 +128,8 @@ function core.operator_motion(motion)
       elseif motion == "WORD-forward" then motion = "WORD-end" end
     end
     if motion == "word-end" or motion == "WORD-end" then kind = "inclusive" end
-    local target = core.motion_target(motion, start, n)
+    -- A count before the operator or the motion: d5G and 5dG both to line 5.
+    local target = core.motion_target(motion, start, n, core.count_given or core.operator_count_given)
     -- dw on a line's last word stops at the line's end.
     if target and kind == "exclusive" and (motion == "word-forward" or motion == "WORD-forward")
       and V.pos_to_line(target) > V.pos_to_line(start) then

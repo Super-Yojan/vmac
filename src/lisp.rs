@@ -3629,6 +3629,33 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn g_and_gg_go_to_a_line_with_a_count() {
+        let (mut lisp, editor) = lisp_with("one\ntwo\n  three\nfour\nfive\nsix\n");
+        let line = |e: &Editor| e.lock().buffer().line() + 1;
+        typed(&mut lisp, "G");
+        assert_eq!(line(&editor), 7, "G: the last line");
+        typed(&mut lisp, "3G");
+        assert_eq!(line(&editor), 3);
+        assert_eq!(editor.lock().buffer().column(), 2, "on its first non-blank, like Vim");
+        typed(&mut lisp, "gg");
+        assert_eq!(line(&editor), 1, "gg: the first line");
+        typed(&mut lisp, "5gg");
+        assert_eq!(line(&editor), 5);
+        typed(&mut lisp, "99G");
+        assert_eq!(line(&editor), 7, "past the end: the last line");
+
+        // After an operator, either count is the line: d2G and 2dG.
+        typed(&mut lisp, "4Gd2G");
+        assert_eq!(editor.lock().buffer().text().to_string(), "one\nfive\nsix\n", "lines 2 to 4 gone");
+        typed(&mut lisp, "3G2dG");
+        assert_eq!(editor.lock().buffer().text().to_string(), "one\n", "lines 2 and 3 gone");
+        typed(&mut lisp, "u");
+        assert_eq!(editor.lock().buffer().text().to_string(), "one\nfive\nsix\n");
+        typed(&mut lisp, "ggdG");
+        assert_eq!(editor.lock().buffer().text().to_string(), "", "dG without a count: to the end");
+    }
+
+    #[test]
     fn pdfs_follow_the_theme_until_toggled() {
         let (mut lisp, editor) = lisp_with("");
         assert!(editor.lock().pdf_themed, "on by default");

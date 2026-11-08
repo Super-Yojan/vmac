@@ -848,8 +848,7 @@ mod tests {
         let tex = dir.join("paper.tex");
         let mut s = session_with("");
         s.editor.lock().open_file(&tex).unwrap();
-        // To line 7 (G takes no count).
-        for k in ["6", "j", "SPC", "m", "s"] {
+        for k in ["7", "G", "SPC", "m", "s"] {
             key(&mut s, k);
         }
         let frame = s.frame(VIEW);
