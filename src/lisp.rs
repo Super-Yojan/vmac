@@ -100,6 +100,11 @@ pub struct Source {
 }
 
 impl Source {
+    /// The built-in core's text.
+    fn built_in_core() -> String {
+        join_core(CORE_FILES.iter().map(|(n, t)| (n.to_string(), t.to_string())))
+    }
+
     fn read(&self) -> Option<String> {
         match &self.path {
             Some(p) if p.is_dir() => Some(join_core(scheme_files(p).into_iter().filter_map(|f| {
@@ -107,7 +112,7 @@ impl Source {
                 Some((name, std::fs::read_to_string(&f).ok()?))
             }))),
             Some(p) => std::fs::read_to_string(p).ok(),
-            None => Some(join_core(CORE_FILES.iter().map(|(n, t)| (n.to_string(), t.to_string())))),
+            None => Some(Self::built_in_core()),
         }
     }
 
@@ -274,7 +279,15 @@ impl Lisp {
             };
             self.run_pending_scheme();
             if let Err(e) = result {
-                errors.push((None, format!("{name}: {}", first_line(&e))));
+                // A checkout's file this binary can't run: the built-in one, if it has it.
+                let built_in = LUA_CORE_FILES.iter().find(|(n, c)| *n == name && *c != code).map(|(_, c)| *c);
+                let fell_back = built_in.is_some_and(|c| {
+                    let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+                    lua.load(c).set_name(&name).exec().is_ok()
+                });
+                self.run_pending_scheme();
+                let note = if fell_back { " (using the one built into vmac)" } else { "" };
+                errors.push((None, format!("{name}: {}{note}", first_line(&e))));
             }
         }
         let user_files = self.lua_sources.clone().into_iter().map(|p| (None, p, None));
@@ -366,6 +379,9 @@ impl Lisp {
 
         // The Scheme to load, in order: (label, text, plugin name).
         let mut items: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        // The checkout's lisp/core, read live: it can be newer than this binary.
+        let core_on_disk = self.sources.first().is_some_and(|c| c.path.is_some());
+        let core_label = self.sources.first().map(|c| c.label.clone());
         if let Some(core) = self.sources.first() {
             items.push((core.label.clone(), core.read(), None));
         }
@@ -402,12 +418,22 @@ impl Lisp {
                         let _ = self.engine.run(t.clone());
                     }
                     let kept = self.last_good.get(&label).cloned().filter(|old| self.engine.run(old.clone()).is_ok());
-                    match kept {
-                        Some(old) => {
+                    // A checkout's core that this binary can't run (it calls
+                    // primitives added since the binary was built): the
+                    // core built into the binary, rather than none at all.
+                    let built_in = (kept.is_none() && core_on_disk && plugin.is_none() && Some(&label) == core_label.as_ref())
+                        .then(Source::built_in_core)
+                        .filter(|core| self.engine.run(core.clone()).is_ok());
+                    match (kept, built_in) {
+                        (Some(old), _) => {
                             good.push(old);
                             errors.push(format!("{error} (kept the last version that loaded)"));
                         }
-                        None => errors.push(error),
+                        (None, Some(core)) => {
+                            good.push(core);
+                            errors.push(format!("{error} (using the core built into vmac; rebuild it to use the checkout's)"));
+                        }
+                        (None, None) => errors.push(error),
                     }
                     if let Some(name) = plugin {
                         statuses.insert(name, Status::Failed(first_line(&e)));
@@ -3911,6 +3937,21 @@ for line in sys.stdin:
             "{}",
             editor.lock().buffer().text()
         );
+    }
+
+    #[test]
+    fn a_checkout_core_this_binary_cant_run_falls_back_to_the_built_in_one() {
+        // A core folder calling a primitive this binary doesn't have.
+        let dir = std::env::temp_dir().join(format!("vmac-newer-core-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("00-new.scm"), "(define (x) (primitive-from-the-future))").unwrap();
+        let editor = Editor::new(Buffer::new("*scratch*"));
+        let mut lisp = Lisp::with_config(editor.clone(), vec![Source { label: "core".into(), path: Some(dir.clone()) }], vec![], None);
+        let message = editor.lock().message.clone();
+        assert!(message.contains("using the core built into vmac"), "{message}");
+        assert!(lisp.eval("(procedure? dispatch-key)").unwrap().contains("true"), "the built-in core runs");
+        assert!(!lisp.modeline().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
