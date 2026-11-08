@@ -60,6 +60,14 @@
           (let ((dot (let loop ((i 0)) (if (equal? (substring item i (+ i 1)) ".") i (loop (+ i 1))))))
             (apply-code-action (- (string->number (substring item 0 dot)) 1))))))
 
+;; SPC c f: format the file, or the selected lines.
+(defcommand (format-buffer)
+  (if (visual?)
+      (let ((b (visual-bounds)))
+        (set! evil-state 'normal)
+        (lsp-format-range (car b) (second b)))
+      (lsp-format)))
+
 (defcommand (goto-definition) (lsp-goto-definition))
 (defcommand (find-references) (lsp-references))
 (defcommand (hover-documentation) (lsp-hover))

@@ -689,6 +689,30 @@ impl EditorState {
         }
     }
 
+    /// Asks the server to format the file, or just `range` (a selection).
+    pub fn lsp_format(&mut self, range: Option<(usize, usize)>) {
+        let Some(path) = self.buffer().file().cloned() else {
+            self.message = "This buffer has no file".into();
+            return;
+        };
+        self.lsp_sync();
+        let options = json!({ "tabSize": 4, "insertSpaces": true, "trimTrailingWhitespace": true });
+        let mut params = json!({ "textDocument": { "uri": crate::lsp::path_to_uri(&path) }, "options": options });
+        let method = match range {
+            Some((start, end)) => {
+                let rope = self.buffer().text();
+                let (a, b) = (crate::lsp::char_to_utf16(rope, start), crate::lsp::char_to_utf16(rope, end));
+                params["range"] = json!({ "start": { "line": a.0, "character": a.1 },
+                                          "end": { "line": b.0, "character": b.1 } });
+                "textDocument/rangeFormatting"
+            }
+            None => "textDocument/formatting",
+        };
+        if let Err(e) = self.lsp.send(&path, RequestKind::Format, method, params) {
+            self.message = e;
+        }
+    }
+
     /// Asks for code actions for `start..end` (the cursor, or a selection),
     /// sending the diagnostics there so the server can offer fixes.
     pub fn lsp_code_actions(&mut self, start: usize, end: usize) {
@@ -925,6 +949,14 @@ impl EditorState {
                     self.message = "Nothing to change".into();
                 } else {
                     self.apply_workspace_edit(&edit);
+                }
+            }
+            Reply::Format(path, edits) => {
+                if edits.is_empty() {
+                    self.message = "Already formatted".into();
+                } else {
+                    self.apply_workspace_edit(&vec![(path, edits)]);
+                    self.message = "formatted".into();
                 }
             }
             Reply::CodeActions(actions) => {

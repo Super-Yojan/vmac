@@ -102,7 +102,8 @@ documentation for what's under the cursor in a popup (any key closes it).
 insert state pops up completions that narrow as you type: `C-n`/`C-p` move,
 `RET`/`TAB` accept, `ESC` closes; `.` and `:` ask afresh. `SPC c r` renames
 what's under the cursor everywhere (starting from its current name), and
-`SPC c a` lists fixes and refactorings for the cursor or a visual selection.
+`SPC c a` lists fixes and refactorings for the cursor or a visual selection,
+and `SPC c f` formats the file (or, in visual state, the selected lines).
 Edits to other files open them unsaved, so you can review before `:w`. A server that fails
 to start or stops says why in the echo area. Set `GMACS_LSP_LOG=/tmp/lsp.log`
 to log every message to and from the servers.

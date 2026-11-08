@@ -70,6 +70,7 @@
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
         (list "g d" 'goto-definition) (list "g r" 'find-references)
         (list "SPC c r" 'rename-symbol) (list "SPC c a" 'code-actions)
+        (list "SPC c f" 'format-buffer)
         (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
         (list "SPC c x" 'diagnostic-list)
         ;; Buffers
@@ -105,7 +106,8 @@
         (list "p" 'visual-paste) (list "ESC" 'exit-visual) (list ":" 'ex)
         (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
         (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
-        (list "z z" 'recenter-center) (list "SPC c a" 'code-actions)))
+        (list "z z" 'recenter-center) (list "SPC c a" 'code-actions)
+        (list "SPC c f" 'format-buffer)))
 
 (define-key operator-map "ESC" 'keyboard-quit)
 

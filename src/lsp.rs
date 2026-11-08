@@ -85,6 +85,8 @@ pub enum RequestKind {
     ResolveAction,
     /// workspace/executeCommand: the server acts (and may send edits).
     ExecuteCommand,
+    /// textDocument/formatting or rangeFormatting: edits to the file asked about.
+    Format,
 }
 
 /// A place in a file, as (line, UTF-16 column).
@@ -111,6 +113,8 @@ pub enum Reply {
     CodeActions(Vec<Value>),
     /// A chosen code action, with its edit filled in.
     ResolvedAction(Value),
+    /// Formatting edits for a file (empty when it's formatted already).
+    Format(PathBuf, Vec<TextEdit>),
 }
 
 /// One replacement in a file: positions as (line, UTF-16 column).
@@ -435,7 +439,8 @@ struct Client {
     open: HashMap<PathBuf, (u64, u64, i32)>,
     next_id: i64,
     /// Requests waiting for an answer, by id.
-    pending: HashMap<i64, RequestKind>,
+    /// Requests waiting for an answer, by id, with the file each was about.
+    pending: HashMap<i64, (RequestKind, PathBuf)>,
 }
 
 impl Client {
@@ -532,11 +537,11 @@ impl Client {
     }
 
     /// Sends a request with its own params; the answer comes back as `kind`.
-    fn send(&mut self, kind: RequestKind, method: &str, params: Value) {
+    fn send(&mut self, kind: RequestKind, path: &Path, method: &str, params: Value) {
         let id = self.next_id;
         self.next_id += 1;
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.pending.insert(id, kind);
+        self.pending.insert(id, (kind, path.to_path_buf()));
         if self.ready {
             self.write(&message);
         } else {
@@ -563,7 +568,7 @@ impl Client {
             _ => {}
         }
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.pending.insert(id, kind);
+        self.pending.insert(id, (kind, path.to_path_buf()));
         if self.ready {
             self.write(&message);
         } else {
@@ -672,7 +677,7 @@ impl Lsp {
             .iter_mut()
             .find(|c| c.open.contains_key(path))
             .ok_or_else(|| "No language server for this file".to_string())?;
-        client.send(kind, method, params);
+        client.send(kind, path, method, params);
         Ok(())
     }
 
@@ -783,7 +788,7 @@ fn handle(
 
     // The answer to one of our requests.
     if method.is_empty()
-        && let Some(kind) = id.as_ref().and_then(Value::as_i64).and_then(|n| client.pending.remove(&n))
+        && let Some((kind, path)) = id.as_ref().and_then(Value::as_i64).and_then(|n| client.pending.remove(&n))
     {
         let result = &message["result"];
         replies.push(match kind {
@@ -795,6 +800,7 @@ fn handle(
             RequestKind::CodeActions => Reply::CodeActions(result.as_array().cloned().unwrap_or_default()),
             RequestKind::ResolveAction => Reply::ResolvedAction(result.clone()),
             RequestKind::ExecuteCommand => return false,
+            RequestKind::Format => Reply::Format(path, parse_text_edits(result)),
         });
         return true;
     }
@@ -962,6 +968,12 @@ while True:
         send({"jsonrpc": "2.0", "id": 500, "method": "workspace/applyEdit", "params": {"edit": {"changes": {uri: [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// ran\n"}]}}}})
         send({"jsonrpc": "2.0", "id": m["id"], "result": None})
+    elif method in ("textDocument/formatting", "textDocument/rangeFormatting"):
+        # Formats line 1 (or the start of the range): "let  x=1" -> "let x = 1;"
+        line = m["params"]["range"]["start"]["line"] if method == "textDocument/rangeFormatting" else 1
+        send({"jsonrpc": "2.0", "id": m["id"], "result": [
+            {"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 8}},
+             "newText": "let x = 1;"}]})
     elif method == "textDocument/hover":
         line = m["params"]["position"]["line"]
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown",
@@ -1157,6 +1169,41 @@ while True:
         let edits: usize = edit.iter().map(|(_, e)| e.len()).sum();
         assert_eq!(edits, 2, "the definition and the call: {edit:?}");
         assert!(edit.iter().flat_map(|(_, e)| e).all(|e| e.text == "hello"));
+    }
+
+    /// Against the real typescript-language-server: `cargo test -- --ignored typescript`.
+    #[test]
+    #[ignore]
+    fn typescript_server_formats() {
+        let dir = std::env::temp_dir().join(format!("gmacs-ts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.ts");
+        let text = "let  x=1\n";
+        std::fs::write(&file, text).unwrap();
+        let mut lsp = Lsp::default();
+        lsp.set_configs(vec![ServerConfig {
+            language: "typescript".into(),
+            command: "typescript-language-server".into(),
+            args: vec!["--stdio".into()],
+        }]);
+        let docs = vec![Doc { path: file.clone(), language: "typescript", revision: 0, saves: 0, text: Rope::from_str(text) }];
+        lsp.pump(&docs, |_| dir.clone());
+        let params = json!({ "textDocument": { "uri": path_to_uri(&file) },
+                             "options": { "tabSize": 4, "insertSpaces": true } });
+        lsp.send(&file, RequestKind::Format, "textDocument/formatting", params).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..300 {
+            lsp.pump(&docs, |_| dir.clone());
+            replies.extend(lsp.take_replies());
+            if !replies.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        let Some(Reply::Format(path, edits)) = replies.first() else { panic!("{replies:?}") };
+        assert_eq!(path, &file);
+        assert!(!edits.is_empty(), "it found something to fix in `let  x=1`");
     }
 
     /// Against the real rust-analyzer: `cargo test -- --ignored rust_analyzer`.

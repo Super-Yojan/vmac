@@ -1043,6 +1043,9 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "lsp-references", |s| s.lsp_request(crate::lsp::RequestKind::References));
     prim!(reg, editor, "goto-location", |s, item: String| s.goto_location(&item));
     prim!(reg, editor, "lsp-rename", |s, name: String| s.lsp_rename(&name));
+    prim!(reg, editor, "lsp-format", |s| s.lsp_format(None));
+    prim!(reg, editor, "lsp-format-range", |s, start: isize, end: isize| s
+        .lsp_format(Some((start.max(0) as usize, end.max(0) as usize))));
     prim!(reg, editor, "lsp-code-actions", |s, start: isize, end: isize| s
         .lsp_code_actions(start.max(0) as usize, end.max(0) as usize));
     prim!(reg, editor, "apply-code-action", |s, index: isize| s.apply_code_action(index.max(0) as usize));
@@ -2938,6 +2941,38 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         typed(&mut lisp, " wv tz");
         assert_eq!(editor.lock().window_count(), 1);
         assert_eq!(editor.lock().message, "zen");
+    }
+
+    #[test]
+    fn spc_c_f_formats_the_file_keeping_the_cursor() {
+        let (mut lisp, editor, dir) = with_fake_server("format", "fn main() {}\nlet  x=1\nx\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "G");
+        let line = editor.lock().buffer().line();
+        typed(&mut lisp, " cf");
+        assert!(pump_until(&mut lisp, &editor, |st| st.message == "formatted"), "{}", editor.lock().message.clone());
+        let st = editor.lock();
+        assert_eq!(st.buffer().text().to_string(), "fn main() {}\nlet x = 1;\nx\n");
+        assert_eq!(st.buffer().line(), line, "the cursor stayed on its line");
+        drop(st);
+        typed(&mut lisp, "u");
+        assert_eq!(editor.lock().buffer().text().to_string(), "fn main() {}\nlet  x=1\nx\n", "one undo step");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spc_c_f_in_visual_formats_the_selection() {
+        let (mut lisp, editor, dir) = with_fake_server("format-range", "fn main() {}\nlet  x=1\nlet  x=1\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "jjV cf");
+        assert!(pump_until(&mut lisp, &editor, |st| st.message == "formatted"));
+        assert_eq!(
+            editor.lock().buffer().text().to_string(),
+            "fn main() {}\nlet  x=1\nlet x = 1;\n",
+            "only the selected line"
+        );
+        assert_eq!(lisp.cursor_shape(), "box", "out of visual state");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
