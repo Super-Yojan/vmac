@@ -5,7 +5,12 @@ Scheme and Lua, and can be redefined while it runs.</p>
 
 <p align="center"><a href="https://super-yojan.dev/vmac/">Install and configure</a></p>
 
-<p align="center"><img src="assets/screenshot.png" alt="vmac with the file tree, a Rust file and the README side by side" width="900"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
+    <img src="assets/screenshot-light.png" alt="vmac with the file tree, a Rust file and the README side by side" width="900">
+  </picture>
+</p>
 
 vmac was called gmacs. Plugins that use `gmacs.*` in Lua still work (it's an
 alias of `vmac`), and `~/.config/gmacs/` is read while `~/.config/vmac/`
@@ -216,6 +221,12 @@ The styles are faces, defined in Scheme with attributes:
 (set-faces! (append (heading-faces 1 2.2 'magenta)   ; a bigger, magenta h1
                     (list (list "md-bold" 'weight 'bold 'color 'yellow))))
 ```
+
+## Light and dark
+
+vmac follows the system: light or dark, switching when the system does.
+`:theme dark` (or `light`, or `system` to follow it again), `(set-theme "dark")`
+or `vmac.set_theme("dark")` pins one.
 
 ## Font
 

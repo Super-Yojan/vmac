@@ -1476,6 +1476,16 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         }
     });
     prim!(reg, editor, "font", |s| s.font.clone().unwrap_or_default());
+    // Light or dark: "system" follows the system's appearance as it changes.
+    prim!(reg, editor, "set-theme", |s, mode: String| {
+        if matches!(mode.as_str(), "system" | "light" | "dark") {
+            s.message = format!("theme: {mode}");
+            s.theme_mode = mode;
+        } else {
+            s.message = format!("{mode}: the theme is system, light or dark");
+        }
+    });
+    prim!(reg, editor, "theme", |s| s.theme_mode.clone());
     prim!(reg, editor, "font-list", |s| s.fonts.clone());
     prim!(reg, editor, "terminal-shell", |s| s.terminal_shell.clone());
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
@@ -3393,6 +3403,18 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         assert!(editor.lock().picker.is_some());
         typed(&mut lisp, "hack\n");
         assert_eq!(editor.lock().font.as_deref(), Some("Hack Nerd Font Mono"), "picked from the list");
+    }
+
+    #[test]
+    fn the_theme_follows_the_system_unless_set() {
+        let (mut lisp, editor) = lisp_with("");
+        assert_eq!(editor.lock().theme_mode, "system");
+        typed(&mut lisp, ":theme dark\n");
+        assert_eq!(editor.lock().theme_mode, "dark");
+        typed(&mut lisp, ":theme purple\n");
+        assert_eq!(editor.lock().theme_mode, "dark", "only system, light or dark");
+        lisp.eval_lua(r#"vmac.set_theme("system")"#).unwrap();
+        assert_eq!(lisp.eval("(theme)").unwrap(), "\"system\"");
     }
 
     #[test]

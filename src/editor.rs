@@ -310,6 +310,8 @@ pub struct EditorState {
     /// families installed, which the view fills in.
     pub font: Option<String>,
     pub fonts: Vec<String>,
+    /// "system" (follow light or dark mode as the system does), "light" or "dark".
+    pub theme_mode: String,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
@@ -352,6 +354,7 @@ impl EditorState {
             terminal_shell: default_shell(),
             font: None,
             fonts: Vec::new(),
+            theme_mode: "system".into(),
             terminals_to_kill: Vec::new(),
             events: Vec::new(),
             search_cache: None,

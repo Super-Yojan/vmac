@@ -38,6 +38,10 @@ pub struct Shell {
     lisp: Lisp,
     focus: FocusHandle,
     syntax: Syntax,
+    /// The light/dark mode last applied, and the subscription that hears
+    /// the system's appearance change.
+    applied_mode: Option<gpui_kit::component::ThemeMode>,
+    _appearance: gpui_kit::Subscription,
 }
 
 impl Shell {
@@ -58,7 +62,36 @@ impl Shell {
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
         Self::drive_terminals(cx);
-        Self { editor, lisp, focus, syntax: Syntax::default() }
+        // Light or dark as the system is, and again whenever it changes.
+        let appearance = cx.observe_window_appearance(window, |shell, window, cx| {
+            shell.applied_mode = None;
+            shell.apply_theme(window, cx);
+        });
+        let mut shell = Self {
+            editor,
+            lisp,
+            focus,
+            syntax: Syntax::default(),
+            applied_mode: None,
+            _appearance: appearance,
+        };
+        shell.apply_theme(window, cx);
+        shell
+    }
+
+    /// Applies the theme mode the editor asks for (`:theme`): the system's
+    /// appearance for "system". Does nothing when it's already applied.
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::ThemeMode;
+        let wanted = match self.editor.lock().theme_mode.as_str() {
+            "light" => ThemeMode::Light,
+            "dark" => ThemeMode::Dark,
+            _ => window.appearance().into(),
+        };
+        if self.applied_mode != Some(wanted) {
+            self.applied_mode = Some(wanted);
+            gpui_kit::component::Theme::change(wanted, Some(window), cx);
+        }
     }
 
     /// Reloads lisp/core/ and init.scm when they change on disk.
@@ -541,6 +574,7 @@ fn window_rows(r: &Rect, area_height: f32) -> usize {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_theme(window, cx);
         let viewport = window.viewport_size();
         let (width, height): (f32, f32) = (viewport.width.into(), viewport.height.into());
         // The echo area takes the bottom row; windows share the rest.

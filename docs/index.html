@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>vmac: the editor you rewrite while you use it</title>
 <meta name="description" content="vmac is a modal, evil-style editor on GPUI whose behavior is written in Steel Scheme and Lua and can be redefined while it runs. Install it and configure it.">
 <link rel="icon" href="logo.svg" type="image/svg+xml">
@@ -28,6 +29,34 @@
     --red: #fca5a5;
     --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
     --sans: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+    --header: rgba(11,13,18,.8);
+    --glow: rgba(139,92,246,.20);
+  }
+  /* Light: the page turns light; code (the window, snippets, the panel and
+     commands) stays dark in both, like the editor it shows. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #fbfbfd;
+      --surface: #ffffff;
+      --raised: #f2f3f7;
+      --border: #e4e6ee;
+      --border-strong: #d3d6e2;
+      --text: #12141c;
+      --muted: #555d72;
+      --dim: #858ca0;
+      --violet: #7c3aed;
+      --violet-soft: #6d28d9;
+      --teal: #0f766e;
+      --header: rgba(251,251,253,.82);
+      --glow: rgba(124,58,237,.12);
+    }
+  }
+  .window, .vis, .panel, .cmd {
+    --bg: #0b0d12; --surface: #12151d; --raised: #191d27;
+    --border: #232836; --border-strong: #2f3546;
+    --text: #e8eaf0; --muted: #9aa1b3; --dim: #646b80;
+    --violet-soft: #c4b5fd; --teal: #5eead4;
+    color: var(--text);
   }
   * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
@@ -41,7 +70,7 @@
   .eyebrow { font: 500 12px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--teal); }
 
   /* Header */
-  header { position: sticky; top: 0; z-index: 20; background: rgba(11,13,18,.8); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); }
+  header { position: sticky; top: 0; z-index: 20; background: var(--header); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); }
   header .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
   .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font: 700 17px var(--mono); }
   .brand:hover { text-decoration: none; }
@@ -58,7 +87,7 @@
   .hero { position: relative; padding: 84px 0 40px; text-align: center; overflow: hidden; }
   .hero::before {
     content: ""; position: absolute; inset: -20% 10% auto; height: 520px; pointer-events: none;
-    background: radial-gradient(closest-side, rgba(139,92,246,.20), transparent 70%);
+    background: radial-gradient(closest-side, var(--glow), transparent 70%);
   }
   .pill { display: inline-flex; gap: 8px; align-items: center; border: 1px solid var(--border-strong); background: var(--surface); border-radius: 999px; padding: 5px 14px 5px 6px; font-size: 13px; color: var(--muted); }
   .pill b { background: var(--violet); color: #fff; font: 600 11px var(--mono); padding: 2px 8px; border-radius: 999px; }
@@ -139,7 +168,7 @@
   .step.on .t { color: var(--text); }
   .step.on .t i { color: var(--violet-soft); }
   .step.on .d { display: block; }
-  .panel { position: sticky; top: 90px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
+  .panel { position: sticky; top: 90px; background: #12151d; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
   .panel .bar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); font: 12px var(--mono); color: var(--dim); }
   .panel pre { margin: 0; padding: 18px 20px; font: 13px/1.7 var(--mono); overflow-x: auto; min-height: 270px; }
   .panel pre[hidden] { display: none; }
