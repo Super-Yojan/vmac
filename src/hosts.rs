@@ -25,6 +25,10 @@ pub struct Hosts {
     connect: Sender<(String, Result<Client, String>)>,
     /// What the window says until the next key ("connecting to ...").
     notice: Option<String>,
+    /// The session shown, and the one before (SPC S l goes back to it), as
+    /// (machine's label, session).
+    shown: Option<(String, String)>,
+    last: Option<(String, String)>,
 }
 
 const LOCAL: &str = "local";
@@ -32,7 +36,15 @@ const LOCAL: &str = "local";
 impl Hosts {
     pub fn new(home: Box<dyn Host>) -> Self {
         let (connect, connected) = channel();
-        Self { machines: vec![Machine { label: String::new(), host: home }], active: 0, connected, connect, notice: None }
+        Self {
+            machines: vec![Machine { label: String::new(), host: home }],
+            active: 0,
+            connected,
+            connect,
+            notice: None,
+            shown: None,
+            last: None,
+        }
     }
 
     /// `name` (a session of machine `of`) as machine `seen_from` lists it.
@@ -108,6 +120,7 @@ impl Hosts {
                         None => self.notice = Some(format!("No session {name}")),
                     },
                     WindowRequest::Connect { host, target } => self.start_connect(host, target),
+                    WindowRequest::Last => self.go_back(),
                 }
             }
         }
@@ -129,6 +142,33 @@ impl Hosts {
         }
         self.tell_foreign();
         changed
+    }
+
+    /// Notes the session shown: when it changed, the one before is last.
+    fn note_shown(&mut self, session: &str) {
+        let now = (self.machines[self.active].label.clone(), session.to_string());
+        if session.is_empty() || self.shown.as_ref() == Some(&now) {
+            return;
+        }
+        if let Some(before) = self.shown.replace(now) {
+            self.last = Some(before);
+        }
+    }
+
+    /// SPC S l: the session shown before, on whichever machine (while it
+    /// and its machine are still there).
+    fn go_back(&mut self) {
+        let target = self.last.clone().and_then(|(label, session)| {
+            let machine = self.machines.iter().position(|m| m.label == label)?;
+            self.machines[machine].host.sessions().contains(&session).then_some((machine, session))
+        });
+        match target {
+            Some((machine, session)) => {
+                self.active = machine;
+                self.machines[machine].host.switch_to(&session);
+            }
+            None => self.notice = Some("No other session".into()),
+        }
     }
 
     fn start_connect(&mut self, host: String, target: String) {
@@ -178,6 +218,7 @@ impl Host for Hosts {
     fn frame(&mut self, viewport: Viewport) -> Frame {
         let active = self.active;
         let mut frame = self.machines[active].host.frame(viewport);
+        self.note_shown(&frame.session);
         // Another machine's session: its name says which machine.
         if active > 0 {
             let label = &self.machines[active].label;
@@ -313,6 +354,11 @@ mod tests {
         assert!(list.contains(&format!("{label}:vmac-agent-test")), "{list}");
         ex(&mut hosts, &format!("lua vmac.session_switch('{label}:vmac-agent-test')"));
         assert_eq!(hosts.active, 1);
+        // SPC S l, from the far machine back to this one's session.
+        let _ = hosts.frame(VIEW);
+        ex(&mut hosts, "lua vmac.session_last()");
+        let notice = said(&mut hosts);
+        assert_eq!(hosts.active, 0, "{notice}");
     }
 
     #[test]
@@ -342,6 +388,16 @@ mod tests {
                 // And back.
                 ex(&mut hosts, "lua vmac.session_switch('local:main')");
                 seen.push(hosts.active.to_string());
+                // SPC S l: back to the other machine's session, and again.
+                let _ = hosts.frame(VIEW);
+                ex(&mut hosts, "lua vmac.session_last()");
+                let _ = hosts.frame(VIEW);
+                let session = hosts.frame(VIEW).session;
+                seen.push(format!("{} {session}", hosts.active));
+                ex(&mut hosts, "lua vmac.session_last()");
+                let _ = hosts.frame(VIEW);
+                let session = hosts.frame(VIEW).session;
+                seen.push(format!("{} {session}", hosts.active));
                 drop(hosts);
                 crate::daemon::kill(&socket).unwrap();
                 seen
@@ -354,6 +410,8 @@ mod tests {
         assert_eq!(seen[2], "notes / main,notes,local:main", "named as that machine sees them");
         assert!(seen[3].contains("[box:notes]"), "{}", seen[3]);
         assert_eq!(seen[4], "0", "back on this machine");
+        assert_eq!(seen[5], "1 notes", "SPC S l goes back to the other machine's session");
+        assert_eq!(seen[6], "0 main", "and back again");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

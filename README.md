@@ -223,7 +223,7 @@ windows, terminals, language servers and agent, so one project's files
 never show up in another's buffer list. The first project a session opens
 names it; with several, the modeline starts with `[name]`.
 
-- `SPC S s` switches session, `SPC S l` goes back to the last one.
+- `SPC S s` switches session, `SPC S l` goes back to the last one (on whichever machine it is).
 - `SPC S n` makes one (it asks a name), `SPC S r` renames this one.
 - `SPC S k` kills one (not with unsaved files: `SPC S K` kills it anyway).
 - `SPC S c` (or `:connect HOST [TARGET]`) adds another machine's sessions

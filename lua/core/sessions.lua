@@ -3,7 +3,7 @@
 -- project's files never show up in another's buffer list.
 --
 --   SPC p p   open a project: its own session (made the first time)
---   SPC S s   switch session                SPC S l   the last session
+--   SPC S s   switch session                SPC S l   the last session (on any machine)
 --   SPC S n   new session (asks a name)     SPC S r   rename this session
 --   SPC S k   kill a session                SPC S K   kill it, unsaved files and all
 --   SPC S c   connect to another machine (:connect HOST [TARGET]), over

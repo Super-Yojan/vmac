@@ -79,7 +79,7 @@ pub enum ToClient {
 /// Bumped when the messages change in a way older servers can't read: each
 /// version has its own socket, so a newer window never talks to an older
 /// server (stop that one with its own `vmac kill-server`).
-const PROTOCOL: u32 = 5;
+const PROTOCOL: u32 = 6;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.

@@ -67,6 +67,8 @@ pub enum WindowRequest {
     Switch(String),
     /// Connect to another machine (`HOST [TARGET]`).
     Connect { host: String, target: String },
+    /// Back to the session shown before, whichever machine it's on.
+    Last,
 }
 
 impl Host for Server {
@@ -298,6 +300,8 @@ impl Server {
                 None => self.message(format!("No session {name}")),
             },
             SessionRequest::Connect { host, target } => self.window_requests.push(WindowRequest::Connect { host, target }),
+            // In a window with other machines' sessions, it knows which was last.
+            SessionRequest::Last if !self.foreign.is_empty() => self.window_requests.push(WindowRequest::Last),
             SessionRequest::Last => match self.last.filter(|id| self.list.iter().any(|e| e.id == *id)) {
                 Some(id) => self.switch(id),
                 None => self.message("No other session".into()),
