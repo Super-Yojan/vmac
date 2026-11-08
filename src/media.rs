@@ -155,6 +155,11 @@ pub struct PdfView {
     zoom_wheel: Rc<Cell<f32>>,
     /// What to call with a double-click on a page (SyncTeX).
     on_double_click: OnPageClick,
+    /// A box marked on a page for a moment (forward search): the page, and
+    /// x, y, width, height in PDF points; numbered, so the timer that clears
+    /// it leaves a newer one.
+    highlight: Option<(usize, (f32, f32, f32, f32))>,
+    highlights: u64,
 }
 
 /// What a PDF view calls with a double-click on a page: the window, the
@@ -187,6 +192,8 @@ impl PdfView {
             on_zoom,
             zoom_wheel: Rc::new(Cell::new(0.)),
             on_double_click,
+            highlight: None,
+            highlights: 0,
         }
     }
 
@@ -300,8 +307,42 @@ impl PdfView {
         cx.notify();
     }
 
+    /// Scrolls a box on a page into view, a third of the way down the
+    /// window (and to its middle sideways when zoomed wide), and marks it
+    /// for a moment.
+    fn reveal(&mut self, ix: usize, b: (f32, f32, f32, f32), cx: &mut Context<Self>) {
+        let Some(&(own, _)) = self.sizes.as_ref().ok().and_then(|s| s.get(ix)) else { return };
+        let (x, y, width, _) = b;
+        let scale = self.page_width(ix) / own.max(1.);
+        let top = if ix == 0 { PAGE_MARGIN } else { 0. };
+        let viewport = f32::from(self.list.viewport_bounds().size.height);
+        let viewport = if viewport > 0. { viewport } else { 600. };
+        let offset = (top + y * scale - viewport / 3.).max(0.);
+        self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(offset) });
+        let content = self.content_width();
+        let room = (content - self.width).max(0.);
+        if room > 0. {
+            let middle = (content - self.page_width(ix)) / 2. + (x + width / 2.) * scale;
+            self.sideways.set_offset(point(px(-(middle - self.width / 2.).clamp(0., room)), px(0.)));
+        }
+        self.highlight = Some((ix, b));
+        self.highlights += 1;
+        let n = self.highlights;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.highlights == n {
+                    view.highlight = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Does the scrolls asked for since the last one done.
-    pub fn scroll(&mut self, asked: &[(u64, MediaScroll)]) {
+    pub fn scroll(&mut self, asked: &[(u64, MediaScroll)], cx: &mut Context<Self>) {
         let done = self.scrolled;
         for &(n, how) in asked.iter().filter(|(n, _)| *n > done) {
             self.scrolled = n;
@@ -326,6 +367,7 @@ impl PdfView {
                 MediaScroll::Pages(n) => self.list.scroll_to(page(top.item_ix.saturating_add_signed(n as isize))),
                 MediaScroll::Page(ix) => self.list.scroll_to(page(ix)),
                 MediaScroll::End => self.list.scroll_to_end(),
+                MediaScroll::Reveal { page, x, y, width, height } => self.reveal(page, (x, y, width, height), cx),
             }
         }
     }
@@ -429,6 +471,21 @@ impl PdfView {
                     .border_color(border)
                     .shadow_sm()
                     .child(body)
+                    .children(self.highlight.filter(|(page, _)| *page == ix).map(|(_, (x, y, bw, bh))| {
+                        // The box forward search found, a little larger than its text.
+                        let scale = shown / w.max(1.);
+                        let accent = cx.theme().primary;
+                        div()
+                            .absolute()
+                            .left(px(x * scale - 3.))
+                            .top(px(y * scale - 3.))
+                            .w(px(bw * scale + 6.))
+                            .h(px(bh * scale + 6.))
+                            .rounded(px(3.))
+                            .bg(accent.opacity(0.25))
+                            .border_1()
+                            .border_color(accent)
+                    }))
                     .child(self.double_click_catcher(ix, (w, h))),
             )
             .child(div().pt(px(4.)).text_xs().text_color(muted).child(format!("{}", ix + 1)))
@@ -655,6 +712,8 @@ impl ImageView {
                 MediaScroll::Sideways(n) => self.set_offset(x + n as f32 * LINE_STEP, y),
                 MediaScroll::Page(0) => self.set_offset(x, 0.),
                 MediaScroll::Page(_) | MediaScroll::End => self.set_offset(x, f32::MAX),
+                // A spot in a PDF: not for an image.
+                MediaScroll::Reveal { .. } => {}
             }
         }
     }

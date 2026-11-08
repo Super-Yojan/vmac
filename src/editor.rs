@@ -883,18 +883,8 @@ impl EditorState {
     /// already, closes that instead. True when it opened one.
     pub fn toggle_file_beside(&mut self, path: &Path) -> std::io::Result<bool> {
         let path = self.resolve(path);
-        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let want = canonical(&path);
         let here = self.selected;
-        let showing: Vec<WindowId> = self
-            .window_order()
-            .into_iter()
-            .filter(|&w| w != here && !self.is_sidebar(w))
-            .filter(|&w| {
-                let file = self.window_by_id(w).and_then(|w| self.buffer_by_id(w.buffer)).and_then(|b| b.file());
-                file.is_some_and(|f| canonical(f) == want)
-            })
-            .collect();
+        let showing = self.windows_showing(&path);
         if !showing.is_empty() {
             for w in showing {
                 self.select_window(w);
@@ -903,13 +893,57 @@ impl EditorState {
             self.select_window(here);
             return Ok(false);
         }
+        self.open_beside(&path).map(|()| true)
+    }
+
+    /// Shows a file in a new window on the right unless another window shows
+    /// it already, leaving the cursor here.
+    pub fn show_file_beside(&mut self, path: &Path) -> std::io::Result<()> {
+        let path = self.resolve(path);
+        if self.windows_showing(&path).is_empty() { self.open_beside(&path) } else { Ok(()) }
+    }
+
+    fn open_beside(&mut self, path: &Path) -> std::io::Result<()> {
+        let here = self.selected;
         self.split_window(Axis::Row);
-        let opened = self.open_file(&path);
+        let opened = self.open_file(path);
         if opened.is_err() {
             self.close_window();
         }
         self.select_window(here);
-        opened.map(|()| true)
+        opened
+    }
+
+    /// The windows other than the selected one (and the sidebar) showing a file.
+    fn windows_showing(&self, path: &Path) -> Vec<WindowId> {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canonical(path);
+        self.window_order()
+            .into_iter()
+            .filter(|&w| w != self.selected && !self.is_sidebar(w))
+            .filter(|&w| {
+                let file = self.window_by_id(w).and_then(|w| self.buffer_by_id(w.buffer)).and_then(|b| b.file());
+                file.is_some_and(|f| canonical(f) == want)
+            })
+            .collect()
+    }
+
+    /// Asks the view of the buffer on a file to scroll (several may be asked
+    /// for between two frames, so they're numbered and kept a while).
+    pub fn queue_media_scroll(&mut self, buffer: BufferId, scroll: crate::frame::MediaScroll) {
+        let queue = self.media_scroll.entry(buffer).or_default();
+        let n = queue.last().map_or(0, |(n, _)| *n) + 1;
+        queue.push((n, scroll));
+        if queue.len() > 64 {
+            queue.remove(0);
+        }
+    }
+
+    /// The buffer on a file, if one is open.
+    pub fn buffer_for_file(&self, path: &Path) -> Option<BufferId> {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canonical(&self.resolve(path));
+        self.buffers.iter().find(|(_, b)| b.file().is_some_and(|f| canonical(f) == want)).map(|(id, _)| *id)
     }
 
     /// Shows a file in a window other than this one (the source of the PDF
@@ -917,16 +951,10 @@ impl EditorState {
     /// new split. That window is selected.
     pub fn show_file_elsewhere(&mut self, path: &Path) -> std::io::Result<()> {
         let path = self.resolve(path);
-        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let want = canonical(&path);
         let here = self.selected;
         let others: Vec<WindowId> =
             self.window_order().into_iter().filter(|&w| w != here && !self.is_sidebar(w)).collect();
-        let showing = others.iter().copied().find(|&w| {
-            let file = self.window_by_id(w).and_then(|w| self.buffer_by_id(w.buffer)).and_then(|b| b.file());
-            file.is_some_and(|f| canonical(f) == want)
-        });
-        if let Some(w) = showing {
+        if let Some(&w) = self.windows_showing(&path).first() {
             self.select_window(w);
             return Ok(());
         }

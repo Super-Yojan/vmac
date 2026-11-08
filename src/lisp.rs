@@ -902,6 +902,13 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             Err(e) => format!("{path}: {e}"),
         }
     });
+    // A file in a window on the right unless one shows it: "" or what went wrong.
+    prim!(reg, editor, "show-file-beside", |s, path: String| {
+        match s.show_file_beside(&expand_home(&path)) {
+            Ok(()) => String::new(),
+            Err(e) => format!("{path}: {e}"),
+        }
+    });
     // A file in a window on the right, the cursor staying here, or that
     // window closed if there is one: "opened", "closed", or what went wrong.
     prim!(reg, editor, "toggle-file-beside", |s, path: String| {
@@ -1306,13 +1313,16 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             }
         };
         let id = s.window().buffer;
-        let queue = s.media_scroll.entry(id).or_default();
-        let n = queue.last().map_or(0, |(n, _)| *n) + 1;
-        queue.push((n, scroll));
-        // Plenty for the keys typed between two frames.
-        if queue.len() > 64 {
-            queue.remove(0);
-        }
+        s.queue_media_scroll(id, scroll);
+    });
+    // Forward search: the PDF's view scrolled to a box on a page (from 1),
+    // in PDF points from its top left, and marked for a moment.
+    prim!(reg, editor, "pdf-reveal", |s, pdf: String, page: isize, x: f64, y: f64, width: f64, height: f64| {
+        let Some(id) = s.buffer_for_file(&expand_home(&pdf)) else { return false };
+        let page = (page - 1).max(0) as usize;
+        let (x, y, width, height) = (x as f32, y as f32, width as f32, height as f32);
+        s.queue_media_scroll(id, crate::frame::MediaScroll::Reveal { page, x, y, width, height });
+        true
     });
     prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
     // SPC t m: markup hidden (the default) -> as typed -> rendered, like the preview.

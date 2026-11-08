@@ -138,3 +138,37 @@ vmac.hooks.pdf_double_click = function(pdf, page, x, y)
   vmac.goto_line_column(line, column + 1)
   vmac.message(file:match("[^/]+$") .. ":" .. line)
 end
+
+---- From the source to the PDF: SyncTeX's forward search
+--
+-- SPC m s in a LaTeX file shows where the cursor's line is in its PDF
+-- (opened beside it if it isn't showing): scrolled to, and marked for a
+-- moment. Like the other way, it needs synctex and a PDF built with
+-- -synctex=1.
+
+-- Where a source line is in its PDF: the page (from 1) and the box of
+-- its text, x, y (top left), width and height in PDF points (or nil).
+function core.synctex_view(file, line, column, pdf)
+  local out = vmac.exec("synctex", { "view", "-i", line .. ":" .. column .. ":" .. file, "-o", pdf })
+  local function number(key) return tonumber(out:match("\n" .. key .. ":(%-?[%d%.]+)") or "") end
+  local page, h, v, width, height = number("Page"), number("h"), number("v"), number("W"), number("H")
+  if not (page and h and v) then return nil end
+  width, height = width or 0, height or 0
+  -- v is the text's baseline: its box rises from there.
+  return page, h, v - height, width, height
+end
+
+vmac.command("pdf-forward-search", function()
+  local file = vmac.buffer_file_name()
+  local pdf = file ~= "" and core.pdf_for(file)
+  if not pdf or file:lower():match("%.pdf$") then return vmac.message("Not a file with a PDF built from it") end
+  if not vmac.file_exists(pdf) then return vmac.message("Not built yet: " .. pdf) end
+  local page, x, y, width, height = core.synctex_view(file, vmac.line_number(), 0, pdf)
+  if not page then
+    return vmac.message("Not found in the PDF: is synctex installed, and was it built with -synctex=1?")
+  end
+  local err = vmac.show_file_beside(pdf)
+  if err ~= "" then return vmac.message(err) end
+  vmac.pdf_reveal(pdf, page, x, y, width, height)
+  vmac.message("Page " .. page)
+end)

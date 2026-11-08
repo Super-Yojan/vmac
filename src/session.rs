@@ -816,14 +816,15 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
-    #[test]
-    fn a_double_click_in_a_latex_pdf_goes_to_its_source_line() {
+    /// A three-paragraph LaTeX file (paragraphs on lines 3, 5 and 7) built
+    /// with SyncTeX in its own folder, or None without pdflatex and synctex.
+    fn latex_sample(tag: &str) -> Option<std::path::PathBuf> {
         let have = |c: &str| std::process::Command::new(c).arg("--version").output().is_ok();
         if !have("pdflatex") || !have("synctex") {
             eprintln!("skipped: needs pdflatex and synctex");
-            return;
+            return None;
         }
-        let dir = std::env::temp_dir().join(format!("vmac-synctex-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tex = dir.join("paper.tex");
         std::fs::write(
@@ -837,7 +838,48 @@ mod tests {
             .output()
             .unwrap();
         assert!(dir.join("paper.synctex.gz").exists(), "built: {}", String::from_utf8_lossy(&built.stdout));
+        Some(dir)
+    }
 
+    #[test]
+    fn spc_m_s_shows_the_cursors_line_in_the_pdf() {
+        use crate::frame::MediaScroll;
+        let Some(dir) = latex_sample("forward") else { return };
+        let tex = dir.join("paper.tex");
+        let mut s = session_with("");
+        s.editor.lock().open_file(&tex).unwrap();
+        // To line 7 (G takes no count).
+        for k in ["6", "j", "SPC", "m", "s"] {
+            key(&mut s, k);
+        }
+        let frame = s.frame(VIEW);
+        assert_eq!(frame.windows.len(), 2, "the PDF opened beside it");
+        assert_eq!(s.editor.lock().buffer().name(), "paper.tex", "the cursor stays in the source");
+        let reveal = match &frame.windows[1].content {
+            Content::Media { scroll, .. } => scroll.last().map(|(_, how)| *how),
+            other => panic!("not the PDF: {other:?}"),
+        };
+        match reveal {
+            // Line 7's paragraph: page 1, its baseline near 160 points down.
+            Some(MediaScroll::Reveal { page: 0, y, height, width, .. }) => {
+                assert!((140. ..165.).contains(&y) && height > 0. && width > 0., "{y} {width} {height}")
+            }
+            other => panic!("not revealed: {other:?}"),
+        }
+        assert_eq!(s.editor.lock().message, "Page 1");
+
+        // Again, with the PDF showing: no second window.
+        for k in ["g", "g", "SPC", "m", "s"] {
+            key(&mut s, k);
+        }
+        assert_eq!(s.frame(VIEW).windows.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_double_click_in_a_latex_pdf_goes_to_its_source_line() {
+        let Some(dir) = latex_sample("synctex") else { return };
+        let tex = dir.join("paper.tex");
         let mut s = session_with("");
         s.editor.lock().open_file(&tex).unwrap();
         s.editor.lock().toggle_file_beside(&dir.join("paper.pdf")).unwrap();

@@ -184,6 +184,9 @@ pub enum MediaScroll {
     /// To a page (from 0), or the end.
     Page(usize),
     End,
+    /// To a spot on a page (from 0), marked for a moment: a box in PDF
+    /// points from the page's top left (SyncTeX's forward search).
+    Reveal { page: usize, x: f32, y: f32, width: f32, height: f32 },
 }
 
 /// Files shown as what they are rather than as text.

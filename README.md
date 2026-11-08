@@ -476,9 +476,11 @@ writes a broken file leaves the last good version up; the old pages stay
 until the new ones are drawn, so it doesn't flash; and a PDF opened before
 it exists shows up when it's first built.
 
-**From the PDF to the source.** Double-click a page to jump to the line it
-was built from, in the source's window (opened beside the PDF if it isn't
-showing). This is SyncTeX, so it's for LaTeX: build with `-synctex=1`
+**Between the PDF and the source.** Double-click a page to jump to the line
+it was built from, in the source's window (opened beside the PDF if it isn't
+showing). The other way, `SPC m s` in the source shows where the cursor's
+line is in the PDF (opening it beside the source if needed): scrolled to,
+and marked for a moment. This is SyncTeX, so it's for LaTeX: build with `-synctex=1`
 (`latexmk -pvc -pdf -synctex=1 paper.tex`), which leaves `paper.synctex.gz`
 beside the PDF, and have TeX Live's `synctex` on your `PATH` (MacTeX and
 Homebrew's TeX Live include it). Typst doesn't write SyncTeX.

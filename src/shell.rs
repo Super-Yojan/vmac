@@ -437,8 +437,13 @@ impl Shell {
             .pdf_views
             .entry(buffer)
             .or_insert_with(|| {
-                // Scrolls asked for before this view existed are done with.
-                let seen = scroll.last().map_or(0, |(n, _)| *n);
+                // Scrolls asked for before this view existed are done with,
+                // but for a forward search that opened it.
+                let seen = scroll
+                    .iter()
+                    .rev()
+                    .find(|(_, s)| !matches!(s, crate::frame::MediaScroll::Reveal { .. }))
+                    .map_or(0, |(n, _)| *n);
                 let on_zoom = Self::zoom_sender(cx);
                 // A double-click on a page: to the session, for SyncTeX.
                 let shell = cx.entity().downgrade();
@@ -456,7 +461,7 @@ impl Shell {
         view.update(cx, |v, cx| {
             v.set_colors(colors, cx);
             v.set_size(zoom, width, cx);
-            v.scroll(scroll);
+            v.scroll(scroll, cx);
         });
         view
     }
