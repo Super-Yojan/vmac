@@ -15,6 +15,8 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     strategy:
+      # Each target on its own: one failing doesn't stop the others.
+      fail-fast: false
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
@@ -22,7 +24,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: mlugg/setup-zig@v1
+      # Zig from PyPI, which cargo-zigbuild finds (zig's own mirrors failed
+      # the first release's build).
+      - run: pip install ziglang
       - run: cargo install cargo-zigbuild --locked
       - run: cargo zigbuild --release --locked --no-default-features --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/vmac vmac-server-${{ matrix.target }}
@@ -34,6 +38,7 @@ jobs:
   macos:
     runs-on: macos-latest
     strategy:
+      fail-fast: false
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
