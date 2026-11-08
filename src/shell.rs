@@ -88,12 +88,33 @@ impl Shell {
 
     fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Some((key, text)) = key_name(&event.keystroke) else { return };
-        self.lisp.dispatch_key(&key, &text);
+        self.dispatch(&key, &text, cx);
+    }
+
+    fn dispatch(&mut self, key: &str, text: &str, cx: &mut Context<Self>) {
+        self.lisp.dispatch_key(key, text);
         if self.editor.lock().quit_requested {
             cx.quit();
         }
         cx.notify();
     }
+}
+
+gpui_kit::actions!(gmacs, [TabKey, ShiftTabKey]);
+
+/// The key context of gmacs's window. Bindings here win over gpui-kit's
+/// Root, which is further out.
+const KEY_CONTEXT: &str = "Gmacs";
+
+/// Keys gpui-kit's Root binds for itself (TAB and shift-TAB move focus
+/// between controls) and the editor needs instead. GPUI matches bindings
+/// before key handlers run, so the editor binds them too, deeper in, and
+/// passes them on as ordinary keys.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        gpui_kit::KeyBinding::new("tab", TabKey, Some(KEY_CONTEXT)),
+        gpui_kit::KeyBinding::new("shift-tab", ShiftTabKey, Some(KEY_CONTEXT)),
+    ]);
 }
 
 /// Emacs notation for a keystroke ("C-r", "ESC", "SPC", "<left>", "A") and
@@ -764,7 +785,10 @@ impl Render for Shell {
             .relative()
             .id("gmacs")
             .track_focus(&self.focus)
+            .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|shell, _: &TabKey, _, cx| shell.dispatch("TAB", "", cx)))
+            .on_action(cx.listener(|shell, _: &ShiftTabKey, _, cx| shell.dispatch("S-TAB", "", cx)))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
