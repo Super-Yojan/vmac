@@ -1,6 +1,9 @@
 //! Images and PDFs in a window: what `Content::Media` asks the window to draw.
 //! An image is fitted to the window; a PDF's pages are stacked to scroll
 //! through, each drawn (off the main thread) when it first comes into view.
+//! Both are read again when their file changes, as LaTeX or Typst rebuild
+//! it, once it has stopped changing (so not half written), keeping the
+//! place and showing the last good version until the new one is ready.
 
 use gpui_kit::component::ActiveTheme as _;
 use crate::frame::MediaScroll;
@@ -16,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// The widest a page is shown at zoom 1, in points on screen.
 const PAGE_MAX_WIDTH: f32 = 900.;
@@ -32,49 +35,108 @@ const PIXEL_STEP: f32 = 128.;
 const KEEP_AROUND: usize = 4;
 /// How far j and k scroll, in points.
 const LINE_STEP: f32 = 48.;
+/// How often a shown file is checked for changes.
+const WATCH_POLL: Duration = Duration::from_millis(300);
 
-/// An image file, as large as fits (never larger than it is).
-pub fn image_element(path: &Path, cx: &gpui_kit::App) -> AnyElement {
-    let theme = cx.theme();
-    let shown = path.display().to_string();
-    let muted = theme.muted_foreground;
-    div()
-        .flex_1()
-        .size_full()
-        .overflow_hidden()
-        .p(px(16.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            img(path.to_path_buf())
-                .size_full()
-                .object_fit(ObjectFit::ScaleDown)
-                .with_fallback(move || {
-                    div().text_color(muted).child(format!("can't show {shown}")).into_any_element()
-                }),
-        )
-        .into_any_element()
+/// A file's modification time and length: it changed when this did.
+type Stamp = (SystemTime, u64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// When a file being rewritten is ready to read again: it changed from the
+/// version shown, and has stayed the same since the last look (a compiler
+/// writing it has finished). A version that wouldn't read isn't tried
+/// again; the next change is.
+#[derive(Debug, Default)]
+struct Watch {
+    shown: Option<Stamp>,
+    seen: Option<Stamp>,
+    failed: Option<Stamp>,
+}
+
+impl Watch {
+    /// Given the file's stamp now: whether to read it.
+    fn poll(&mut self, now: Option<Stamp>) -> bool {
+        let settled = now == self.seen;
+        self.seen = now;
+        now.is_some() && settled && now != self.shown && now != self.failed
+    }
+
+    fn read(&mut self, stamp: Option<Stamp>, ok: bool) {
+        if ok {
+            self.shown = stamp;
+        } else {
+            self.failed = stamp;
+        }
+    }
+}
+
+/// Calls `poll` on a view every `WATCH_POLL` while it lives.
+fn watch<T: 'static>(cx: &mut Context<T>, poll: fn(&mut T, &mut Context<T>)) {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor().timer(WATCH_POLL).await;
+            if this.update(cx, |view, cx| poll(view, cx)).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// An image file's frames (one, or a GIF's), BGRA as GPUI draws them.
+fn decode(path: &Path) -> Result<Vec<image::Frame>, String> {
+    use image::AnimationDecoder as _;
+    let bytes = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let bad = |e: image::ImageError| format!("can't show {}: {e}", path.display());
+    let format = image::guess_format(&bytes).map_err(bad)?;
+    let mut frames = if format == image::ImageFormat::Gif {
+        image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes))
+            .and_then(|d| d.into_frames().collect_frames())
+            .map_err(bad)?
+    } else {
+        vec![image::Frame::new(image::load_from_memory_with_format(&bytes, format).map_err(bad)?.into_rgba8())]
+    };
+    for frame in &mut frames {
+        for pixel in frame.buffer_mut().pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+    }
+    if frames.is_empty() {
+        return Err(format!("{} has no picture in it", path.display()));
+    }
+    Ok(frames)
+}
+
+/// A drawn PDF page: how many pixels wide, for which version of the file
+/// and colors, and the picture.
+struct Page {
+    width: u32,
+    generation: u64,
+    picture: Arc<RenderImage>,
 }
 
 /// A PDF's pages, drawn as they scroll into view.
 pub struct PdfView {
     path: PathBuf,
-    /// The file's modification time when it was read: a change reloads it.
-    modified: Option<SystemTime>,
+    watch: Watch,
     /// Each page's size in points, or why the file can't be shown.
     sizes: Result<Vec<(f32, f32)>, String>,
-    /// Drawn pages, and how many pixels wide each was drawn; a page drawn
-    /// for another zoom is shown stretched until it's drawn again.
-    pages: HashMap<usize, (u32, Arc<RenderImage>)>,
-    drawing: HashSet<(usize, u32)>,
+    /// Drawn pages. One drawn for another zoom, or before the file or the
+    /// colors changed, is shown (stretched) until it's drawn again.
+    pages: HashMap<usize, Page>,
+    /// Pages being drawn: which, how wide, for which generation.
+    drawing: HashSet<(usize, u32, u64)>,
     failed: HashMap<usize, String>,
     list: ListState,
     /// The theme's text and background colors (0xRRGGBB) pages are drawn
     /// in, or None for black on white.
     colors: Option<(u32, u32)>,
     /// Bumped whenever drawn pages go stale (the file or the colors
-    /// changed), so pages still being drawn from before are thrown away.
+    /// changed): they're drawn again, and ones being drawn are thrown away.
     generation: u64,
     /// The number of the last scroll done (`Content::Media`'s `scroll`).
     scrolled: u64,
@@ -93,16 +155,15 @@ pub struct PdfView {
     zoom_wheel: Rc<Cell<f32>>,
 }
 
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
 impl PdfView {
     pub fn new(path: PathBuf, scrolled: u64, on_zoom: OnZoom) -> Self {
+        let now = stamp(&path);
         let sizes = crate::pdf::page_sizes(&path);
         let count = sizes.as_ref().map_or(0, Vec::len);
+        let mut watch = Watch { seen: now, ..Default::default() };
+        watch.read(now, sizes.is_ok());
         Self {
-            modified: modified(&path),
+            watch,
             path,
             sizes,
             pages: HashMap::new(),
@@ -130,25 +191,70 @@ impl PdfView {
         &self.path
     }
 
-    /// Reads the file again if it changed since (a PDF rebuilt by LaTeX...),
-    /// keeping the place.
-    pub fn refresh(&mut self, colors: Option<(u32, u32)>, cx: &mut Context<Self>) {
-        if colors != self.colors {
-            self.colors = colors;
-            self.forget_pages();
-            cx.notify();
-        }
-        let now = modified(&self.path);
-        if now == self.modified {
+    /// Checks its file for changes from now on.
+    pub fn start_watching(cx: &mut Context<Self>) {
+        watch(cx, Self::poll);
+    }
+
+    /// Reads the file again once it changed and settled (a PDF rebuilt by
+    /// LaTeX or Typst), keeping the place. One that doesn't read leaves
+    /// the last good version shown.
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        let now = stamp(&self.path);
+        if !self.watch.poll(now) {
             return;
         }
+        let sizes = crate::pdf::page_sizes(&self.path).and_then(|s| {
+            if s.is_empty() { Err(format!("{} has no pages", self.path.display())) } else { Ok(s) }
+        });
+        self.watch.read(now, sizes.is_ok());
+        match sizes {
+            Ok(sizes) => self.reload(sizes, cx),
+            // Nothing shown yet (it didn't exist, or didn't read): say why.
+            Err(e) if self.sizes.is_err() => {
+                self.sizes = Err(e);
+                cx.notify();
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn reload(&mut self, sizes: Vec<(f32, f32)>, cx: &mut Context<Self>) {
         let top = self.list.logical_scroll_top();
-        self.modified = now;
-        self.sizes = crate::pdf::page_sizes(&self.path);
-        self.forget_pages();
-        self.list.reset(self.sizes.as_ref().map_or(0, Vec::len));
-        self.list.scroll_to(top);
+        let count = sizes.len();
+        let same_count = self.sizes.as_ref().is_ok_and(|s| s.len() == count);
+        self.sizes = Ok(sizes);
+        self.stale();
+        for ix in self.pages.keys().copied().filter(|ix| *ix >= count).collect::<Vec<_>>() {
+            if let Some(page) = self.pages.remove(&ix) {
+                cx.drop_image(page.picture, None);
+            }
+        }
+        if same_count {
+            self.list.remeasure();
+        } else {
+            self.list.reset(count);
+        }
+        let item_ix = top.item_ix.min(count.saturating_sub(1));
+        self.list.scroll_to(ListOffset { item_ix, offset_in_item: top.offset_in_item });
         cx.notify();
+    }
+
+    /// Takes the theme's colors (None: black on white); the pages are drawn
+    /// again in them.
+    pub fn set_colors(&mut self, colors: Option<(u32, u32)>, cx: &mut Context<Self>) {
+        if colors != self.colors {
+            self.colors = colors;
+            self.stale();
+            cx.notify();
+        }
+    }
+
+    /// Every drawn page is out of date: each is drawn again when shown.
+    fn stale(&mut self) {
+        self.generation += 1;
+        self.failed.clear();
+        self.drawing.clear();
     }
 
     /// How wide page `ix` is shown, in points: fitted to the window (no
@@ -217,13 +323,6 @@ impl PdfView {
         }
     }
 
-    fn forget_pages(&mut self) {
-        self.generation += 1;
-        self.pages.clear();
-        self.failed.clear();
-        self.drawing.clear();
-    }
-
     /// Draws page `ix` off the main thread as wide as it's shown, unless it
     /// is drawn that wide or on its way.
     fn draw(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -232,12 +331,13 @@ impl PdfView {
         }
         let pixels = (self.page_width(ix) * self.pixels_per_point).min(MAX_PIXELS);
         let width = ((pixels / PIXEL_STEP).ceil() * PIXEL_STEP) as u32;
-        let drawn = self.pages.get(&ix).is_some_and(|(w, _)| *w == width);
-        if drawn || self.failed.contains_key(&ix) || !self.drawing.insert((ix, width)) {
+        let generation = self.generation;
+        let drawn = self.pages.get(&ix).is_some_and(|p| p.width == width && p.generation == generation);
+        if drawn || self.failed.contains_key(&ix) || !self.drawing.insert((ix, width, generation)) {
             return;
         }
         let path = self.path.clone();
-        let (generation, colors) = (self.generation, self.colors);
+        let colors = self.colors;
         cx.spawn(async move |this, cx| {
             let drawn = cx
                 .background_executor()
@@ -250,34 +350,42 @@ impl PdfView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                view.drawing.remove(&(ix, width, generation));
                 // The file or the colors changed while it was drawn: it's stale.
                 if view.generation != generation {
                     return;
                 }
-                view.drawing.remove(&(ix, width));
                 match drawn.and_then(|(w, h, pixels)| {
                     let buffer = image::RgbaImage::from_raw(w, h, pixels).ok_or("bad bitmap")?;
                     Ok(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
                 }) {
                     Ok(picture) => {
-                        view.pages.insert(ix, (width, picture));
+                        if let Some(old) = view.pages.insert(ix, Page { width, generation, picture }) {
+                            cx.drop_image(old.picture, None);
+                        }
                     }
                     Err(e) => {
                         view.failed.insert(ix, e);
                     }
                 }
-                view.forget_far_pages();
+                view.forget_far_pages(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// Drops the pictures of pages far from the ones in view.
-    fn forget_far_pages(&mut self) {
+    /// Drops the pictures of pages far from the ones in view (and frees
+    /// what the GPU kept of them).
+    fn forget_far_pages(&mut self, cx: &mut Context<Self>) {
         let top = self.list.logical_scroll_top().item_ix;
         let keep = top.saturating_sub(KEEP_AROUND)..=top + 2 * KEEP_AROUND;
-        self.pages.retain(|ix, _| keep.contains(ix));
+        let far: Vec<usize> = self.pages.keys().copied().filter(|ix| !keep.contains(ix)).collect();
+        for ix in far {
+            if let Some(page) = self.pages.remove(&ix) {
+                cx.drop_image(page.picture, None);
+            }
+        }
     }
 
     fn page(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -291,7 +399,7 @@ impl PdfView {
             None => (gpui_kit::white(), gpui_kit::black()),
         };
         let body = match (self.pages.get(&ix), self.failed.get(&ix)) {
-            (Some((_, picture)), _) => img(picture.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element(),
+            (Some(page), _) => img(page.picture.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element(),
             (None, Some(e)) => div().p(px(12.)).text_color(ink).child(e.clone()).into_any_element(),
             (None, None) => div().into_any_element(),
         };
@@ -363,9 +471,15 @@ pub type OnZoom = Rc<dyn Fn(WindowId, isize, &mut App)>;
 /// larger than the window, it scrolls both ways.
 pub struct ImageView {
     path: PathBuf,
-    /// Its size in pixels (drawn a point each at zoom 1), or None when it
-    /// can't be read: then it's only fitted, as GPUI manages.
+    watch: Watch,
+    /// The picture, decoded here (so a new version replaces it, rather than
+    /// GPUI's copy kept by path), and its size in pixels (drawn a point
+    /// each at zoom 1). None until it's read.
+    picture: Option<Arc<RenderImage>>,
     size: Option<(f32, f32)>,
+    /// Why it can't be shown, when there's no picture.
+    error: Option<String>,
+    reading: bool,
     zoom: f32,
     /// The window's width and the height under its modeline.
     width: f32,
@@ -379,10 +493,13 @@ pub struct ImageView {
 
 impl ImageView {
     pub fn new(path: PathBuf, scrolled: u64, on_zoom: OnZoom) -> Self {
-        let size = image::image_dimensions(&path).ok().map(|(w, h)| (w as f32, h as f32));
         Self {
             path,
-            size,
+            watch: Watch::default(),
+            picture: None,
+            size: None,
+            error: None,
+            reading: false,
             zoom: 1.,
             width: 800.,
             height: 600.,
@@ -400,6 +517,54 @@ impl ImageView {
 
     pub fn set_window(&mut self, window: WindowId) {
         self.window = window;
+    }
+
+    /// Reads the file now, and again whenever it changes and settles.
+    pub fn start_watching(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |view, cx| {
+                let now = stamp(&view.path);
+                view.watch.seen = now;
+                view.read(now, cx);
+            });
+        })
+        .detach();
+        watch(cx, Self::poll);
+    }
+
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        let now = stamp(&self.path);
+        if !self.reading && self.watch.poll(now) {
+            self.read(now, cx);
+        }
+    }
+
+    /// Decodes the file off the main thread. A version that won't decode
+    /// leaves the last good one shown.
+    fn read(&mut self, now: Option<Stamp>, cx: &mut Context<Self>) {
+        self.reading = true;
+        let path = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            let frames = cx.background_executor().spawn(async move { decode(&path) }).await;
+            let _ = this.update(cx, |view, cx| {
+                view.reading = false;
+                view.watch.read(now, frames.is_ok());
+                match frames {
+                    Ok(frames) => {
+                        let (w, h) = frames[0].buffer().dimensions();
+                        view.size = Some((w as f32, h as f32));
+                        view.error = None;
+                        if let Some(old) = view.picture.replace(Arc::new(RenderImage::new(frames))) {
+                            cx.drop_image(old, None);
+                        }
+                    }
+                    Err(e) if view.picture.is_none() => view.error = Some(e),
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// How large it's shown, in points.
@@ -462,12 +627,13 @@ impl ImageView {
 
 impl Render for ImageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.size.is_none() {
-            return image_element(&self.path, cx);
-        }
-        let ((w, h), (cw, ch)) = (self.shown(), self.content());
         let muted = cx.theme().muted_foreground;
-        let shown = self.path.display().to_string();
+        let Some(picture) = self.picture.clone() else {
+            // Not read yet, or it can't be.
+            let why = self.error.clone().unwrap_or_default();
+            return div().flex_1().size_full().flex().items_center().justify_center().text_color(muted).child(why);
+        };
+        let ((w, h), (cw, ch)) = (self.shown(), self.content());
         div()
             .flex_1()
             .size_full()
@@ -477,13 +643,10 @@ impl Render for ImageView {
             .child(
                 div().id("image-scroll").size_full().overflow_scroll().track_scroll(&self.scroll).child(
                     div().w(px(cw)).h(px(ch)).flex().items_center().justify_center().child(
-                        img(self.path.clone()).flex_none().w(px(w)).h(px(h)).with_fallback(move || {
-                            div().text_color(muted).child(format!("can't show {shown}")).into_any_element()
-                        }),
+                        img(picture).flex_none().w(px(w)).h(px(h)),
                     ),
                 ),
             )
-            .into_any_element()
     }
 }
 
@@ -522,8 +685,10 @@ mod tests {
     fn images_fit_never_grow_and_zoom_from_there() {
         let path = std::env::temp_dir().join(format!("vmac-image-{}.png", std::process::id()));
         image::RgbaImage::new(400, 200).save(&path).unwrap();
+        let frames = decode(&path).unwrap();
+        assert_eq!(frames[0].buffer().dimensions(), (400, 200), "decoded");
         let mut view = ImageView::new(path.clone(), 0, Rc::new(|_, _, _| {}));
-        assert_eq!(view.size, Some((400., 200.)), "its size, read from the file");
+        view.size = Some((400., 200.));
         (view.width, view.height) = (2000., 1000.);
         assert_eq!(view.shown(), (400., 200.), "never larger than it is");
         assert_eq!(view.content(), (2000., 1000.));
@@ -532,8 +697,29 @@ mod tests {
         view.zoom = 3.;
         assert_eq!(view.shown(), (600., 300.));
         assert_eq!(view.content(), (600. + 2. * PAGE_MARGIN, 1000.), "wider than the window: scrolls sideways");
+        std::fs::write(&path, b"not a picture").unwrap();
+        assert!(decode(&path).is_err());
         std::fs::remove_file(path).ok();
-        assert_eq!(ImageView::new(PathBuf::from("/nonexistent.png"), 0, Rc::new(|_, _, _| {})).size, None);
+        assert!(decode(Path::new("/nonexistent.png")).is_err());
+    }
+
+    #[test]
+    fn a_changed_file_is_read_once_it_settles() {
+        let t = |s: u64| Some((SystemTime::UNIX_EPOCH + Duration::from_secs(s), s));
+        let mut w = Watch { seen: t(1), ..Default::default() };
+        w.read(t(1), true);
+        assert!(!w.poll(t(1)), "unchanged");
+        assert!(!w.poll(t(2)), "changed: wait a look, it may be half written");
+        assert!(!w.poll(t(3)), "still changing");
+        assert!(w.poll(t(3)), "settled: read it");
+        w.read(t(3), false);
+        assert!(!w.poll(t(3)), "it didn't read: not again");
+        assert!(!w.poll(t(4)));
+        assert!(w.poll(t(4)), "the next version is tried");
+        w.read(t(4), true);
+        assert!(!w.poll(t(4)));
+        assert!(!w.poll(None) && !w.poll(None), "gone (being replaced): wait for it");
+        assert!(!w.poll(t(5)) && w.poll(t(5)), "back");
     }
 
     #[test]

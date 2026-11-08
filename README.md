@@ -455,21 +455,31 @@ its folder in a git repository.
 ## Images and PDFs
 
 Opening an image (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.ico`)
-shows it, as large as the window allows and never larger than it is. It
-zooms like a PDF's pages (below), and zoomed larger than the window, it
-scrolls with the same keys (`h`/`j`/`k`/`l`, `C-d`/`C-u`, `gg`/`G`). A PDF
-shows its pages one under the other, to scroll through with the trackpad,
-the wheel or keys: `j`/`k` a little, `C-d`/`C-u` half a window, `C-f`/`C-b` a
-window, `J`/`K` a page, `gg`/`G` the first and last page (`5G` page 5).
-`+`/`-` (or `Cmd =`/`Cmd -`, or Ctrl and the wheel) zoom, `=` (`Cmd 0`) fits the pages to the window
-again, and `h`/`l` scroll sideways across pages zoomed wider than it. Pages
-are drawn as they come into view, and a PDF that changes on disk (rebuilt by
-LaTeX, say) reloads where you were. Pages take the theme's
-colors, paper as its background and ink as its text; `SPC t p` (or
-`vmac.set_pdf_themed(false)`) shows them black on white, as printed, for
-PDFs full of photos. Both are read-only, and `:w`
-won't write them. SVG files open as text. PDFs need macOS (CoreGraphics draws
-them), and both show only in a window on the machine that has the file.
+shows it, as large as the window allows and never larger than it is. A PDF
+shows its pages one under the other, drawn as they come into view. Both are
+read-only (`:w` won't write them); SVG files open as text.
+
+**Moving and zooming.** The trackpad and wheel scroll, and so do keys: `j`/`k`
+a little, `h`/`l` sideways, `C-d`/`C-u` half a window, `C-f`/`C-b` a window,
+`gg`/`G` the top and end, and in a PDF `J`/`K` a page and `5G` page 5.
+`+`/`-` (or `Cmd =`/`Cmd -`, or Ctrl and the wheel) zoom, and `=` (`Cmd 0`)
+fits it to the window again.
+
+**Live preview.** An image or PDF that changes on disk reloads by itself,
+where you were, so a document being built shows beside its source as you
+write: run `typst watch paper.typ` or `latexmk -pvc -pdf paper.tex` (in
+`SPC o t`'s terminal, say), and open `paper.pdf` in a split. It reloads once
+the file has stopped changing, so never half written; a build that fails or
+writes a broken file leaves the last good version up; the old pages stay
+until the new ones are drawn, so it doesn't flash; and a PDF opened before
+it exists shows up when it's first built.
+
+**Colors.** PDF pages take the theme's colors, paper as its background and
+ink as its text; `SPC t p` (or `vmac.set_pdf_themed(false)`) shows them black
+on white, as printed, for PDFs full of photos.
+
+PDFs need macOS (CoreGraphics draws them), and both show only in a window on
+the machine that has the file.
 
 ## Markdown
 

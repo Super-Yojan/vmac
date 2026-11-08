@@ -397,7 +397,10 @@ impl Shell {
         // Scrolls asked for before this view existed are done with.
         let seen = scroll.last().map_or(0, |(n, _)| *n);
         let on_zoom = Self::zoom_sender(cx);
-        let view = gpui_kit::AppContext::new(cx, |_| crate::media::ImageView::new(path.to_path_buf(), seen, on_zoom));
+        let view = gpui_kit::AppContext::new(cx, |cx| {
+            crate::media::ImageView::start_watching(cx);
+            crate::media::ImageView::new(path.to_path_buf(), seen, on_zoom)
+        });
         self.image_views.insert(buffer, view.clone());
         view
     }
@@ -429,11 +432,14 @@ impl Shell {
                 // Scrolls asked for before this view existed are done with.
                 let seen = scroll.last().map_or(0, |(n, _)| *n);
                 let on_zoom = Self::zoom_sender(cx);
-                gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf(), seen, on_zoom))
+                gpui_kit::AppContext::new(cx, |cx| {
+                    crate::media::PdfView::start_watching(cx);
+                    crate::media::PdfView::new(path.to_path_buf(), seen, on_zoom)
+                })
             })
             .clone();
         view.update(cx, |v, cx| {
-            v.refresh(colors, cx);
+            v.set_colors(colors, cx);
             v.set_size(zoom, width, cx);
             v.scroll(scroll);
         });
