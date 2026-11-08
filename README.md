@@ -179,6 +179,29 @@ outlive vmac while keys, size and colors work as in a local terminal.
 `vmac.exec(cmd, args)` runs a program and returns its output, for backends
 built on a command line tool.
 
+## Dashboard and projects
+
+Started without a file, vmac opens on a dashboard: find a file, reopen a
+recent one, switch project, open a folder, ask the agent, open your config.
+Each line's key runs it (or `RET` on it), and the projects you opened lately
+are listed below, `1` to `9`. `SPC b h` or `:dashboard` shows it again.
+
+A project is a folder with `.git` in it; vmac remembers the projects and
+files you open (in `~/.local/state/vmac`).
+
+- `SPC p p` switches project: pick one (those you opened, then repositories
+  it finds in `~/git`, `~/code`, `~/projects`, `~/src`, `~/dev`, `~/work`),
+  and the file picker opens in it. It becomes the working folder, for `:e`,
+  terminals and the agent.
+- `SPC p a` (or `:project PATH`) opens any folder by path; `SPC p d` forgets
+  one.
+- `SPC f r` reopens a recent file; `SPC f P` opens your config.
+
+The dashboard is Scheme: redefine `dashboard-banner` or `dashboard-items`
+in your config, e.g.
+`(define (dashboard-items) (cons (list "t" "Terminal" 'terminal-toggle) (default-dashboard-items)))`,
+or `(define dashboard-on-start #f)` to start on a scratch buffer.
+
 ## Coding agent
 
 vmac talks to coding agents over the
@@ -201,8 +224,15 @@ move through, search and yank the conversation, not change it; `i`, `a` or
 - **`SPC a s`** asks about the current line, or the visual selection: it sends
   your question with the file, the line numbers and the code.
 - It reads files **through your buffers**, so it sees edits you haven't saved.
-  When it edits a file that is open, the change lands in that buffer as one
-  undo step and is saved: `u` takes it back. Other files are written to disk.
+- **Its edits wait for your review.** They're made at once and saved (so it
+  can build and test them), in the file's buffer, which keeps the text from
+  before. Changed lines get a green band, and a red rule marks where lines
+  were deleted. `]h` and `[h` move between changes; `ga` accepts the one under
+  the cursor, `gx` rejects it (the old lines come back and are saved; `u`
+  undoes that). `SPC a r` lists every change as a diff in `*agent-review*`,
+  where the same keys work and `RET` goes to one; `SPC a A` and `SPC a X`
+  accept or reject them all. `*agent*` counts what's left. To accept edits
+  as they're made: `(set-agent-review #f)` or `vmac.set_agent_review(false)`.
 - When it needs permission (to edit, to run a command), a picker asks you;
   `SPC a p` reopens it if you were busy.
 - `SPC a c` (or `C-c` in `*agent*`) cancels the run, `SPC a n` starts a new

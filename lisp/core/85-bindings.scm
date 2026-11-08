@@ -66,6 +66,9 @@
         ;; Doom's leader
         (list "SPC :" 'execute-extended-command) (list "SPC ;" 'eval-expression)
         (list "SPC f f" 'find-file-command) (list "SPC SPC" 'find-file-command)
+        (list "SPC f r" 'recent-files-command) (list "SPC b h" 'dashboard)
+        (list "SPC p p" 'project-switch) (list "SPC p a" 'project-add)
+        (list "SPC p d" 'project-forget-command) (list "SPC f P" 'open-config)
         (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
         (list "SPC o t" 'terminal-toggle) (list "SPC o T" 'terminal-new)
         (list "SPC h F" 'font-picker)
@@ -80,6 +83,10 @@
         ;; The coding agent
         (list "SPC a a" 'agent-ask) (list "SPC a o" 'agent-open)
         (list "SPC a c" 'agent-cancel-run) (list "SPC a p" 'agent-permission)
+        (list "SPC a r" 'review-open) (list "SPC a A" 'review-accept-all)
+        (list "SPC a X" 'review-reject-all)
+        (list "] h" 'review-next) (list "[ h" 'review-previous)
+        (list "g a" 'review-accept) (list "g x" 'review-reject)
         (list "SPC a k" 'agent-kill) (list "SPC a n" 'agent-new) (list "SPC a s" 'agent-ask-selection)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)

@@ -15,6 +15,14 @@
 ;; SPC a n: a new conversation     SPC a k: stop the agent
 ;; SPC a o: show *agent*
 ;;
+;; Its edits are made at once (so it can build and test them) and saved,
+;; and wait for your review: changed lines have a green band, deletions a
+;; red rule. ]h and [h move between them, ga accepts the one under the
+;; cursor, gx rejects it (puts the old lines back, one u undoes that). SPC a
+;; r lists them all in *agent-review* (the same keys, RET goes to one);
+;; SPC a A / SPC a X accept / reject them all. (set-agent-review #f), or
+;; vmac.set_agent_review(false), accepts edits as they're made.
+;;
 ;; :agent PROMPT asks from the command line. Another agent: :agent-command
 ;; CMD, or (set-agent-command "codex-acp") in init.scm,
 ;; vmac.set_agent_command("codex-acp") in init.lua.
@@ -29,6 +37,21 @@
 (defcommand (agent-new) (agent-new-session))
 (defcommand (agent-send) (agent-activate) (set! evil-state 'normal))
 (defcommand (agent-toggle) (agent-toggle-at-point))
+
+(defcommand (review-open) (review-show))
+(defcommand (review-accept) (review-decide #t))
+(defcommand (review-reject) (review-decide #f))
+(defcommand (review-accept-all) (review-decide-all #t #t))
+(defcommand (review-reject-all) (review-decide-all #f #t))
+(defcommand (review-next) (review-jump #t))
+(defcommand (review-previous) (review-jump #f))
+(defcommand (review-go) (review-visit))
+
+(for-each-pair (lambda (k b) (define-key review-map k b))
+  (list (list "RET" 'review-go) (list "q" 'review-close)))
+
+;; q: closes its window, or shows another buffer in the last one.
+(defcommand (review-close) (when (not (delete-window)) (next-buffer 1)))
 
 ;; SPC a s: a question about the selection (or this line), with its code.
 (defcommand (agent-ask-selection)

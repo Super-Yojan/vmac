@@ -869,6 +869,18 @@ while True:
             else:
                 update(s, {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed"})
             send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "end_turn"}})
+        elif text.startswith("patch "):
+            # Line 2 upper-cased, line 4 deleted, a line added at the end.
+            for path in text[6:].split():
+                send({"jsonrpc": "2.0", "id": 110, "method": "fs/read_text_file", "params": {"sessionId": s, "path": path}})
+                lines = reply_to(110)["result"]["content"].split("\n")
+                lines[1] = lines[1].upper()
+                del lines[3]
+                lines.insert(len(lines) - 1, "added")
+                send({"jsonrpc": "2.0", "id": 111, "method": "fs/write_text_file", "params": {"sessionId": s, "path": path, "content": "\n".join(lines)}})
+                reply_to(111)
+            say(s, "Patched.")
+            send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "end_turn"}})
         elif text == "wait":
             say(s, "Thinking for a long time")
             while True:

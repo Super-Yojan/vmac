@@ -36,6 +36,7 @@ const CORE_FILES: &[(&str, &str)] = &[
     ("70-windows.scm", include_str!("../lisp/core/70-windows.scm")),
     ("72-terminal.scm", include_str!("../lisp/core/72-terminal.scm")),
     ("75-file-tree.scm", include_str!("../lisp/core/75-file-tree.scm")),
+    ("78-dashboard.scm", include_str!("../lisp/core/78-dashboard.scm")),
     ("80-lsp.scm", include_str!("../lisp/core/80-lsp.scm")),
     ("82-agent.scm", include_str!("../lisp/core/82-agent.scm")),
     ("85-bindings.scm", include_str!("../lisp/core/85-bindings.scm")),
@@ -1061,6 +1062,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             .buffer()
             .file()
             .cloned()
+            .or_else(|| s.project.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         crate::picker::project_root(&start).display().to_string()
@@ -1117,6 +1119,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         }
         if s.agent_here() {
             return format!("agent ({})", s.agent_status());
+        }
+        if s.dashboard_here() {
+            return "dashboard".into();
+        }
+        if s.review_here() {
+            return "review".into();
         }
         s.buffer().file().and_then(|f| crate::syntax::language_for_path(f)).unwrap_or("text").to_string()
     });
@@ -1499,6 +1507,48 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "agent-activate", |s| s.agent_activate());
     prim!(reg, editor, "agent-toggle-at-point", |s| s.agent_toggle_at_point());
     prim!(reg, editor, "agent-new-session", |s| s.agent_new_session());
+    // Projects, recent files and the dashboard.
+    pure!(reg, "file-exists?", |path: String| expand_home(&path).exists());
+    prim!(reg, editor, "config-dir", |_s| config_dir().map(|d| d.display().to_string()).unwrap_or_default());
+    prim!(reg, editor, "recent-files", |s| s.history.files().iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+    prim!(reg, editor, "known-projects", |s| s.history.projects().iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+    prim!(reg, editor, "project-candidates", |s| {
+        s.project_candidates().iter().map(|p| crate::projects::abbreviate(p)).collect::<Vec<_>>()
+    });
+    // Opens a folder as the project; its full path, or "" (and why, in the echo area).
+    prim!(reg, editor, "project-open", |s, path: String| {
+        match s.project_open(&crate::projects::expand(&path)) {
+            Ok(p) => p.display().to_string(),
+            Err(e) => {
+                s.message = e;
+                String::new()
+            }
+        }
+    });
+    prim!(reg, editor, "project-forget", |s, path: String| s.history.forget_project(&crate::projects::expand(&path)));
+    pure!(reg, "abbreviate-path", |path: String| crate::projects::abbreviate(Path::new(&path)));
+    prim!(reg, editor, "dashboard-show", |s, banner: Vec<String>, items: Vec<Vec<String>>| {
+        let items = items
+            .into_iter()
+            .filter_map(|i| Some((i.first()?.clone(), i.get(1)?.clone(), i.get(2)?.clone())))
+            .collect();
+        s.dashboard_show(banner, items)
+    });
+    prim!(reg, editor, "dashboard-here?", |s| s.dashboard_here());
+    prim!(reg, editor, "dashboard-action", |s| s.dashboard_action());
+    prim!(reg, editor, "dashboard-project", |s, n: isize| s.dashboard_project(n.max(0) as usize));
+    // Reviewing the agent's changes.
+    prim!(reg, editor, "review-show", |s| s.review_show());
+    prim!(reg, editor, "review-here?", |s| s.review_here());
+    prim!(reg, editor, "review-visit", |s| s.review_visit());
+    prim!(reg, editor, "review-decide", |s, accept: bool| s.review_decide(accept));
+    prim!(reg, editor, "review-decide-all", |s, accept: bool, everywhere: bool| s.review_decide_all(accept, everywhere));
+    prim!(reg, editor, "review-jump", |s, forward: bool| s.review_jump(forward));
+    prim!(reg, editor, "review-count", |s| s.review_count() as isize);
+    prim!(reg, editor, "set-agent-review", |s, on: bool| {
+        s.agent_review = on;
+        s.message = if on { "The agent's changes wait for review".into() } else { "The agent's changes are accepted as made".into() };
+    });
     prim!(reg, editor, "agent-ask-about", |s, start: isize, end: isize, question: String| {
         s.agent_ask_about(start.max(0) as usize, end.max(0) as usize, &question)
     });
@@ -2907,6 +2957,154 @@ mod tests {
         typed(&mut lisp, " an");
         assert!(pump(&mut lisp, &|s| s.agent_status() == "ready"));
         assert!(!text().contains("You said"), "{}", text());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_agents_edits_wait_for_review() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-review-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        let file = dir.join("a.txt");
+        let other = dir.join("b.txt");
+        let original = "one\ntwo\nthree\nfour\nfive\n";
+        std::fs::write(&file, original).unwrap();
+        std::fs::write(&other, original).unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().agent_config = config;
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, "2jl");
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
+            for _ in 0..250 {
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&mut editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let disk = |p: &Path| std::fs::read_to_string(p).unwrap();
+
+        // The agent patches a.txt (open) and b.txt (not open).
+        editor.lock().agent_prompt(&format!("patch {} {}", file.display(), other.display()));
+        assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.review_count() == 6), "{}", editor.lock().review_count());
+        let patched = "one\nTWO\nthree\nfive\nadded\n";
+        assert_eq!(disk(&file), patched, "made and saved at once");
+        assert_eq!(disk(&other), patched);
+        assert_eq!(editor.lock().buffer().name(), "a.txt");
+        let at = { let st = editor.lock(); (st.buffer().line(), st.buffer().column()) };
+        assert_eq!(at, (2, 1), "the cursor stayed put");
+        let id = editor.lock().window().buffer;
+        assert_eq!(editor.lock().review_marks(id), vec![(1, true), (3, false), (4, true)]);
+        editor.lock().agent_show();
+        assert!(text(&editor).contains("◆ 6 changes to review"), "{}", text(&editor));
+        editor.lock().open_file(&file).unwrap();
+
+        // ]h to the first, gx rejects it (saved), u brings it back.
+        typed(&mut lisp, "gg]h");
+        assert_eq!(editor.lock().buffer().line(), 1);
+        typed(&mut lisp, "gx");
+        assert_eq!(disk(&file), "one\ntwo\nthree\nfive\nadded\n");
+        assert_eq!(editor.lock().review_count(), 5);
+        typed(&mut lisp, "u");
+        assert_eq!(text(&editor), patched);
+        assert_eq!(editor.lock().review_count(), 6, "undone, it waits again");
+
+        // ga accepts; the deletion, then rejected: "four" comes back.
+        typed(&mut lisp, "gg]h");
+        typed(&mut lisp, "ga");
+        assert_eq!(editor.lock().review_count(), 5);
+        typed(&mut lisp, "]h");
+        assert_eq!(editor.lock().buffer().line(), 3);
+        typed(&mut lisp, "gx");
+        assert_eq!(disk(&file), "one\nTWO\nthree\nfour\nfive\nadded\n");
+
+        // SPC a r lists the rest; keys work there too.
+        typed(&mut lisp, " ar");
+        assert_eq!(editor.lock().buffer().name(), "*agent-review*");
+        let review = text(&editor);
+        assert!(review.contains("a.txt  (1 change)\n@@ line 6\n+ added"), "{review}");
+        assert!(review.contains("b.txt  (3 changes)\n@@ line 2\n- two\n+ TWO"), "{review}");
+        typed(&mut lisp, "gg]h");
+        typed(&mut lisp, "gx");
+        assert_eq!(disk(&file), "one\nTWO\nthree\nfour\nfive\n", "rejected from the list");
+        assert!(!text(&editor).contains("a.txt"), "{}", text(&editor));
+        typed(&mut lisp, "]h");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().name(), "b.txt");
+        assert_eq!(editor.lock().buffer().line(), 1, "RET went to the change");
+
+        // SPC a A takes the rest.
+        typed(&mut lisp, " aA");
+        assert_eq!(editor.lock().review_count(), 0);
+        assert_eq!(disk(&other), patched);
+        editor.lock().agent_show();
+        editor.lock().agent_pump();
+        assert!(!text(&editor).contains("to review"), "{}", text(&editor));
+
+        // With review off, edits just land.
+        lisp.eval("(set-agent-review #f)").unwrap();
+        let fresh = dir.join("c.txt");
+        std::fs::write(&fresh, original).unwrap();
+        editor.lock().agent_prompt(&format!("patch {}", fresh.display()));
+        assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && disk(&fresh) == patched));
+        assert_eq!(editor.lock().review_count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_dashboard_opens_recent_files_and_projects() {
+        let dir = std::env::temp_dir().join(format!("vmac-dashboard-{}", std::process::id()));
+        let (one, two) = (dir.join("one"), dir.join("two"));
+        for repo in [&one, &two] {
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::write(repo.join("main.rs"), "fn main() {}\n").unwrap();
+        }
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&one.join("main.rs")).unwrap();
+        assert!(lisp.eval("dashboard-on-start").unwrap().contains("#t"));
+
+        lisp.eval("(call-binding 'dashboard)").unwrap();
+        let shown = text(&editor);
+        assert_eq!(editor.lock().buffer().name(), "*dashboard*");
+        assert!(shown.contains("███"), "the banner");
+        assert!(shown.contains("f   Find file"), "{shown}");
+        assert!(shown.contains("Projects"), "{shown}");
+        let listed = format!("1   {}", crate::projects::abbreviate(&one));
+        assert!(shown.contains(&listed), "{shown}");
+        assert!(text(&editor).lines().nth(editor.lock().buffer().line()).unwrap().contains("Find file"), "the cursor starts on the first item");
+
+        // RET on "Recent files" (one line down) lists the file opened.
+        typed(&mut lisp, "j");
+        lisp.dispatch_key("RET", "");
+        let picker = editor.lock().picker.as_ref().map(|p| p.title().to_string());
+        assert_eq!(picker.as_deref(), Some("Recent files"));
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().file(), Some(&one.join("main.rs")));
+
+        // 1 on the dashboard opens the first project's file picker.
+        typed(&mut lisp, " bh");
+        typed(&mut lisp, "1");
+        let picker = editor.lock().picker.as_ref().map(|p| (p.title().to_string(), p.selection().map(str::to_string)));
+        assert_eq!(picker, Some(("Find file".into(), Some("main.rs".into()))));
+        lisp.dispatch_key("ESC", "");
+        lisp.dispatch_key("ESC", "");
+
+        // Another folder by path (SPC p a): it becomes the project.
+        lisp.eval(&format!("(project-switch-to \"{}\")", two.display())).unwrap();
+        assert_eq!(editor.lock().project.as_ref(), Some(&two));
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().file(), Some(&two.join("main.rs")));
+        lisp.eval("(call-binding 'dashboard)").unwrap();
+        let shown = text(&editor);
+        let first = shown.find(&crate::projects::abbreviate(&two)).unwrap();
+        let second = shown.find(&crate::projects::abbreviate(&one)).unwrap();
+        assert!(first < second, "the latest project comes first: {shown}");
+
+        // Not a folder: says so.
+        lisp.eval("(project-switch-to \"/no/such/folder\")").unwrap();
+        assert!(editor.lock().message.contains("not a folder"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

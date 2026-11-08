@@ -20,6 +20,8 @@
 (define (count-digit? text)
   (and (not (inserting?))
        (equal? pending-keys "")
+       ;; On the dashboard, digits open its projects.
+       (not (and (dashboard-here?) (not (minibuffer-active?))))
        (or (contains? '("1" "2" "3" "4" "5" "6" "7" "8" "9") text)
            (and (equal? text "0") (not (equal? pending-count ""))))))
 

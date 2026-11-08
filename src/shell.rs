@@ -140,7 +140,7 @@ impl Shell {
                     let configs = shell.lisp.lsp_servers();
                     let changed = {
                         let mut editor = shell.editor.lock();
-                        editor.lsp_pump(configs) | editor.agent_pump()
+                        editor.lsp_pump(configs) | editor.agent_pump() | editor.dashboard_refresh()
                     };
                     // Replies that Scheme handles (the references picker).
                     if shell.lisp.run_events() || changed {
@@ -608,6 +608,16 @@ impl Render for Shell {
         // Where the cursor is on screen (x, line top, line height), for K's popup.
         let mut cursor_at: Option<(f32, f32, f32)> = None;
 
+        // Lines the agent changed and nobody reviewed yet, per window.
+        let review_marks: std::collections::HashMap<crate::editor::WindowId, Vec<(usize, bool)>> = rects
+            .iter()
+            .filter_map(|(id, _)| {
+                let buffer = st.window_by_id(*id)?.buffer;
+                let marks = st.review_marks(buffer);
+                (!marks.is_empty()).then_some((*id, marks))
+            })
+            .collect();
+
         let windows: Vec<_> = rects
             .iter()
             .filter_map(|(id, r)| {
@@ -726,9 +736,21 @@ impl Render for Shell {
                         };
                         let row = line_element(view, bar, cx);
                         let current = is_sidebar && i == cur_line;
-                        div().when(current, |d| {
+                        let marks = review_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                        let added = marks.contains(&(i, true));
+                        let deleted_above = marks.contains(&(i, false));
+                        div().relative()
+                        .when(current, |d| {
                             d.bg(if is_selected { theme.list_active } else { theme.list_hover })
                         })
+                        // The agent's unreviewed lines: a green band, and a
+                        // red rule where it deleted lines.
+                        .when(added, |d| d.bg(theme.green.opacity(0.14)).child(
+                            div().absolute().left(px(-6.)).top_0().bottom_0().w(px(3.)).bg(theme.green),
+                        ))
+                        .when(deleted_above, |d| d.child(
+                            div().absolute().left(px(-6.)).right_0().top_0().h(px(2.)).bg(theme.red),
+                        ))
                         .child(row)
                     })
                     .collect();

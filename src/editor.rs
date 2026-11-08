@@ -324,12 +324,50 @@ pub struct EditorState {
     agent_asked: usize,
     /// What each line of the agent buffer points at.
     agent_lines: Vec<crate::agent::Target>,
+    /// Whether the agent's writes are kept for review (else just applied),
+    /// the files waiting, and the review buffer with each line's hunk.
+    pub agent_review: bool,
+    reviews: Vec<crate::review::Review>,
+    review_buffer: Option<BufferId>,
+    review_lines: Vec<Option<(PathBuf, usize)>>,
+    review_shown: u64,
+    /// Recent files and projects (in memory only until `set_state_dir`).
+    pub history: crate::projects::History,
+    /// The project opened last (SPC p p), for buffers without a file.
+    pub project: Option<PathBuf>,
+    /// The dashboard: its buffer, what Scheme asked it to show (banner
+    /// lines; items as key, label, command), each line's action, and the
+    /// width it was laid out for.
+    dashboard_buffer: Option<BufferId>,
+    dashboard_spec: (Vec<String>, Vec<(String, String, String)>),
+    dashboard_actions: Vec<String>,
+    dashboard_width: usize,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
     /// Things for Scheme to handle (a function name and its arguments),
     /// raised where Rust can't call Scheme (server replies).
     events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
+}
+
+/// A dashboard line: its text, faces (columns), and what RET on it does.
+type DashboardLine = (String, Vec<(usize, usize, &'static str)>, String);
+
+/// Replaces a buffer's text with `new`, changing only the lines that
+/// differ (last first), so a cursor on an unchanged line stays put.
+fn replace_changed(b: &mut Buffer, new: &str) {
+    let old = b.text().to_string();
+    for hunk in crate::review::hunks(&old, new).into_iter().rev() {
+        let rope = b.text();
+        let at = |line: usize| if line >= rope.len_lines() { rope.len_chars() } else { rope.line_to_char(line) };
+        let (start, end) = (at(hunk.old.start), at(hunk.old.end));
+        b.replace(start, end, &hunk.new_text);
+    }
+    // Lines can't express everything (a missing final newline): settle it.
+    if *b.text() != new {
+        let len = b.len();
+        b.replace(0, len, new);
+    }
 }
 
 impl EditorState {
@@ -374,6 +412,17 @@ impl EditorState {
             agent_shown_width: 0,
             agent_asked: 0,
             agent_lines: Vec::new(),
+            agent_review: true,
+            reviews: Vec::new(),
+            review_buffer: None,
+            review_lines: Vec::new(),
+            review_shown: 0,
+            history: Default::default(),
+            project: None,
+            dashboard_buffer: None,
+            dashboard_spec: Default::default(),
+            dashboard_actions: Vec::new(),
+            dashboard_width: 0,
             events: Vec::new(),
             search_cache: None,
         }
@@ -471,6 +520,7 @@ impl EditorState {
             None => self.add_buffer(Buffer::from_file(PathBuf::from(path))?),
         };
         self.show_buffer(id);
+        self.history.opened_file(path);
         Ok(())
     }
 
@@ -969,6 +1019,7 @@ impl EditorState {
             .file()
             .or_else(|| self.window_by_id(self.last_main).and_then(|w| self.buffer_by_id(w.buffer)?.file()))
             .or_else(|| shown.clone().next())
+            .or(self.project.as_ref())
             .or_else(|| self.buffers.iter().find_map(|(_, b)| b.file()))
             .cloned()
             .or_else(|| std::env::current_dir().ok())
@@ -1094,7 +1145,7 @@ impl EditorState {
         } else if waiting < self.agent_asked {
             self.agent_asked = waiting;
         }
-        changed | self.agent_refresh()
+        changed | self.agent_refresh() | self.review_refresh(false)
     }
 
     /// The open buffer visiting `path`, if any.
@@ -1145,21 +1196,293 @@ impl EditorState {
     /// Writes what the agent wrote: into the file's buffer when it is open
     /// (one undo step, then saved), else to disk.
     fn agent_write(&mut self, path: &Path, content: &str) -> std::io::Result<()> {
-        if let Some(id) = self.buffer_visiting(path) {
-            let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("found above").1;
-            if !b.is_read_only() {
-                b.undo_boundary();
-                let len = b.len();
-                b.replace(0, len, content);
-                b.undo_boundary();
-                b.save()?;
-                return Ok(());
+        // Reviewed writes go through a buffer (opened unseen if need be),
+        // which remembers the text before the agent's first change.
+        let id = match self.buffer_visiting(path) {
+            Some(id) => Some(id),
+            None if self.agent_review => Some(self.add_buffer(Buffer::from_file(path.to_path_buf())?)),
+            None => None,
+        };
+        let Some(id) = id.filter(|&id| self.buffer_by_id(id).is_some_and(|b| !b.is_read_only())) else {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
             }
-        }
+            return std::fs::write(path, content);
+        };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, content)
+        let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("found above").1;
+        let file = b.file().cloned().unwrap_or_else(|| path.to_path_buf());
+        if self.agent_review && !self.reviews.iter().any(|r| r.path == file) {
+            self.reviews.push(crate::review::Review::new(file, b.text().to_string()));
+        }
+        b.undo_boundary();
+        replace_changed(b, content);
+        b.undo_boundary();
+        b.save()?;
+        Ok(())
+    }
+
+    // ---- Reviewing the agent's changes
+
+    /// The review of the file a buffer visits, with its hunks now.
+    fn review_of(&mut self, id: BufferId) -> Option<(usize, Vec<crate::review::Hunk>)> {
+        let b = self.buffers.iter().find(|(b, _)| *b == id).map(|(_, b)| b)?;
+        let file = b.file()?.clone();
+        let (text, revision) = (b.text().to_string(), b.revision());
+        let i = self.reviews.iter().position(|r| r.path == file)?;
+        Some((i, self.reviews[i].hunks(&text, revision).to_vec()))
+    }
+
+    /// How the agent's unreviewed lines in a buffer are marked: (line,
+    /// added) for changed lines, (line, false) where lines were deleted above.
+    pub fn review_marks(&mut self, id: BufferId) -> Vec<(usize, bool)> {
+        let Some((_, hunks)) = self.review_of(id) else { return Vec::new() };
+        hunks
+            .iter()
+            .flat_map(|h| {
+                let deleted = (!h.old.is_empty() && h.new.is_empty()).then_some((h.new.start, false));
+                h.new.clone().map(|l| (l, true)).chain(deleted)
+            })
+            .collect()
+    }
+
+    /// Changes waiting for review, over all files.
+    pub fn review_count(&mut self) -> usize {
+        let ids: Vec<BufferId> = self
+            .reviews
+            .iter()
+            .filter_map(|r| self.buffer_visiting(&r.path))
+            .collect();
+        ids.into_iter().map(|id| self.review_of(id).map_or(0, |(_, h)| h.len())).sum()
+    }
+
+    /// The hunk ga/gx act on: the one on the cursor's line, in a file or in
+    /// the review buffer. (buffer, review index, hunk).
+    fn review_target(&mut self) -> Option<(BufferId, usize, crate::review::Hunk)> {
+        let line = self.buffer().line();
+        if self.window().buffer == self.review_buffer.unwrap_or(0) {
+            let (path, n) = self.review_lines.get(line)?.clone()?;
+            let id = self.buffer_visiting(&path)?;
+            let (i, hunks) = self.review_of(id)?;
+            return Some((id, i, hunks.get(n)?.clone()));
+        }
+        let id = self.window().buffer;
+        let (i, hunks) = self.review_of(id)?;
+        let hunk = hunks.into_iter().find(|h| h.covers(line))?;
+        Some((id, i, hunk))
+    }
+
+    /// ga (accept) or gx (reject) on the hunk at the cursor.
+    pub fn review_decide(&mut self, accept: bool) {
+        let Some((id, i, hunk)) = self.review_target() else {
+            self.message = "No change of the agent's here".into();
+            return;
+        };
+        self.review_apply(id, i, &hunk, accept);
+        let left = self.review_count();
+        self.message = match (accept, left) {
+            (true, 0) => "Accepted; all reviewed".into(),
+            (false, 0) => "Rejected; all reviewed".into(),
+            (true, n) => format!("Accepted; {n} left"),
+            (false, n) => format!("Rejected; {n} left"),
+        };
+        self.review_tidy();
+    }
+
+    fn review_apply(&mut self, id: BufferId, i: usize, hunk: &crate::review::Hunk, accept: bool) {
+        if accept {
+            self.reviews[i].accept(hunk);
+            return;
+        }
+        // Put the base's lines back, as one undo step, and save.
+        let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("a reviewed buffer").1;
+        let rope = b.text();
+        let at = |line: usize| if line >= rope.len_lines() { rope.len_chars() } else { rope.line_to_char(line) };
+        let (start, end) = (at(hunk.new.start), at(hunk.new.end));
+        b.undo_boundary();
+        b.replace(start, end, &hunk.old_text);
+        b.undo_boundary();
+        if let Err(e) = b.save() {
+            self.message = format!("{}: {e}", b.name());
+        }
+    }
+
+    /// Accepts or rejects every change: in this file, or everywhere.
+    pub fn review_decide_all(&mut self, accept: bool, everywhere: bool) {
+        let here = self.buffer().file().cloned();
+        let paths: Vec<PathBuf> = self
+            .reviews
+            .iter()
+            .map(|r| r.path.clone())
+            .filter(|p| everywhere || Some(p) == here.as_ref())
+            .collect();
+        if paths.is_empty() {
+            self.message = "Nothing to review".into();
+            return;
+        }
+        let mut n = 0;
+        for path in paths {
+            let Some(id) = self.buffer_visiting(&path) else { continue };
+            // Last first, so earlier hunks' lines stay where they are.
+            while let Some((i, hunks)) = self.review_of(id) {
+                let Some(hunk) = hunks.last().cloned() else { break };
+                self.review_apply(id, i, &hunk, accept);
+                n += 1;
+            }
+        }
+        self.message = format!("{} {n} change{}", if accept { "Accepted" } else { "Rejected" }, if n == 1 { "" } else { "s" });
+        self.review_tidy();
+    }
+
+    /// ]h and [h: the next or previous change, in this file or the review buffer.
+    pub fn review_jump(&mut self, forward: bool) {
+        let line = self.buffer().line();
+        let starts: Vec<usize> = if self.window().buffer == self.review_buffer.unwrap_or(0) {
+            let mut seen = None;
+            self.review_lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    let new = t.is_some() && *t != seen;
+                    seen = t.clone();
+                    new.then_some(i)
+                })
+                .collect()
+        } else {
+            let id = self.window().buffer;
+            self.review_of(id).map(|(_, h)| h.iter().map(|h| h.new.start).collect()).unwrap_or_default()
+        };
+        let target = if forward {
+            starts.iter().copied().find(|&l| l > line).or(starts.first().copied())
+        } else {
+            starts.iter().rev().copied().find(|&l| l < line).or(starts.last().copied())
+        };
+        match target {
+            Some(l) => {
+                let pos = self.buffer().line_to_pos(l);
+                self.buffer_mut().goto_char(pos);
+                self.window_mut().point = pos;
+            }
+            None => self.message = "No changes to review".into(),
+        }
+    }
+
+    /// Drops reviews with nothing left, and redraws the review buffer.
+    fn review_tidy(&mut self) {
+        let paths: Vec<PathBuf> = self.reviews.iter().map(|r| r.path.clone()).collect();
+        let mut done = Vec::new();
+        for p in paths {
+            let pending = match self.buffer_visiting(&p) {
+                Some(id) => self.review_of(id).is_some_and(|(_, h)| !h.is_empty()),
+                None => false,
+            };
+            if !pending {
+                done.push(p);
+            }
+        }
+        self.reviews.retain(|r| !done.contains(&r.path));
+        self.review_refresh(true);
+    }
+
+    /// SPC a r: every change waiting, as a diff, in *agent-review*.
+    pub fn review_show(&mut self) {
+        let id = match self.review_buffer.filter(|&id| self.buffer_by_id(id).is_some()) {
+            Some(id) => id,
+            None => {
+                let mut b = Buffer::new("*agent-review*");
+                b.set_read_only(true);
+                let id = self.add_buffer(b);
+                self.review_buffer = Some(id);
+                id
+            }
+        };
+        self.review_refresh(true);
+        if let Some(w) = self.windows.iter().find(|w| w.buffer == id && !self.is_sidebar(w.id)).map(|w| w.id) {
+            self.select_window(w);
+        } else {
+            self.show_buffer(id);
+        }
+    }
+
+    /// Rewrites the review buffer when the changes did (or when `force`d).
+    fn review_refresh(&mut self, force: bool) -> bool {
+        let Some(id) = self.review_buffer.filter(|&id| self.buffer_by_id(id).is_some()) else { return false };
+        let ids: Vec<(PathBuf, Option<BufferId>)> =
+            self.reviews.iter().map(|r| (r.path.clone(), self.buffer_visiting(&r.path))).collect();
+        let signature: u64 = ids
+            .iter()
+            .filter_map(|(_, b)| self.buffer_by_id((*b)?))
+            .map(|b| b.revision())
+            .sum::<u64>()
+            + self.reviews.iter().map(|r| r.base.len() as u64).sum::<u64>()
+            + ids.len() as u64;
+        if !force && signature == self.review_shown {
+            return false;
+        }
+        self.review_shown = signature;
+        let root = self.agent.as_ref().map(|a| a.root.clone());
+        let mut text = String::new();
+        let mut faces: Vec<(usize, usize, &str)> = Vec::new();
+        let mut lines: Vec<Option<(PathBuf, usize)>> = Vec::new();
+        let mut push = |text: &mut String, line: &str, face: Option<&'static str>, target: Option<(PathBuf, usize)>| {
+            let start = text.chars().count();
+            text.push_str(line);
+            text.push('\n');
+            if let Some(f) = face {
+                faces.push((start, start + line.chars().count(), f));
+            }
+            lines.push(target);
+        };
+        for (path, buffer) in ids {
+            let Some(buffer) = buffer else { continue };
+            let Some((_, hunks)) = self.review_of(buffer) else { continue };
+            if hunks.is_empty() {
+                continue;
+            }
+            let shown = root.as_ref().and_then(|r| path.strip_prefix(r).ok()).unwrap_or(&path).display().to_string();
+            let plural = if hunks.len() == 1 { "" } else { "s" };
+            push(&mut text, &format!("{shown}  ({} change{plural})", hunks.len()), Some("agent-heading"), None);
+            for (n, h) in hunks.iter().enumerate() {
+                let target = Some((path.clone(), n));
+                push(&mut text, &format!("@@ line {}", h.new.start + 1), Some("cyan"), target.clone());
+                for l in h.old_text.lines() {
+                    push(&mut text, &format!("- {l}"), Some("red"), target.clone());
+                }
+                for l in h.new_text.lines() {
+                    push(&mut text, &format!("+ {l}"), Some("green"), target.clone());
+                }
+            }
+            push(&mut text, "", None, None);
+        }
+        if text.is_empty() {
+            push(&mut text, "Nothing to review.", Some("dim"), None);
+        } else {
+            push(&mut text, "ga accept · gx reject · ]h [h move · RET go to it · SPC a A / SPC a X all", Some("dim"), None);
+        }
+        let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("checked above").1;
+        let point = b.point();
+        b.set_text(&text);
+        for (a, z, f) in faces {
+            b.add_face(a, z, f.to_string());
+        }
+        b.goto_char(point);
+        self.review_lines = lines;
+        true
+    }
+
+    /// RET in the review buffer: the change in its file.
+    pub fn review_visit(&mut self) {
+        let line = self.buffer().line();
+        let Some(Some((path, n))) = self.review_lines.get(line).cloned() else { return };
+        let Some(id) = self.buffer_visiting(&path) else { return };
+        let start = self.review_of(id).and_then(|(_, h)| h.get(n).map(|h| h.new.start)).unwrap_or(0);
+        self.agent_visit(&path, Some(start as u64 + 1));
+    }
+
+    pub fn review_here(&self) -> bool {
+        self.review_buffer == Some(self.window().buffer)
     }
 
     /// Puts the conversation in the agent buffer when it changed, above
@@ -1170,7 +1493,8 @@ impl EditorState {
         // Wrapped to the widest window showing it (re-wrapped on resize).
         let width = self.windows.iter().filter(|w| w.buffer == id).map(|w| w.cols).max().unwrap_or(0);
         let width = if width == 0 { 80 } else { width.saturating_sub(2) };
-        let revision = self.agent.as_ref().map_or(0, |a| a.revision + 1);
+        let pending = self.review_count();
+        let revision = self.agent.as_ref().map_or(0, |a| a.revision + 1) + (pending as u64) * 1_000_003;
         if (revision, width) == (self.agent_shown, self.agent_shown_width) {
             return false;
         }
@@ -1187,6 +1511,15 @@ impl EditorState {
             );
             rendered.faces.push((0, rendered.text.chars().count(), "dim"));
             rendered.lines = vec![crate::agent::Target::None; 2];
+        }
+        if pending > 0 {
+            let plural = if pending == 1 { "" } else { "s" };
+            let note = format!("◆ {pending} change{plural} to review: SPC a r (ga accepts, gx rejects)");
+            let at = rendered.text.chars().count();
+            rendered.faces.push((at, at + note.chars().count(), "yellow"));
+            rendered.text.push_str(&note);
+            rendered.text.push_str("\n\n");
+            rendered.lines.extend([crate::agent::Target::None, crate::agent::Target::None]);
         }
         // The rule above the prompt.
         let rule = "─".repeat(40);
@@ -1330,6 +1663,169 @@ impl EditorState {
             self.message = e;
         }
         self.agent_refresh();
+    }
+
+    // ---- Projects and the dashboard
+
+    /// Keeps recent files and projects in `dir` from now on (and the file
+    /// vmac started with).
+    pub fn set_state_dir(&mut self, dir: Option<PathBuf>) {
+        self.history = crate::projects::History::load(dir);
+        if let Some(file) = self.buffer().file().cloned() {
+            self.history.opened_file(&file);
+        }
+    }
+
+    /// Makes a folder the current project: remembered, and the working
+    /// folder (where the file picker, :e and terminals start). Err if it
+    /// isn't a folder.
+    pub fn project_open(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        if !path.is_dir() {
+            return Err(format!("{}: not a folder", path.display()));
+        }
+        // The working folder too, in the app (tests share theirs).
+        if self.history.is_saved() {
+            std::env::set_current_dir(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        self.project = Some(path.clone());
+        self.history.opened_project(&path);
+        self.message = format!("Project: {}", crate::projects::abbreviate(&path));
+        Ok(path)
+    }
+
+    /// Projects to open: those opened before, then others found on disk.
+    pub fn project_candidates(&self) -> Vec<PathBuf> {
+        let mut list = self.history.projects();
+        for p in crate::projects::discover(&crate::projects::search_dirs()) {
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+        list
+    }
+
+    /// Shows the dashboard: `banner` lines and `items` (key, label,
+    /// command) centered, then the recent projects (1-9).
+    pub fn dashboard_show(&mut self, banner: Vec<String>, items: Vec<(String, String, String)>) {
+        let id = match self.dashboard_buffer.filter(|&id| self.buffer_by_id(id).is_some()) {
+            Some(id) => id,
+            None => {
+                let mut b = Buffer::new("*dashboard*");
+                b.set_read_only(true);
+                let id = self.add_buffer(b);
+                self.dashboard_buffer = Some(id);
+                id
+            }
+        };
+        self.dashboard_spec = (banner, items);
+        self.dashboard_width = 0;
+        // Fresh: the first layout puts the cursor on the first item.
+        self.dashboard_actions.clear();
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
+        self.show_buffer(id);
+        self.dashboard_refresh();
+    }
+
+    pub fn dashboard_here(&self) -> bool {
+        self.dashboard_buffer.is_some() && self.dashboard_buffer == Some(self.window().buffer)
+    }
+
+    /// What the dashboard line under the cursor does: a command name, or
+    /// "project:PATH". "" on other lines.
+    pub fn dashboard_action(&self) -> String {
+        if !self.dashboard_here() {
+            return String::new();
+        }
+        self.dashboard_actions.get(self.buffer().line()).cloned().unwrap_or_default()
+    }
+
+    /// The n-th project the dashboard lists (1-based), or "".
+    pub fn dashboard_project(&self, n: usize) -> String {
+        self.history.projects().get(n.wrapping_sub(1)).map(|p| p.display().to_string()).unwrap_or_default()
+    }
+
+    /// Lays the dashboard out for the window's width when that changed.
+    pub fn dashboard_refresh(&mut self) -> bool {
+        let Some(id) = self.dashboard_buffer.filter(|&id| self.buffer_by_id(id).is_some()) else { return false };
+        let Some(w) = self.windows.iter().find(|w| w.buffer == id) else { return false };
+        let (width, rows) = (if w.cols == 0 { 100 } else { w.cols }, if w.rows == 0 { 40 } else { w.rows });
+        if width == self.dashboard_width {
+            return false;
+        }
+        self.dashboard_width = width;
+        let (banner, items) = self.dashboard_spec.clone();
+        let projects: Vec<String> = self.history.projects().iter().take(9).map(|p| crate::projects::abbreviate(p)).collect();
+
+        // (text, faces, action) per line.
+        let mut lines: Vec<DashboardLine> = Vec::new();
+        let banner_width = banner.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        for l in &banner {
+            lines.push((l.clone(), vec![(0, l.chars().count(), "magenta")], String::new()));
+        }
+        lines.push((String::new(), vec![], String::new()));
+        // Items: "f   Find file", the keys in one column.
+        let label_width = items.iter().map(|(_, l, _)| l.chars().count()).max().unwrap_or(0).max(24);
+        for (key, label, command) in &items {
+            let text = format!("{key:<4}{label:<label_width$}");
+            lines.push((text, vec![(0, key.chars().count(), "accent")], command.clone()));
+        }
+        if !projects.is_empty() {
+            lines.push((String::new(), vec![], String::new()));
+            let title = "Projects".to_string();
+            let n = title.chars().count();
+            lines.push((title, vec![(0, n, "agent-heading")], String::new()));
+            for (i, p) in projects.iter().enumerate() {
+                let path = self.history.projects()[i].display().to_string();
+                lines.push((format!("{:<4}{p}", i + 1), vec![(0, 1, "accent"), (4, 4 + p.chars().count(), "dim")], format!("project:{path}")));
+            }
+        }
+        lines.push((String::new(), vec![], String::new()));
+        let footer = format!("vmac {}", env!("CARGO_PKG_VERSION"));
+        let n = footer.chars().count();
+        lines.push((footer, vec![(0, n, "dim")], String::new()));
+
+        // Centered: the banner on its own, the rest as one block.
+        let block = lines[banner.len()..].iter().map(|l| l.0.chars().count()).max().unwrap_or(0);
+        let top = rows.saturating_sub(lines.len()) / 3;
+        let mut text = "\n".repeat(top);
+        let mut faces = Vec::new();
+        let mut actions = vec![String::new(); top];
+        for (i, (line, line_faces, action)) in lines.into_iter().enumerate() {
+            let w = if i < banner.len() { banner_width } else { block };
+            let pad = width.saturating_sub(w) / 2;
+            let start = text.chars().count() + pad;
+            text.push_str(&" ".repeat(pad));
+            text.push_str(line.trim_end());
+            text.push('\n');
+            faces.extend(line_faces.into_iter().map(|(a, b, f)| (start + a, start + b, f)));
+            actions.push(action);
+        }
+        // The cursor stays on its item (or line) as the layout moves.
+        let old_line = self.buffer_by_id(id).map_or(0, |b| b.line());
+        let item = self.dashboard_actions.get(old_line).filter(|a| !a.is_empty()).cloned();
+        let line = match item.and_then(|a| actions.iter().position(|x| *x == a)) {
+            Some(l) => l,
+            None if self.dashboard_actions.is_empty() => actions.iter().position(|a| !a.is_empty()).unwrap_or(0),
+            None => old_line,
+        };
+        let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("checked above").1;
+        b.set_text(&text);
+        for (a, z, f) in faces {
+            b.add_face(a, z, f.to_string());
+        }
+        // Same line, at its text.
+        let start = b.line_to_pos(line.min(b.line_count().saturating_sub(1)));
+        let indent = b.substring(start, b.line_end(start)).chars().take_while(|c| *c == ' ').count();
+        b.goto_char(start + indent);
+        let point = b.point();
+        for w in self.windows.iter_mut().filter(|w| w.buffer == id) {
+            w.point = point;
+        }
+        self.dashboard_actions = actions;
+        true
     }
 
     pub fn take_events(&mut self) -> Vec<(String, Vec<String>)> {

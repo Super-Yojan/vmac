@@ -28,10 +28,11 @@
             (message "No match")
             (on-pick choice))))))
 
-(defcommand (find-file-command)
-  (let ((root (project-root)))
-    (pick "Find file" (project-files root) root
-          (lambda (path) (find-file (string-append root "/" path))))))
+(define (find-file-in root)
+  (pick "Find file" (project-files root) root
+        (lambda (path) (find-file (string-append root "/" path)))))
+
+(defcommand (find-file-command) (find-file-in (project-root)))
 
 (defcommand (picker-next) (picker-move 1))
 (defcommand (picker-previous) (picker-move -1))

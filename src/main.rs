@@ -8,7 +8,9 @@ mod lisp;
 mod lsp;
 mod markdown;
 mod picker;
+mod review;
 mod plugins;
+mod projects;
 mod shell;
 mod syntax;
 mod terminal;
@@ -20,7 +22,9 @@ use lisp::Lisp;
 use shell::Shell;
 
 fn main() {
-    let buffer = match std::env::args().nth(1) {
+    let start_file = std::env::args().nth(1);
+    let dashboard = start_file.is_none();
+    let buffer = match start_file {
         Some(path) => Buffer::from_file(path.into()).unwrap_or_else(|e| {
             eprintln!("vmac: {e}");
             std::process::exit(1);
@@ -43,12 +47,17 @@ fn main() {
             };
             gpui_kit::open_window(options, cx, move |window, cx| {
                 let editor = Editor::new(buffer);
-                let lisp = Lisp::with_config(
+                editor.lock().set_state_dir(projects::History::default_dir());
+                let mut lisp = Lisp::with_config(
                     editor.clone(),
                     Lisp::default_sources(),
                     Lisp::default_lua_sources(),
                     Lisp::default_plugin_dir(),
                 );
+                // Started without a file: the dashboard (unless turned off).
+                if dashboard {
+                    let _ = lisp.eval("(when dashboard-on-start (call-binding 'dashboard))");
+                }
                 cx.new(|cx| Shell::new(editor, lisp, window, cx))
             })
             .expect("failed to open window");
