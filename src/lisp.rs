@@ -1395,7 +1395,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             s.message = format!("agent-define-cli {name}: needs a command");
         }
     });
-    prim!(reg, editor, "agent-kind", |s| if s.agent_config.terminal { "cli".to_string() } else { "acp".to_string() });
+    prim!(reg, editor, "agent-kind", |s| if s.agent_is_cli() { "cli".to_string() } else { "acp".to_string() });
     prim!(reg, editor, "agent-cli-open", |s| s.agent_cli_open(None, None));
     prim!(reg, editor, "agent-cli-here?", |s| s.agent_cli_here());
     prim!(reg, editor, "agent-cli-send", |s, text: String| s.agent_cli_send(&text));
@@ -1419,6 +1419,30 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "session-rename", |s, name: String| s.session_requests.push(SessionRequest::Rename(name)));
     prim!(reg, editor, "set-session-per-project", |s, on: bool| s.session_per_project = on);
+    // Opens a window on a server on another machine (`vmac connect`), a
+    // program of its own; what it says goes to connect.log.
+    prim!(reg, editor, "connect", |s, host: String, target: String| {
+        let log = crate::projects::History::default_dir().map(|d| {
+            let _ = std::fs::create_dir_all(&d);
+            d.join("connect.log")
+        });
+        let out = || {
+            log.as_ref()
+                .and_then(|l| std::fs::OpenOptions::new().create(true).append(true).open(l).ok())
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(std::process::Stdio::null)
+        };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "vmac".into()));
+        command.arg("connect").arg(&host);
+        if !target.is_empty() {
+            command.arg(&target);
+        }
+        s.message = match command.stdin(std::process::Stdio::null()).stdout(out()).stderr(out()).spawn() {
+            Ok(_) => format!("connecting to {host} (a window opens; {})", log.map(|l| crate::projects::abbreviate(&l)).unwrap_or_default()),
+            Err(e) => format!("connect: {e}"),
+        };
+    });
+
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
     prim!(reg, editor, "exec", |s, command: String, args: Vec<String>| {
         std::process::Command::new(&command)
@@ -3032,7 +3056,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         let t = editor.lock().agent.as_ref().unwrap().transcript();
         assert!(t.contains("exit 3: hi there / second"), "{t}");
         let names = editor.lock().buffer_names();
-        let term = names.iter().find(|n| n.starts_with("*agent: sh -c echo")).cloned().expect("a terminal buffer");
+        let term = names.iter().find(|n| n.starts_with("*agent: echo $GREETING")).cloned().expect("a terminal buffer");
         editor.lock().switch_to_buffer(&term);
         assert!(text(&editor).contains("hi there\nsecond"), "{}", text(&editor));
 

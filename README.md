@@ -268,7 +268,20 @@ the release's download. ssh needs to log in without asking (a key, or an agent).
 
 Closing the window detaches; the remote sessions keep running, and the
 next `connect` finds them. What you yank there lands on this machine's
-clipboard, and `p` there pastes what you copied here.
+clipboard, and `p` there pastes what you copied here. From inside vmac,
+`SPC S c` or `:connect HOST [TARGET]` opens such a window. After updating
+vmac, `vmac connect --restart HOST` replaces the older server running there
+(closing its sessions).
+
+**The agent stays on your machine.** In a remote session, the coding agent
+runs here, where you're logged in, and works on the remote files through
+vmac: its reads, edits and commands happen there. It runs in a stand-in
+folder here, `/tmp/vmac/<host>-<project>`, holding the project's
+`CLAUDE.md` and `.claude/`; paths are translated both ways. Tools that
+would run inside the agent's own process are left out (Grep, Glob and
+subagents), and it's told to search with commands instead. This works with
+ACP agents (`claude`, `codex`, `gemini`); a CLI agent such as `claude-cli`
+gives way to its ACP version (`claude`) in a remote session.
 
 The dashboard is Lua: redefine `core.dashboard_banner` or
 `core.dashboard_items` in your config, e.g.

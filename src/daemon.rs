@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// What a client sends.
@@ -23,12 +24,25 @@ use std::time::{Duration, Instant};
 pub enum ToServer {
     /// Attach: to the session named `target`, or a project's session when
     /// it's a folder (relative to `cwd`), made when there's none such.
-    Hello { version: String, target: Option<String>, cwd: PathBuf, viewport: Viewport },
+    /// `agents`: it can run sessions' agents (it's on another machine, where
+    /// you're logged into them).
+    Hello {
+        version: String,
+        target: Option<String>,
+        cwd: PathBuf,
+        viewport: Viewport,
+        #[serde(default)]
+        agents: bool,
+    },
     Input(Input),
     Resize(Viewport),
     /// What's on the clipboard of the machine the window runs on (sent by
     /// windows far from the server, when it changes).
     Clipboard(String),
+    /// A line from an agent it runs, and that the agent stopped (with what
+    /// it last said on stderr).
+    AgentOut { id: u64, line: String },
+    AgentExit { id: u64, error: String },
     /// Ask for the sessions' names (and then the server hangs up).
     List,
     KillServer,
@@ -46,7 +60,16 @@ pub enum ToClient {
     Bye(String),
     /// Text a session copied, for the clipboard of a window far from the server.
     Clipboard(String),
+    /// Start an agent for a session, send it a line, stop it.
+    SpawnAgent(crate::remote_agent::Spawn),
+    AgentIn { id: u64, line: String },
+    AgentStop { id: u64 },
 }
+
+/// Bumped when the messages change in a way older servers can't read: each
+/// version has its own socket, so a newer window never talks to an older
+/// server (stop that one with its own `vmac kill-server`).
+const PROTOCOL: u32 = 2;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.
@@ -61,7 +84,7 @@ pub fn socket_path() -> PathBuf {
             std::env::temp_dir().join(format!("vmac-{user}"))
         }
     };
-    dir.join("default")
+    dir.join(format!("default-{PROTOCOL}"))
 }
 
 fn send_line(stream: &mut impl Write, message: &impl Serialize) -> std::io::Result<()> {
@@ -176,6 +199,9 @@ fn run(
     new_rx: Receiver<(ClientId, Sender<String>)>,
 ) -> std::io::Result<()> {
     let mut clients: std::collections::BTreeMap<ClientId, Attached> = Default::default();
+    // The window that runs sessions' agents (one on another machine).
+    let mut agent_window: Option<ClientId> = None;
+    let mut agent_windows: Vec<ClientId> = Vec::new();
     let (mut last_lsp, mut last_reload) = (Instant::now(), Instant::now());
     loop {
         // Wait for a message, or until terminals are due to be read.
@@ -194,8 +220,19 @@ fn run(
             match message {
                 None => {
                     clients.remove(&id);
+                    agent_windows.retain(|w| *w != id);
+                    if agent_window == Some(id) {
+                        agent_window = None;
+                        crate::remote_agent::all_exited("the window running it closed");
+                    }
                 }
-                Some(ToServer::Hello { target, cwd, viewport, .. }) => {
+                Some(ToServer::Hello { target, cwd, viewport, agents, .. }) => {
+                    if agents {
+                        agent_windows.push(id);
+                        // At once: the keys after it may start an agent.
+                        agent_window.get_or_insert(id);
+                        crate::remote_agent::set_available(true);
+                    }
                     client.viewport = viewport;
                     client.acks += 1;
                     client.hello = true;
@@ -218,6 +255,8 @@ fn run(
                     changed = true;
                 }
                 Some(ToServer::Clipboard(text)) => crate::clipboard::relay_from_window(text),
+                Some(ToServer::AgentOut { id: agent, line }) => crate::remote_agent::deliver(agent, &line),
+                Some(ToServer::AgentExit { id: agent, error }) => crate::remote_agent::exited(agent, &error),
                 Some(ToServer::List) => {
                     let (active, all) = server.names();
                     client.send(&ToClient::Sessions { active, all });
@@ -232,6 +271,25 @@ fn run(
                     return Ok(());
                 }
             }
+        }
+        // Agents start in a window that can run them, while there is one.
+        if agent_window.is_none() {
+            agent_window = agent_windows.last().copied();
+        }
+        crate::remote_agent::set_available(agent_window.is_some());
+        for message in crate::remote_agent::take_outgoing() {
+            use crate::remote_agent::ToWindow;
+            let Some(window) = agent_window.and_then(|w| clients.get(&w)) else {
+                if let ToWindow::Spawn(spawn) = message {
+                    crate::remote_agent::exited(spawn.id, "no window to run it");
+                }
+                continue;
+            };
+            window.send(&match message {
+                ToWindow::Spawn(spawn) => ToClient::SpawnAgent(spawn),
+                ToWindow::Line(id, line) => ToClient::AgentIn { id, line },
+                ToWindow::Stop(id) => ToClient::AgentStop { id },
+            });
         }
         // What sessions copied, for windows on other machines.
         for text in crate::clipboard::relay_take_copied() {
@@ -275,7 +333,10 @@ fn run(
 /// The connection a window has to a server: sends its inputs, keeps the
 /// last frame the server sent.
 pub struct Client {
-    writer: Box<dyn Write + Send>,
+    /// Shared with the threads reading agents' output.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Agents it runs for the server's sessions: their input, by id.
+    agents: std::collections::HashMap<u64, LocalAgent>,
     incoming: Receiver<((), Option<ToClient>)>,
     /// What carries it (ssh), stopped when the window closes.
     carrier: Option<std::process::Child>,
@@ -316,12 +377,14 @@ impl Client {
         carrier: Option<std::process::Child>,
     ) -> std::io::Result<Self> {
         let viewport = Viewport { width: 1320., height: 840. };
-        send_line(&mut writer, &ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd, viewport })?;
+        let remote = carrier.is_some();
+        let hello = ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd, viewport, agents: remote };
+        send_line(&mut writer, &hello)?;
         let (tx, incoming) = channel();
         read_lines(reader, (), tx);
-        let remote = carrier.is_some();
         let mut client = Self {
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
+            agents: Default::default(),
             incoming,
             carrier,
             remote,
@@ -345,7 +408,7 @@ impl Client {
     }
 
     fn send(&mut self, message: &ToServer) {
-        if self.gone.is_none() && send_line(&mut self.writer, message).is_err() {
+        if self.gone.is_none() && send_to(&self.writer, message).is_err() {
             self.gone = Some("Lost the server".into());
         }
     }
@@ -378,6 +441,21 @@ impl Client {
                     return true;
                 }
                 Some(ToClient::Sessions { .. }) => {}
+                Some(ToClient::SpawnAgent(spawn)) => {
+                    let id = spawn.id;
+                    match LocalAgent::start(spawn, self.writer.clone()) {
+                        Ok(agent) => {
+                            self.agents.insert(id, agent);
+                        }
+                        Err(e) => self.send(&ToServer::AgentExit { id, error: e.to_string() }),
+                    }
+                }
+                Some(ToClient::AgentIn { id, line }) => {
+                    if let Some(agent) = self.agents.get_mut(&id) {
+                        agent.send(&line);
+                    }
+                }
+                Some(ToClient::AgentStop { id }) => drop(self.agents.remove(&id)),
                 // A server on this machine has the clipboard already.
                 Some(ToClient::Clipboard(text)) => {
                     if self.remote {
@@ -397,6 +475,83 @@ impl Client {
     /// Why the server hung up, once it has.
     pub fn gone(&self) -> Option<&str> {
         self.gone.as_deref()
+    }
+}
+
+fn send_to(writer: &Mutex<Box<dyn Write + Send>>, message: &ToServer) -> std::io::Result<()> {
+    send_line(&mut *writer.lock().unwrap_or_else(|e| e.into_inner()), message)
+}
+
+/// An agent a window runs for a session on another machine (see
+/// remote_agent.rs): its output goes to the server line by line.
+struct LocalAgent {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+}
+
+impl LocalAgent {
+    fn start(spawn: crate::remote_agent::Spawn, writer: Arc<Mutex<Box<dyn Write + Send>>>) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        // The stand-in folder, with the project's rules.
+        std::fs::create_dir_all(&spawn.cwd)?;
+        for (rel, text) in &spawn.files {
+            let path = spawn.cwd.join(rel);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(path, text)?;
+        }
+        let mut child = std::process::Command::new(&spawn.command)
+            .args(&spawn.args)
+            .current_dir(&spawn.cwd)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().expect("piped");
+        let (stdout, stderr) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
+        let id = spawn.id;
+        let last_error = Arc::new(Mutex::new(String::new()));
+        {
+            let last = last_error.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        *last.lock().unwrap_or_else(|e| e.into_inner()) = line.trim().to_string();
+                    }
+                }
+            });
+        }
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if send_to(&writer, &ToServer::AgentOut { id, line }).is_err() {
+                    return;
+                }
+            }
+            // Let stderr's last words arrive.
+            std::thread::sleep(Duration::from_millis(50));
+            let error = last_error.lock().map(|e| e.clone()).unwrap_or_default();
+            let _ = send_to(&writer, &ToServer::AgentExit { id, error });
+        });
+        Ok(Self { child, stdin })
+    }
+
+    fn send(&mut self, line: &str) {
+        let _ = self.stdin.write_all(line.as_bytes()).and_then(|()| self.stdin.write_all(b"\n")).and_then(|()| self.stdin.flush());
+    }
+}
+
+impl Drop for LocalAgent {
+    fn drop(&mut self) {
+        // Its whole process group: npx runs the adapter as a child.
+        // SAFETY: kill with a negative pid signals that process group.
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGTERM);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -614,6 +769,67 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A window on "another machine" (a carrier: here a stand-in process)
+    /// runs the session's agent; its lines go through the server's relay.
+    #[test]
+    fn a_far_window_runs_the_sessions_agent() {
+        let dir = std::env::temp_dir().join(format!("vmac-daemon-agent-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        let socket = dir.join("socket");
+        let windows = {
+            let socket = socket.clone();
+            let command = config.line();
+            std::thread::spawn(move || {
+                while UnixStream::connect(&socket).is_err() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let stream = UnixStream::connect(&socket).unwrap();
+                let carrier = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+                let mut client =
+                    Client::over(Box::new(stream.try_clone().unwrap()), Box::new(stream), None, PathBuf::new(), Some(carrier))
+                        .unwrap();
+                let line = |client: &mut Client, text: &str| {
+                    keys(client, &[":"]);
+                    for c in text.chars() {
+                        let k = if c == ' ' { "SPC".to_string() } else { c.to_string() };
+                        client.handle(Input::Key { key: k, text: c.to_string() });
+                    }
+                    keys(client, &["RET"]);
+                };
+                line(&mut client, &format!("lua vmac.agent_define('fake', {command:?})"));
+                line(&mut client, "agent-use fake");
+                line(&mut client, "agent hello there");
+                let mut shown = String::new();
+                for _ in 0..300 {
+                    client.pump_terminals();
+                    let frame = client.frame(VIEW);
+                    shown = frame
+                        .windows
+                        .iter()
+                        .filter_map(|w| match &w.content {
+                            Content::Text(lines) => Some(lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n")),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n---\n");
+                    if shown.contains("You said: hello there") {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let ran_here = !client.agents.is_empty();
+                drop(client);
+                kill(&socket).unwrap();
+                (shown, ran_here)
+            })
+        };
+        serve(|| Server::new(fresh(), Box::new(fresh)), &socket).unwrap();
+        let (shown, ran_here) = windows.join().unwrap();
+        assert!(ran_here, "the agent ran in the window's process");
+        assert!(shown.contains("You said: hello there"), "{shown}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_second_server_on_the_same_socket_is_refused() {
         let dir = std::env::temp_dir().join(format!("vmac-daemon-twice-{}", std::process::id()));
@@ -635,7 +851,7 @@ mod tests {
 
     #[test]
     fn messages_survive_the_wire() {
-        let hello = ToServer::Hello { version: "1".into(), target: Some("x".into()), cwd: "/tmp".into(), viewport: VIEW };
+        let hello = ToServer::Hello { version: "1".into(), target: Some("x".into()), cwd: "/tmp".into(), viewport: VIEW, agents: false };
         let line = serde_json::to_string(&hello).unwrap();
         assert_eq!(serde_json::from_str::<ToServer>(&line).unwrap(), hello);
     }

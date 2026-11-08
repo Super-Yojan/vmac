@@ -6,6 +6,8 @@
 --   SPC S s   switch session                SPC S l   the last session
 --   SPC S n   new session (asks a name)     SPC S r   rename this session
 --   SPC S k   kill a session                SPC S K   kill it, unsaved files and all
+--   SPC S c   connect to another machine (:connect HOST [TARGET]): a
+--             window on its sessions, over ssh (`vmac connect`)
 --
 -- The first project a session opens names it. To open projects in the
 -- session you're in instead: vmac.set_session_per_project(false)
@@ -49,6 +51,17 @@ end
 vmac.command("session-kill-command", kill(false))
 vmac.command("session-kill-force-command", kill(true))
 
+local function connect(line)
+  local host, target = line:match("^(%S+)%s*(.*)$")
+  if host then vmac.connect(host, target) end
+end
+
+vmac.command("connect-command", function() vmac.prompt("Connect to (HOST [TARGET]): ", connect) end)
+core.ex_commands["connect"] = function(arg)
+  if arg == "" then core.call_binding("connect-command") else connect(arg) end
+end
+
+vmac.map("normal", "SPC S c", "connect-command")
 vmac.map("normal", "SPC S s", "session-switch-command")
 vmac.map("normal", "SPC S l", "session-last-command")
 vmac.map("normal", "SPC S n", "session-new-command")

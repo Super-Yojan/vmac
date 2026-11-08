@@ -22,6 +22,7 @@ mod sessions;
 mod plugins;
 mod projects;
 mod remote;
+mod remote_agent;
 #[cfg(feature = "gui")]
 mod shell;
 mod syntax;
@@ -42,10 +43,12 @@ usage: vmac [FILE]              edit FILE (or show the dashboard) in this window
        vmac attach [TARGET]     open a window on the vmac server, starting it if
                                 needed; TARGET is a session's name or a project's
                                 folder (its session is made the first time)
-       vmac connect HOST [TARGET]
+       vmac connect [--restart] HOST [TARGET]
                                 the same on another machine, over ssh: installs
                                 the server there (once per build); TARGET's
-                                folders are from your home folder there
+                                folders are from your home folder there.
+                                --restart replaces a server running there (an
+                                older build), closing its sessions
        vmac ls                  list the server's sessions
        vmac kill-server         stop the server and everything in it
        vmac --server            run the server here, without a window
@@ -83,8 +86,10 @@ fn main() {
             open_window(Box::new(client));
         }
         Some("connect" | "c") => {
-            let Some(host) = args.get(1) else { fail(&"connect to which host? (vmac connect HOST [TARGET])") };
-            let client = remote::connect(host, args.get(2).cloned()).unwrap_or_else(|e| fail(&e));
+            let restart = args.iter().any(|a| a == "--restart");
+            let words: Vec<&String> = args[1..].iter().filter(|a| *a != "--restart").collect();
+            let Some(host) = words.first() else { fail(&"connect to which host? (vmac connect [--restart] HOST [TARGET])") };
+            let client = remote::connect(host, words.get(1).map(|t| t.to_string()), restart).unwrap_or_else(|e| fail(&e));
             if let Some(why) = client.gone() {
                 fail(&why);
             }

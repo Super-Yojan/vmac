@@ -302,6 +302,9 @@ pub struct Agent {
     initialized: bool,
     /// The past session to reopen instead of a new one.
     pub load: Option<String>,
+    /// Sent along when a session opens (`_meta`): what claude-code-acp
+    /// takes beyond ACP (tools to leave out, words for its system prompt).
+    pub meta: Option<Value>,
     /// Replaying a reopened session: its tool calls aren't news for hooks.
     replaying: bool,
     /// A list of sessions asked before initialize was answered (Some(None):
@@ -348,6 +351,7 @@ impl Agent {
             can_list: false,
             initialized: false,
             load: None,
+            meta: None,
             replaying: false,
             list_wanted: None,
             terminals: HashMap::new(),
@@ -595,23 +599,31 @@ impl Agent {
                 self.can_list = caps["sessionCapabilities"]["list"].is_object();
                 self.initialized = true;
                 let cwd = self.root.display().to_string();
+                // `_meta` only when there is some (strict agents refuse null).
+                let meta = self.meta.clone();
+                let params = |mut v: Value| {
+                    if let Some(meta) = &meta {
+                        v["_meta"] = meta.clone();
+                    }
+                    v
+                };
                 match self.load.take() {
                     // Reopen a past session: load replays it; resume just continues.
                     Some(id) if self.can_load => {
                         self.replaying = true;
                         self.session = Some(id.clone());
-                        self.call(Pending::LoadSession, "session/load", json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] }));
+                        self.call(Pending::LoadSession, "session/load", params(json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] })));
                     }
                     Some(id) if self.can_resume => {
                         self.session = Some(id.clone());
-                        self.call(Pending::LoadSession, "session/resume", json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] }));
+                        self.call(Pending::LoadSession, "session/resume", params(json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] })));
                         self.note("Resumed: its earlier messages aren't shown (this agent doesn't replay them)".into());
                     }
                     other => {
                         if other.is_some() {
                             self.note(format!("{} can't reopen sessions; starting a new one", self.config.name));
                         }
-                        self.call(Pending::NewSession, "session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+                        self.call(Pending::NewSession, "session/new", params(json!({ "cwd": cwd, "mcpServers": [] })));
                     }
                 }
                 if let Some(dir) = self.list_wanted.take() {
@@ -1082,11 +1094,29 @@ pub struct Pipe {
     stop: Box<dyn FnMut() + Send>,
 }
 
+#[cfg(test)]
 impl Pipe {
-    /// For agents on a client's machine (not wired up yet).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(send: Box<dyn Write + Send>, incoming: Receiver<Value>, stop: Box<dyn FnMut() + Send>) -> Self {
-        Self { send, incoming, last_error: Default::default(), stop }
+    pub fn write_line(&mut self, message: &Value) {
+        let mut line = message.to_string();
+        line.push('\n');
+        self.send.write_all(line.as_bytes()).unwrap();
+    }
+
+    pub fn try_recv(&self) -> Option<Value> {
+        self.incoming.try_recv().ok()
+    }
+}
+
+impl Pipe {
+    /// Messages written to `send`, read from `incoming`; `last_error` says
+    /// why it failed, once it has.
+    pub fn new(
+        send: Box<dyn Write + Send>,
+        incoming: Receiver<Value>,
+        last_error: Arc<Mutex<String>>,
+        stop: Box<dyn FnMut() + Send>,
+    ) -> Self {
+        Self { send, incoming, last_error, stop }
     }
 
     /// Runs the agent's program in `root`.
@@ -1249,10 +1279,11 @@ while True:
             say(s, "Patched.")
             send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "end_turn"}})
         elif text.startswith("run "):
-            # Runs a shell line in the editor's terminal, waits, reads it.
+            # Runs a shell line in the editor's terminal (the whole line as
+            # the command, as claude-code-acp sends it), waits, reads it.
             update(s, {"sessionUpdate": "tool_call", "toolCallId": "r1", "title": "Run it", "kind": "execute", "status": "in_progress"})
             send({"jsonrpc": "2.0", "id": 120, "method": "terminal/create", "params": {"sessionId": s,
-                  "command": "sh", "args": ["-c", text[4:]], "env": [{"name": "GREETING", "value": "hi there"}], "outputByteLimit": 1000}})
+                  "command": text[4:], "env": [{"name": "GREETING", "value": "hi there"}], "outputByteLimit": 1000}})
             tid = reply_to(120)["result"]["terminalId"]
             update(s, {"sessionUpdate": "tool_call_update", "toolCallId": "r1", "content": [{"type": "terminal", "terminalId": tid}]})
             send({"jsonrpc": "2.0", "id": 121, "method": "terminal/wait_for_exit", "params": {"sessionId": s, "terminalId": tid}})
@@ -1334,7 +1365,7 @@ while True:
                 let _ = tx.send(serde_json::from_str(&line).unwrap());
             }
         });
-        let pipe = Pipe::new(Box::new(stdin), rx, Box::new(move || drop(child.kill())));
+        let pipe = Pipe::new(Box::new(stdin), rx, Default::default(), Box::new(move || drop(child.kill())));
         let mut agent = Agent::over(config, &dir, pipe);
         agent.prompt("hello");
         assert!(wait_until(&mut agent, |a| a.entries.contains(&Entry::Agent("You said: hello".into()))), "{:?}", agent.entries);

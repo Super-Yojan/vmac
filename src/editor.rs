@@ -1288,10 +1288,18 @@ impl EditorState {
         if self.agent.as_ref().is_some_and(|a| a.state != crate::agent::State::Exited) {
             return Ok(());
         }
-        let config = self.agent_config.clone();
+        let config = self.acp_config();
         let root = self.agent_root();
-        let agent = crate::agent::Agent::start(config.clone(), &root)
-            .map_err(|e| format!("{}: {e}", config.command))?;
+        let agent = if crate::remote_agent::available() {
+            // The window is on another machine, where you're logged into
+            // the agent: it runs there, working on these files through vmac.
+            let pipe = crate::remote_agent::pipe(&config.command, &config.args, &root);
+            let mut agent = crate::agent::Agent::over(config.clone(), &root, pipe);
+            agent.meta = Some(crate::remote_agent::session_meta(&root));
+            agent
+        } else {
+            crate::agent::Agent::start(config.clone(), &root).map_err(|e| format!("{}: {e}", config.command))?
+        };
         self.agent = Some(agent);
         self.agent_shown = u64::MAX;
         self.agent_asked = 0;
@@ -1314,7 +1322,7 @@ impl EditorState {
     /// Shows the agent buffer: in the window already showing it, else in a
     /// new window on the right.
     pub fn agent_show(&mut self) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             self.agent_cli_open(None, None);
             return;
         }
@@ -1332,7 +1340,7 @@ impl EditorState {
 
     /// Sends the agent a prompt, starting it if needed.
     pub fn agent_prompt(&mut self, text: &str) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             self.agent_cli_send(text);
             return;
         }
@@ -1380,7 +1388,7 @@ impl EditorState {
     /// SPC a e: asks about the selected file's problems (the language
     /// server's diagnostics), with the file attached.
     pub fn agent_ask_about_problems(&mut self, question: &str) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             let Some(path) = self.buffer().file().cloned() else {
                 self.message = "This buffer has no file".into();
                 return;
@@ -1440,7 +1448,7 @@ impl EditorState {
 
     /// Stops the agent; the next prompt starts a new one.
     pub fn agent_stop(&mut self) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             self.agent_cli_kill();
             self.message = "Agent stopped".into();
             return;
@@ -1453,7 +1461,7 @@ impl EditorState {
 
     pub fn agent_status(&self) -> String {
         use crate::agent::State;
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             return match self.agent_cli.and_then(|id| self.terminals.iter().find(|t| t.buffer == id)) {
                 Some(t) if !t.exited => "running".into(),
                 Some(_) => "stopped".into(),
@@ -1525,6 +1533,24 @@ impl EditorState {
     }
 
     /// Uses the agent backend called `name` from the next start.
+    /// The agent runs in a terminal (a CLI agent). Not while a window on
+    /// another machine runs the agents: a terminal would run it here.
+    pub fn agent_is_cli(&self) -> bool {
+        self.agent_config.terminal && !crate::remote_agent::available()
+    }
+
+    /// The ACP agent to run: the one chosen, or for a CLI agent while a far
+    /// window runs agents, the ACP agent of that name less "-cli"
+    /// (claude-cli: claude), else claude.
+    fn acp_config(&self) -> crate::agent::AgentConfig {
+        if !self.agent_config.terminal {
+            return self.agent_config.clone();
+        }
+        let base = self.agent_config.name.trim_end_matches("-cli");
+        let find = |name: &str| self.agent_backends.iter().find(|b| b.name == name && !b.terminal).cloned();
+        find(base).or_else(|| find("claude")).unwrap_or_else(|| self.agent_config.clone())
+    }
+
     pub fn agent_use(&mut self, name: &str) -> bool {
         match self.agent_backends.iter().find(|b| b.name == name).cloned() {
             Some(config) => {
@@ -1680,7 +1706,14 @@ impl EditorState {
                     .unwrap_or_default();
                 let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_default();
                 let cwd = p["cwd"].as_str().map(PathBuf::from).unwrap_or(root);
-                match crate::terminal::LocalPty::run(&command, &args, &env, &cwd, 30, 120) {
+                // A whole shell line and no arguments (claude-code-acp's Bash
+                // sends `cd x && rg y | head`): a shell runs it, as Zed does.
+                let (program, run_args) = if args.is_empty() && command.contains(char::is_whitespace) {
+                    ("sh".to_string(), vec!["-c".to_string(), command.clone()])
+                } else {
+                    (command.clone(), args.clone())
+                };
+                match crate::terminal::LocalPty::run(&program, &run_args, &env, &cwd, 30, 120) {
                     Ok(pty) => {
                         let shown = std::iter::once(command.as_str()).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
                         let short: String = shown.chars().take(40).collect();
@@ -1899,7 +1932,7 @@ impl EditorState {
     /// keeping its cursor. While a CLI agent runs, its changes wait for
     /// review, as an ACP agent's do. Returns whether a buffer changed.
     fn watch_files(&mut self) -> bool {
-        let cli = self.agent_config.terminal && self.agent_cli_alive().is_some();
+        let cli = self.agent_is_cli() && self.agent_cli_alive().is_some();
         let files: Vec<(BufferId, PathBuf)> = self
             .buffers
             .iter()
@@ -2294,7 +2327,7 @@ impl EditorState {
         let comments = std::mem::take(&mut self.review_comments);
         let n = comments.len();
         let side = |c: &ReviewComment| if c.at.modified { "" } else { " (the old version)" };
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             let list: Vec<String> = comments
                 .iter()
                 .map(|c| format!("{} line {}{}: {}", c.at.rel, c.at.line, side(c), c.text))
@@ -2441,7 +2474,7 @@ impl EditorState {
 
     /// Shows the agent buffer with the point at the end of the prompt.
     pub fn agent_focus_prompt(&mut self) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             self.agent_cli_open(None, None);
             return;
         }
@@ -2528,7 +2561,7 @@ impl EditorState {
     /// Asks about lines of the selected buffer: sends the question with the
     /// file, the line numbers and the text.
     pub fn agent_ask_about(&mut self, start: usize, end: usize, question: &str) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             let b = self.buffer();
             let (first, last) = (b.line_of(start), b.line_of(end.saturating_sub(1).max(start)));
             let root = self.agent_root();
@@ -2578,7 +2611,7 @@ impl EditorState {
             self.offer_sessions(list, true);
             return;
         }
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             self.message = format!("{} can't list its sessions here", self.agent_config.name);
             return;
         }
@@ -2628,7 +2661,7 @@ impl EditorState {
             return;
         }
         // A CLI agent reopens it with its own resume command, in its folder.
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             if self.agent_config.resume.is_empty() {
                 self.message = format!("{} has no resume command", self.agent_config.name);
                 return;
@@ -2665,7 +2698,7 @@ impl EditorState {
 
     /// A new conversation: stops the agent and starts it again.
     pub fn agent_new_session(&mut self) {
-        if self.agent_config.terminal {
+        if self.agent_is_cli() {
             self.agent_cli_kill();
             self.agent_cli_open(None, None);
             return;

@@ -139,14 +139,15 @@ fn build_id(binary: &Path) -> Result<String> {
 }
 
 /// Installs the server on `host` (unless this build is there already) and
-/// returns its path there, relative to the home folder.
-pub fn install(host: &str) -> Result<String> {
+/// returns its path there, relative to the home folder, and whether it
+/// was just installed.
+pub fn install(host: &str) -> Result<(String, bool)> {
     let uname = ssh(host, "uname -sm")?;
     let target = target_for(&uname)?;
     let binary = server_binary(target)?;
     let path = format!(".vmac/server/{}/vmac", build_id(&binary)?);
     if ssh(host, &format!("test -x {path} && echo yes || echo no"))?.trim() == "yes" {
-        return Ok(path);
+        return Ok((path, false));
     }
     let size = binary.metadata()?.len();
     say(&format!("installing the server on {host} ({} MB)", size / 1_000_000));
@@ -159,13 +160,23 @@ pub fn install(host: &str) -> Result<String> {
     if !status.success() {
         return Err(Error::other(format!("couldn't copy the server to {host}")));
     }
-    Ok(path)
+    Ok((path, true))
 }
 
 /// Installs the server on `host` if needed, and attaches to `target` there
-/// (a session's name or a folder, from the remote home folder).
-pub fn connect(host: &str, target: Option<String>) -> Result<Client> {
-    let path = install(host)?;
+/// (a session's name or a folder, from the remote home folder). `restart`
+/// stops the server running there first (it may be an older build), and
+/// everything in it.
+pub fn connect(host: &str, target: Option<String>, restart: bool) -> Result<Client> {
+    let (path, fresh) = install(host)?;
+    if restart {
+        let _ = ssh(host, &format!("{path} kill-server; sleep 0.3"));
+    } else if fresh && ssh(host, &format!("{path} ls >/dev/null 2>&1 && echo running || true"))?.trim() == "running" {
+        say(&format!(
+            "the server running on {host} is an older build (it keeps its sessions); \
+             `vmac connect --restart {host}` replaces it, closing them"
+        ));
+    }
     let mut ssh = Command::new("ssh")
         .args(["-C", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", host, &path, "proxy"])
         .stdin(Stdio::piped())
@@ -179,6 +190,54 @@ pub fn connect(host: &str, target: Option<String>) -> Result<Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code (claude-code-acp, logged in here) on a project on
+    /// another machine: VMAC_TEST_HOST=user@host, the project
+    /// /tmp/vmac-agent-test there. Its command must run there.
+    #[test]
+    #[ignore]
+    fn a_local_agent_works_on_a_remote_project() {
+        use crate::frame::{Content, Input, Viewport};
+        use crate::server::Host;
+        let host = std::env::var("VMAC_TEST_HOST").expect("VMAC_TEST_HOST=user@host");
+        let remote_name = ssh(&host, "hostname").unwrap().trim().to_string();
+        let mut client = connect(&host, Some("/tmp/vmac-agent-test".into()), true).unwrap();
+        let view = Viewport { width: 1400., height: 900. };
+        let ex = |client: &mut Client, text: &str| {
+            for k in ["ESC", "ESC", ":"] {
+                client.handle(Input::Key { key: k.into(), text: if k == ":" { ":".into() } else { String::new() } });
+            }
+            for c in text.chars() {
+                let k = if c == ' ' { "SPC".to_string() } else { c.to_string() };
+                client.handle(Input::Key { key: k, text: c.to_string() });
+            }
+            client.handle(Input::Key { key: "RET".into(), text: String::new() });
+        };
+        ex(&mut client, "lua vmac.hooks.agent_permission = function() return 'allow' end");
+        ex(&mut client, "agent-use claude");
+        ex(&mut client, "agent Run the shell command hostname, then use a command to find which files here contain the word println. Reply with one line: HOST=<hostname> FILES=<files>");
+        let mut shown = String::new();
+        for _ in 0..900 {
+            client.pump_terminals();
+            let frame = client.frame(view);
+            shown = frame
+                .windows
+                .iter()
+                .filter_map(|w| match &w.content {
+                    Content::Text(lines) => Some(lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            if shown.contains(&format!("HOST={remote_name}")) && shown.contains("main.rs") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        eprintln!("{shown}");
+        assert!(shown.contains(&format!("HOST={remote_name}")), "the command ran on {remote_name}");
+        assert!(shown.contains("main.rs"));
+    }
 
     #[test]
     fn targets_from_uname() {
