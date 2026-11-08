@@ -458,8 +458,11 @@ Opening an image (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.ico`)
 shows it, as large as the window allows and never larger than it is. A PDF
 shows its pages one under the other, to scroll through with the trackpad,
 the wheel or keys: `j`/`k` a little, `C-d`/`C-u` half a window, `C-f`/`C-b` a
-window, `J`/`K` a page, `gg`/`G` the first and last page (`5G` page 5); pages are drawn as they come into view, and a PDF that changes on disk
-(rebuilt by LaTeX, say) reloads where you were. Pages take the theme's
+window, `J`/`K` a page, `gg`/`G` the first and last page (`5G` page 5).
+`+`/`-` (or `Cmd =`/`Cmd -`) zoom, `=` (`Cmd 0`) fits the pages to the window
+again, and `h`/`l` scroll sideways across pages zoomed wider than it. Pages
+are drawn as they come into view, and a PDF that changes on disk (rebuilt by
+LaTeX, say) reloads where you were. Pages take the theme's
 colors, paper as its background and ink as its text; `SPC t p` (or
 `vmac.set_pdf_themed(false)`) shows them black on white, as printed, for
 PDFs full of photos. Both are read-only, and `:w`

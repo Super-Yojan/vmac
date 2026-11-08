@@ -1267,6 +1267,15 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "pdf-themed", |s| s.pdf_themed);
     // Keys in a PDF: whether this is one, and moving through it
     // ("lines", "screens", "pages", "page" (from 1), or "end").
+    // Zoom: times `by`, or back to fitting the window with 0.
+    prim!(reg, editor, "pdf-zoom", |s, by: f64| {
+        let id = s.window().buffer;
+        let now = s.pdf_zoom.get(&id).copied().unwrap_or(1.);
+        let zoom = if by <= 0. { 1. } else { (now * by as f32).clamp(0.25, 8.) };
+        s.pdf_zoom.insert(id, zoom);
+        s.message = format!("Zoom {:.0}%", zoom * 100.);
+    });
+    prim!(reg, editor, "pdf-zoom-level", |s| s.pdf_zoom.get(&s.window().buffer).copied().unwrap_or(1.) as f64);
     prim!(reg, editor, "pdf-here?", |s| {
         s.buffer().file().and_then(|f| crate::frame::media_kind(f)) == Some(crate::frame::MediaKind::Pdf)
     });
@@ -1275,11 +1284,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         let scroll = match how.as_str() {
             "lines" => PdfScroll::Lines(n as i32),
             "screens" => PdfScroll::Screens(n as f32),
+            "sideways" => PdfScroll::Sideways(n as i32),
             "pages" => PdfScroll::Pages(n as i32),
             "page" => PdfScroll::Page((n as usize).saturating_sub(1)),
             "end" => PdfScroll::End,
             _ => {
-                s.message = format!("{how}: PDFs scroll by lines, screens, pages, to a page or the end");
+                s.message = format!("{how}: PDFs scroll by lines, screens, sideways, pages, to a page or the end");
                 return;
             }
         };
@@ -3625,6 +3635,33 @@ for line in sys.stdin:
         );
         let numbers: Vec<u64> = editor.lock().pdf_scroll[&id].iter().map(|(n, _)| *n).collect();
         assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "numbered in order: {numbers:?}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pdfs_zoom_in_steps_and_back_to_fitting() {
+        let (mut lisp, editor) = lisp_with("");
+        let path = std::env::temp_dir().join(format!("vmac-zoom-{}.pdf", std::process::id()));
+        std::fs::write(&path, b"%PDF-1.4").unwrap();
+        editor.lock().open_file(&path).unwrap();
+        let zoom = |e: &Editor| {
+            let st = e.lock();
+            st.pdf_zoom.get(&st.window().buffer).copied().unwrap_or(1.)
+        };
+        typed(&mut lisp, "++");
+        assert!((zoom(&editor) - 1.5625).abs() < 1e-4, "{}", zoom(&editor));
+        assert_eq!(editor.lock().message, "Zoom 156%");
+        typed(&mut lisp, "-");
+        assert!((zoom(&editor) - 1.25).abs() < 1e-4);
+        lisp.dispatch_key("s-0", "");
+        assert_eq!(zoom(&editor), 1.);
+        typed(&mut lisp, "20-");
+        assert_eq!(zoom(&editor), 0.25, "no smaller than a quarter");
+        typed(&mut lisp, "=hl");
+        assert_eq!(zoom(&editor), 1.);
+        let id = editor.lock().window().buffer;
+        let last: Vec<_> = editor.lock().pdf_scroll[&id].iter().map(|(_, how)| *how).collect();
+        assert_eq!(last, [crate::frame::PdfScroll::Sideways(-1), crate::frame::PdfScroll::Sideways(1)]);
         std::fs::remove_file(path).ok();
     }
 

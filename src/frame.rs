@@ -160,6 +160,9 @@ pub enum Content {
         /// does each once (several may come between two frames).
         #[serde(default)]
         scroll: Vec<(u64, PdfScroll)>,
+        /// A PDF's zoom: 1 fits its pages to the window.
+        #[serde(default = "default_scale")]
+        zoom: f32,
     },
 }
 
@@ -170,6 +173,9 @@ pub enum PdfScroll {
     Lines(i32),
     /// Window heights.
     Screens(f32),
+    /// Steps sideways, across pages zoomed wider than the window
+    /// (negative: left).
+    Sideways(i32),
     /// Pages from the one at the top.
     Pages(i32),
     /// To a page (from 0), or the end.

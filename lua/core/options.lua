@@ -26,6 +26,8 @@ vmac.map("normal", "SPC t p", "toggle-pdf-theme")
 -- In a PDF, in front of normal state's keys (core.keymaps.pdf): j k and
 -- C-e C-y scroll a little, C-d C-u half a window, C-f C-b a window, J K a
 -- page, gg the first page and G the last (5G page 5). Counts work: 3j.
+-- + and - zoom (Cmd = and Cmd - too), = fits the pages to the window again
+-- (Cmd 0), and h l scroll sideways across pages zoomed wider than it.
 
 vmac.command("pdf-down", function() vmac.pdf_scroll("lines", 1) end)
 vmac.command("pdf-up", function() vmac.pdf_scroll("lines", -1) end)
@@ -48,4 +50,14 @@ local pdf_keys = {
   ["g g"] = page_or(function() vmac.pdf_scroll("page", 1) end),
   G = page_or(function() vmac.pdf_scroll("end", 0) end),
 }
+vmac.command("pdf-zoom-in", function() vmac.pdf_zoom(1.25) end)
+vmac.command("pdf-zoom-out", function() vmac.pdf_zoom(0.8) end)
+vmac.command("pdf-zoom-fit", function() vmac.pdf_zoom(0) end)
+vmac.command("pdf-left", function() vmac.pdf_scroll("sideways", -1) end)
+vmac.command("pdf-right", function() vmac.pdf_scroll("sideways", 1) end)
+for key, binding in pairs({
+  ["+"] = "pdf-zoom-in", ["-"] = "pdf-zoom-out", ["="] = "pdf-zoom-fit",
+  ["s-="] = "pdf-zoom-in", ["s-+"] = "pdf-zoom-in", ["s--"] = "pdf-zoom-out", ["s-0"] = "pdf-zoom-fit",
+  h = "pdf-left", l = "pdf-right",
+}) do pdf_keys[key] = binding end
 for key, binding in pairs(pdf_keys) do core.define_key("pdf", key, binding) end

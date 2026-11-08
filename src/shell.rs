@@ -374,6 +374,8 @@ impl Shell {
         path: &std::path::Path,
         themed: bool,
         scroll: &[(u64, crate::frame::PdfScroll)],
+        zoom: f32,
+        width: f32,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Entity<crate::media::PdfView> {
         let colors = themed.then(|| {
@@ -395,6 +397,7 @@ impl Shell {
             .clone();
         view.update(cx, |v, cx| {
             v.refresh(colors, cx);
+            v.set_size(zoom, width, cx);
             v.scroll(scroll);
         });
         view
@@ -1025,8 +1028,8 @@ impl Render for Shell {
                             .into_any_element()
                     }
                     Content::Media { path, kind: MediaKind::Image, .. } => crate::media::image_element(path, cx),
-                    Content::Media { path, kind: MediaKind::Pdf, themed, scroll } => {
-                        let view = self.pdf_view(w.buffer, path, *themed, scroll, cx);
+                    Content::Media { path, kind: MediaKind::Pdf, themed, scroll, zoom } => {
+                        let view = self.pdf_view(w.buffer, path, *themed, scroll, *zoom, w.width, cx);
                         div().flex_1().overflow_hidden().child(view).into_any_element()
                     }
                     Content::Text(lines) => v_flex()

@@ -5,18 +5,24 @@
 use gpui_kit::component::ActiveTheme as _;
 use crate::frame::PdfScroll;
 use gpui_kit::{
-    AnyElement, Context, IntoElement, ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _, Render, RenderImage,
-    Styled as _, StyledImage as _, Window, div, img, list, prelude::FluentBuilder as _, px,
+    AnyElement, Context, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState, ObjectFit,
+    ParentElement as _, Render, RenderImage, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Window, div, img, list, point, prelude::FluentBuilder as _, px,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// The widest a page is shown, in points on screen, and how many pixels
-/// each of those gets (sharp on a Retina display).
+/// The widest a page is shown at zoom 1, in points on screen.
 const PAGE_MAX_WIDTH: f32 = 900.;
-const PAGE_PIXELS_PER_POINT: f32 = 2.;
+/// The space around pages, and the most pixels a page is drawn across
+/// (a 300% zoom of a wide page on a Retina display is near it).
+const PAGE_MARGIN: f32 = 16.;
+const MAX_PIXELS: f32 = 6000.;
+/// Pages are drawn again for a new zoom in steps of this many pixels, not
+/// for every pixel a window is resized by.
+const PIXEL_STEP: f32 = 128.;
 /// Pages kept drawn either side of the first one in view; further ones are
 /// dropped and drawn again if you come back.
 const KEEP_AROUND: usize = 4;
@@ -54,8 +60,10 @@ pub struct PdfView {
     modified: Option<SystemTime>,
     /// Each page's size in points, or why the file can't be shown.
     sizes: Result<Vec<(f32, f32)>, String>,
-    pages: HashMap<usize, Arc<RenderImage>>,
-    drawing: HashSet<usize>,
+    /// Drawn pages, and how many pixels wide each was drawn; a page drawn
+    /// for another zoom is shown stretched until it's drawn again.
+    pages: HashMap<usize, (u32, Arc<RenderImage>)>,
+    drawing: HashSet<(usize, u32)>,
     failed: HashMap<usize, String>,
     list: ListState,
     /// The theme's text and background colors (0xRRGGBB) pages are drawn
@@ -66,6 +74,13 @@ pub struct PdfView {
     generation: u64,
     /// The number of the last scroll done (`Content::Media`'s `scroll`).
     scrolled: u64,
+    /// The zoom (1 fits pages to the window), the window's width, and the
+    /// display's pixels per point.
+    zoom: f32,
+    width: f32,
+    pixels_per_point: f32,
+    /// Sideways, across pages wider than the window.
+    sideways: ScrollHandle,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -87,6 +102,10 @@ impl PdfView {
             colors: None,
             generation: 0,
             scrolled,
+            zoom: 1.,
+            width: 800.,
+            pixels_per_point: 2.,
+            sideways: ScrollHandle::new(),
         }
     }
 
@@ -115,6 +134,42 @@ impl PdfView {
         cx.notify();
     }
 
+    /// How wide page `ix` is shown, in points: fitted to the window (no
+    /// wider than 900 or its own width), times the zoom.
+    fn page_width(&self, ix: usize) -> f32 {
+        let own = self.sizes.as_ref().ok().and_then(|s| s.get(ix)).map_or(612., |s| s.0);
+        let room = (self.width - 2. * PAGE_MARGIN).max(100.);
+        own.min(PAGE_MAX_WIDTH).min(room) * self.zoom
+    }
+
+    /// How wide the pages are laid out: the widest page, or the window.
+    fn content_width(&self) -> f32 {
+        let count = self.sizes.as_ref().map_or(0, Vec::len);
+        let widest = (0..count).map(|ix| self.page_width(ix)).fold(0., f32::max);
+        (widest + 2. * PAGE_MARGIN).max(self.width)
+    }
+
+    /// Takes a new zoom or window width, keeping the place: the same spot
+    /// on the page at the top, and in the middle sideways.
+    pub fn set_size(&mut self, zoom: f32, width: f32, cx: &mut Context<Self>) {
+        if zoom == self.zoom && width == self.width {
+            return;
+        }
+        let before = self.page_width(self.list.logical_scroll_top().item_ix);
+        let middle = -f32::from(self.sideways.offset().x) + self.width / 2.;
+        let content_before = self.content_width();
+        (self.zoom, self.width) = (zoom, width);
+        let top = self.list.logical_scroll_top();
+        let ratio = self.page_width(top.item_ix) / before.max(1.);
+        // Pages are taller or shorter now.
+        self.list.remeasure();
+        self.list.scroll_to(ListOffset { item_ix: top.item_ix, offset_in_item: top.offset_in_item * ratio });
+        let middle = middle * self.content_width() / content_before.max(1.);
+        let x = (middle - self.width / 2.).clamp(0., (self.content_width() - self.width).max(0.));
+        self.sideways.set_offset(point(px(-x), px(0.)));
+        cx.notify();
+    }
+
     /// Does the scrolls asked for since the last one done.
     pub fn scroll(&mut self, asked: &[(u64, PdfScroll)]) {
         let done = self.scrolled;
@@ -128,6 +183,11 @@ impl PdfView {
                 PdfScroll::Screens(screens) => {
                     let height: f32 = self.list.viewport_bounds().size.height.into();
                     self.list.scroll_by(px(screens * height.max(LINE_STEP)));
+                }
+                PdfScroll::Sideways(steps) => {
+                    let room = (self.content_width() - self.width).max(0.);
+                    let x = (-f32::from(self.sideways.offset().x) + steps as f32 * LINE_STEP).clamp(0., room);
+                    self.sideways.set_offset(point(px(-x), px(0.)));
                 }
                 // Back from partway down a page: that page's top first.
                 PdfScroll::Pages(n) if n < 0 && top.offset_in_item > px(1.) => {
@@ -147,14 +207,18 @@ impl PdfView {
         self.drawing.clear();
     }
 
-    /// Draws page `ix` off the main thread, unless it is drawn or on its way.
+    /// Draws page `ix` off the main thread as wide as it's shown, unless it
+    /// is drawn that wide or on its way.
     fn draw(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if self.pages.contains_key(&ix) || self.failed.contains_key(&ix) || !self.drawing.insert(ix) {
+        if self.sizes.is_err() {
             return;
         }
-        let Ok(sizes) = &self.sizes else { return };
-        let points = sizes.get(ix).map_or(612., |s| s.0).min(PAGE_MAX_WIDTH);
-        let width = (points * PAGE_PIXELS_PER_POINT).round() as u32;
+        let pixels = (self.page_width(ix) * self.pixels_per_point).min(MAX_PIXELS);
+        let width = ((pixels / PIXEL_STEP).ceil() * PIXEL_STEP) as u32;
+        let drawn = self.pages.get(&ix).is_some_and(|(w, _)| *w == width);
+        if drawn || self.failed.contains_key(&ix) || !self.drawing.insert((ix, width)) {
+            return;
+        }
         let path = self.path.clone();
         let (generation, colors) = (self.generation, self.colors);
         cx.spawn(async move |this, cx| {
@@ -173,13 +237,13 @@ impl PdfView {
                 if view.generation != generation {
                     return;
                 }
-                view.drawing.remove(&ix);
+                view.drawing.remove(&(ix, width));
                 match drawn.and_then(|(w, h, pixels)| {
                     let buffer = image::RgbaImage::from_raw(w, h, pixels).ok_or("bad bitmap")?;
                     Ok(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
                 }) {
                     Ok(picture) => {
-                        view.pages.insert(ix, picture);
+                        view.pages.insert(ix, (width, picture));
                     }
                     Err(e) => {
                         view.failed.insert(ix, e);
@@ -202,6 +266,7 @@ impl PdfView {
     fn page(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.draw(ix, cx);
         let (w, h) = self.sizes.as_ref().ok().and_then(|s| s.get(ix)).copied().unwrap_or((612., 792.));
+        let shown = self.page_width(ix);
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
         let (paper, ink) = match self.colors {
@@ -209,22 +274,22 @@ impl PdfView {
             None => (gpui_kit::white(), gpui_kit::black()),
         };
         let body = match (self.pages.get(&ix), self.failed.get(&ix)) {
-            (Some(picture), _) => img(picture.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element(),
+            (Some((_, picture)), _) => img(picture.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element(),
             (None, Some(e)) => div().p(px(12.)).text_color(ink).child(e.clone()).into_any_element(),
             (None, None) => div().into_any_element(),
         };
         div()
             .w_full()
-            .px(px(16.))
-            .pt(px(if ix == 0 { 16. } else { 0. }))
-            .pb(px(16.))
+            .px(px(PAGE_MARGIN))
+            .pt(px(if ix == 0 { PAGE_MARGIN } else { 0. }))
+            .pb(px(PAGE_MARGIN))
             .flex()
             .flex_col()
             .items_center()
             .child(
                 div()
-                    .w_full()
-                    .max_w(px(w.min(PAGE_MAX_WIDTH)))
+                    .flex_none()
+                    .w(px(shown))
                     .aspect_ratio(w / h.max(1.))
                     .bg(paper)
                     .border_1()
@@ -238,12 +303,48 @@ impl PdfView {
 }
 
 impl Render for PdfView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.pixels_per_point = window.scale_factor();
         let theme = cx.theme();
         let muted = theme.muted_foreground;
+        let content = self.content_width();
         div().flex_1().size_full().overflow_hidden().bg(theme.muted).map(|d| match &self.sizes {
             Err(e) => d.flex().items_center().justify_center().text_color(muted).child(e.clone()),
-            Ok(_) => d.child(list(self.list.clone(), cx.processor(Self::page)).size_full()),
+            // Pages scroll up and down in the list, and the list sideways
+            // when they're zoomed wider than the window.
+            Ok(_) => d.child(
+                div()
+                    .id("pdf-sideways")
+                    .size_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.sideways)
+                    .child(
+                        div()
+                            .w(px(content))
+                            .h_full()
+                            .child(list(self.list.clone(), cx.processor(Self::page)).size_full()),
+                    ),
+            ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pages_fit_the_window_then_grow_with_the_zoom() {
+        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0);
+        view.sizes = Ok(vec![(612., 792.), (1200., 800.)]);
+        view.width = 2000.;
+        assert_eq!(view.page_width(0), 612., "its own width when there's room");
+        assert_eq!(view.page_width(1), PAGE_MAX_WIDTH, "no wider than 900 at zoom 1");
+        assert_eq!(view.content_width(), 2000., "narrower pages: the window's width");
+        view.width = 400.;
+        assert_eq!(view.page_width(0), 400. - 2. * PAGE_MARGIN, "fitted to a narrow window");
+        view.zoom = 2.;
+        assert_eq!(view.page_width(0), 2. * (400. - 2. * PAGE_MARGIN));
+        assert_eq!(view.content_width(), view.page_width(0) + 2. * PAGE_MARGIN, "wider than the window: scrolls sideways");
     }
 }

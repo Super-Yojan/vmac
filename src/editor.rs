@@ -336,6 +336,8 @@ pub struct EditorState {
     pub pdf_themed: bool,
     /// Each PDF buffer's latest scrolls asked for by keys, numbered.
     pub pdf_scroll: std::collections::HashMap<BufferId, Vec<(u64, crate::frame::PdfScroll)>>,
+    /// Each PDF buffer's zoom (1 fits its pages to the window).
+    pub pdf_zoom: std::collections::HashMap<BufferId, f32>,
     pub preview_last: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The coding agent (ACP), how to start it, its buffer, and the
@@ -553,6 +555,7 @@ impl EditorState {
             markdown_preview: false,
             pdf_themed: true,
             pdf_scroll: Default::default(),
+            pdf_zoom: Default::default(),
             preview_last: None,
             terminals_to_kill: Vec::new(),
             agent: None,
