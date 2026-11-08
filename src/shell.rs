@@ -17,6 +17,8 @@ use gpui_kit::{
 };
 use std::time::Duration;
 
+/// How often the clipboard is relayed to and from a server on another machine.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(250);
 /// The documentation popup K shows.
 const HOVER_WIDTH: f32 = 560.;
 const HOVER_MAX_HEIGHT: f32 = 320.;
@@ -47,6 +49,9 @@ pub struct Shell {
     dragging: Option<WindowId>,
     /// Wheel movement short of a whole line, kept for the next event.
     wheel: f32,
+    /// This machine's clipboard as last told to (or set from) a server on
+    /// another machine.
+    clipboard_told: Option<String>,
 }
 
 /// A window as last drawn: its area in pixels and where each line is.
@@ -145,6 +150,9 @@ impl Shell {
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
         Self::drive_terminals(cx);
+        if session.wants_clipboard() {
+            Self::relay_clipboard(cx);
+        }
         // Light or dark as the system is, and again whenever it changes.
         let appearance = cx.observe_window_appearance(window, |shell, _, cx| {
             shell.applied_mode = None;
@@ -162,7 +170,33 @@ impl Shell {
             modal: false,
             dragging: None,
             wheel: 0.,
+            clipboard_told: None,
         }
+    }
+
+    /// With a server on another machine: puts what it copied on this
+    /// machine's clipboard, and tells it when the clipboard changes here.
+    fn relay_clipboard(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CLIPBOARD_POLL).await;
+                let alive = this.update(cx, |shell, cx| {
+                    if let Some(text) = shell.session.take_copied() {
+                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+                        shell.clipboard_told = Some(text);
+                    } else if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                        && shell.clipboard_told.as_ref() != Some(&text)
+                    {
+                        shell.clipboard_told = Some(text.clone());
+                        shell.session.clipboard(text);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Tells the session whether the system is dark, when that changed.

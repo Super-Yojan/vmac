@@ -10,11 +10,18 @@ keywords = ["editor", "vim", "emacs", "gpui", "lua"]
 categories = ["text-editors"]
 edition = "2024"
 
+[features]
+# The window. Without it (--no-default-features) vmac is only the server, for
+# remote machines: `vmac connect` installs that one.
+default = ["gui"]
+gui = ["dep:gpui-kit"]
+
 [dependencies]
 anyhow = "1.0.104"
 fuzzy-matcher = "0.3"
-gpui-kit = "=0.8.0"
+gpui-kit = { version = "=0.8.0", optional = true }
 ignore = "0.4"
+libc = "0.2"
 libloading = "0.8"
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 portable-pty = "0.9"

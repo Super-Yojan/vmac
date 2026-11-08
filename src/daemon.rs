@@ -26,6 +26,9 @@ pub enum ToServer {
     Hello { version: String, target: Option<String>, cwd: PathBuf, viewport: Viewport },
     Input(Input),
     Resize(Viewport),
+    /// What's on the clipboard of the machine the window runs on (sent by
+    /// windows far from the server, when it changes).
+    Clipboard(String),
     /// Ask for the sessions' names (and then the server hangs up).
     List,
     KillServer,
@@ -41,6 +44,8 @@ pub enum ToClient {
     Sessions { active: String, all: Vec<String> },
     /// Detached (`:q`), or the server is going away.
     Bye(String),
+    /// Text a session copied, for the clipboard of a window far from the server.
+    Clipboard(String),
 }
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
@@ -69,7 +74,7 @@ fn send_line(stream: &mut impl Write, message: &impl Serialize) -> std::io::Resu
 /// Reads messages off `stream` into `tx` (tagged with `tag`) until it closes
 /// or sends something that isn't one; then sends `None`.
 fn read_lines<T: for<'de> Deserialize<'de> + Send + 'static, K: Copy + Send + 'static>(
-    stream: UnixStream,
+    stream: impl std::io::Read + Send + 'static,
     tag: K,
     tx: Sender<(K, Option<T>)>,
 ) {
@@ -195,6 +200,9 @@ fn run(
                     client.acks += 1;
                     client.hello = true;
                     client.shown = None;
+                    // No folder (a window on another machine): the home folder.
+                    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                    let cwd = if cwd.as_os_str().is_empty() { home } else { cwd };
                     server.attach(target.as_deref(), &cwd);
                     changed = true;
                 }
@@ -209,6 +217,7 @@ fn run(
                     client.shown = None;
                     changed = true;
                 }
+                Some(ToServer::Clipboard(text)) => crate::clipboard::relay_from_window(text),
                 Some(ToServer::List) => {
                     let (active, all) = server.names();
                     client.send(&ToClient::Sessions { active, all });
@@ -222,6 +231,12 @@ fn run(
                     std::thread::sleep(Duration::from_millis(50));
                     return Ok(());
                 }
+            }
+        }
+        // What sessions copied, for windows on other machines.
+        for text in crate::clipboard::relay_take_copied() {
+            for client in clients.values() {
+                client.send(&ToClient::Clipboard(text.clone()));
             }
         }
         // `:q` detaches the windows; the sessions stay.
@@ -260,8 +275,14 @@ fn run(
 /// The connection a window has to a server: sends its inputs, keeps the
 /// last frame the server sent.
 pub struct Client {
-    stream: UnixStream,
+    writer: Box<dyn Write + Send>,
     incoming: Receiver<((), Option<ToClient>)>,
+    /// What carries it (ssh), stopped when the window closes.
+    carrier: Option<std::process::Child>,
+    /// The server is on another machine: the clipboard goes back and forth.
+    remote: bool,
+    /// Text the server copied, for this machine's clipboard.
+    copied: Option<String>,
     frame: Option<Frame>,
     viewport: Option<Viewport>,
     /// Messages sent (Hello, inputs, sizes) and not answered yet: drawing
@@ -278,16 +299,42 @@ impl Client {
     /// Connects to the server on `socket` and attaches to `target` (a
     /// session's name or a project's folder; None: whichever is active).
     pub fn attach(socket: &Path, target: Option<String>) -> std::io::Result<Self> {
-        let mut stream = UnixStream::connect(socket)?;
+        let stream = UnixStream::connect(socket)?;
         let cwd = std::env::current_dir().unwrap_or_default();
+        Self::over(Box::new(stream.try_clone()?), Box::new(stream), target, cwd, None)
+    }
+
+    /// Attaches over a connection to a server: `reader` and `writer`, which
+    /// `carrier` (ssh) may provide; folders in `target` are relative to
+    /// `cwd` (empty: the server's home folder). A carrier means the server
+    /// is on another machine.
+    pub fn over(
+        reader: Box<dyn std::io::Read + Send>,
+        mut writer: Box<dyn Write + Send>,
+        target: Option<String>,
+        cwd: PathBuf,
+        carrier: Option<std::process::Child>,
+    ) -> std::io::Result<Self> {
         let viewport = Viewport { width: 1320., height: 840. };
-        send_line(&mut stream, &ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd, viewport })?;
+        send_line(&mut writer, &ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd, viewport })?;
         let (tx, incoming) = channel();
-        read_lines(stream.try_clone()?, (), tx);
-        let mut client = Self { stream, incoming, frame: None, viewport: Some(viewport), waiting: 0, gone: None };
-        // The first frame, so the window has something to draw.
+        read_lines(reader, (), tx);
+        let remote = carrier.is_some();
+        let mut client = Self {
+            writer,
+            incoming,
+            carrier,
+            remote,
+            copied: None,
+            frame: None,
+            viewport: Some(viewport),
+            waiting: 0,
+            gone: None,
+        };
+        // The first frame, so the window has something to draw (over ssh,
+        // the server may have to start first).
         client.waiting = 1;
-        client.receive(Duration::from_secs(10));
+        client.receive(Duration::from_secs(30));
         match &client.gone {
             Some(why) => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, why.clone())),
             None if client.frame.is_none() => {
@@ -298,7 +345,7 @@ impl Client {
     }
 
     fn send(&mut self, message: &ToServer) {
-        if self.gone.is_none() && send_line(&mut self.stream, message).is_err() {
+        if self.gone.is_none() && send_line(&mut self.writer, message).is_err() {
             self.gone = Some("Lost the server".into());
         }
     }
@@ -331,6 +378,12 @@ impl Client {
                     return true;
                 }
                 Some(ToClient::Sessions { .. }) => {}
+                // A server on this machine has the clipboard already.
+                Some(ToClient::Clipboard(text)) => {
+                    if self.remote {
+                        self.copied = Some(text);
+                    }
+                }
                 None => {
                     self.gone.get_or_insert_with(|| "Lost the server".into());
                     self.waiting = 0;
@@ -344,6 +397,15 @@ impl Client {
     /// Why the server hung up, once it has.
     pub fn gone(&self) -> Option<&str> {
         self.gone.as_deref()
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(mut carrier) = self.carrier.take() {
+            let _ = carrier.kill();
+            let _ = carrier.wait();
+        }
     }
 }
 
@@ -371,6 +433,50 @@ impl Host for Client {
 
     fn pump_terminals(&mut self) -> bool {
         self.receive(Duration::ZERO)
+    }
+
+    fn wants_clipboard(&self) -> bool {
+        self.remote
+    }
+
+    fn take_copied(&mut self) -> Option<String> {
+        self.copied.take()
+    }
+
+    fn clipboard(&mut self, text: String) {
+        self.send(&ToServer::Clipboard(text));
+    }
+}
+
+/// Carries a connection to the server on `socket` over stdin and stdout
+/// (`vmac proxy`, which `vmac connect` runs over ssh), starting the server
+/// when none is running.
+pub fn proxy(socket: &Path) -> std::io::Result<()> {
+    ensure_server(socket)?;
+    let stream = UnixStream::connect(socket)?;
+    let mut to_server = stream.try_clone()?;
+    std::thread::spawn(move || {
+        let _ = pass(&mut std::io::stdin().lock(), &mut to_server);
+        let _ = to_server.shutdown(std::net::Shutdown::Write);
+    });
+    let mut from_server = stream;
+    pass(&mut from_server, &mut std::io::stdout().lock())
+}
+
+/// Copies `from` to `to` as it comes, flushing each piece. Not
+/// std::io::copy: on Linux it hands sockets to splice/sendfile, which
+/// carried nothing over sshd's connection.
+fn pass(from: &mut impl std::io::Read, to: &mut impl Write) -> std::io::Result<()> {
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        to.write_all(&buf[..n])?;
+        to.flush()?;
     }
 }
 
@@ -407,7 +513,8 @@ pub fn ensure_server(socket: &Path) -> std::io::Result<()> {
         Some(path) => std::process::Stdio::from(std::fs::OpenOptions::new().create(true).append(true).open(path)?),
         None => std::process::Stdio::null(),
     };
-    std::process::Command::new(std::env::current_exe()?)
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
         .arg("--server")
         .env("VMAC_SOCKET", socket)
         .stdin(std::process::Stdio::null())
@@ -415,11 +522,18 @@ pub fn ensure_server(socket: &Path) -> std::io::Result<()> {
         .stderr(match &log {
             Some(path) => std::process::Stdio::from(std::fs::OpenOptions::new().append(true).open(path)?),
             None => std::process::Stdio::null(),
-        })
-        // Its own process group: a Ctrl-C in the terminal it came from
-        // doesn't stop it.
-        .process_group(0)
-        .spawn()?;
+        });
+    // Its own session: neither a Ctrl-C in the terminal it came from nor
+    // the end of the ssh connection that started it stops it.
+    // SAFETY: setsid is async-signal-safe, and nothing else runs in the
+    // child between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.spawn()?;
     for _ in 0..200 {
         if UnixStream::connect(socket).is_ok() {
             return Ok(());

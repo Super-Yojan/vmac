@@ -248,6 +248,28 @@ as it was. Plain `vmac FILE` still runs on its own, without a server. The
 server listens on a socket only you can reach (`$VMAC_SOCKET` to choose
 another) and logs to `~/.local/state/vmac/server.log`.
 
+### On another machine
+
+`vmac connect HOST` does what `vmac attach` does, on a machine you reach
+with ssh: the sessions run there, next to the files, and the window here.
+
+```
+vmac connect me@devbox            # the server's active session
+vmac connect me@devbox ~/git/app  # that project's session (from your home there)
+vmac connect me@devbox notes      # the session named notes
+```
+
+The first time (and after each new vmac build) it installs the server
+there, in `~/.vmac/server/`: this program when the machine runs the same
+system, else a server built for it (Linux x86_64 and arm64, macOS): from a
+checkout with `cargo-zigbuild` it builds one, else it uses
+`~/.local/share/vmac/servers/<version>/<target>/vmac` (put one there), else
+the release's download. ssh needs to log in without asking (a key, or an agent).
+
+Closing the window detaches; the remote sessions keep running, and the
+next `connect` finds them. What you yank there lands on this machine's
+clipboard, and `p` there pastes what you copied here.
+
 The dashboard is Lua: redefine `core.dashboard_banner` or
 `core.dashboard_items` in your config, e.g.
 

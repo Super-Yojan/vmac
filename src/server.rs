@@ -36,6 +36,16 @@ pub trait Host {
     fn pump_servers(&mut self) -> bool {
         false
     }
+    /// The server is on another machine, so the window's clipboard is
+    /// relayed: what it copied comes back with `take_copied`, and the
+    /// window tells it what's on this machine's clipboard with `clipboard`.
+    fn wants_clipboard(&self) -> bool {
+        false
+    }
+    fn take_copied(&mut self) -> Option<String> {
+        None
+    }
+    fn clipboard(&mut self, _text: String) {}
 }
 
 impl Host for Server {
@@ -338,7 +348,12 @@ impl Server {
     /// none such; None stays on the active one.
     pub fn attach(&mut self, target: Option<&str>, cwd: &Path) {
         let Some(target) = target.filter(|t| !t.is_empty()) else { return };
-        let path = cwd.join(target);
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let path = match target.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None if target == "~" => home,
+            None => cwd.join(target),
+        };
         if path.is_dir() {
             let root = std::path::absolute(&path).unwrap_or(path);
             let fresh = self.active_session().editor().lock().project.is_none()
