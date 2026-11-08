@@ -194,6 +194,14 @@ The styles are faces, defined in Scheme with attributes:
                     (list (list "md-bold" 'weight 'bold 'color 'yellow))))
 ```
 
+## Font
+
+gmacs starts with an installed Nerd Font (JetBrains Mono, FiraCode, Hack,
+Iosevka, ...), so icons from eza, starship and the like show; without one
+it uses the theme's monospace font. `:font NAME` changes it, `:fonts` or
+`SPC h F` picks from the fonts installed, and `(set-font "...")` or
+`gmacs.set_font("...")` sets it from your config.
+
 ## Customizing
 
 The core, init.scm and init.lua are watched: save any of them and gmacs

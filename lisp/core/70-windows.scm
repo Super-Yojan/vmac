@@ -53,3 +53,11 @@
 ;; :q closes the window, and quits from the last one.
 (defcommand (quit-window) (when (not (delete-window)) (quit-editor)))
 
+;;;; Fonts
+;;
+;; The editor's font starts as an installed Nerd Font (for the icons eza,
+;; starship and others print), else the theme's. :font NAME or
+;; (set-font "...") changes it; :fonts or SPC h F picks from those installed.
+
+(defcommand (font-picker)
+  (pick "Font" (font-list) "" (lambda (name) (set-font name))))

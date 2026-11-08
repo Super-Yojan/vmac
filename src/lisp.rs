@@ -1458,6 +1458,20 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "set-terminal-backend", |s, name: String| s.terminal_backend = name);
     prim!(reg, editor, "terminal-backend", |s| s.terminal_backend.clone());
     prim!(reg, editor, "set-terminal-shell", |s, shell: String| s.terminal_shell = shell);
+    // The editor's font: a family name ("" for the theme's monospace font).
+    prim!(reg, editor, "set-font", |s, name: String| {
+        if name.is_empty() {
+            s.font = None;
+            s.message = "the theme's font".into();
+        } else if !s.fonts.is_empty() && !s.fonts.contains(&name) {
+            s.message = format!("no font named {name} (:fonts lists them)");
+        } else {
+            s.message = format!("font: {name}");
+            s.font = Some(name);
+        }
+    });
+    prim!(reg, editor, "font", |s| s.font.clone().unwrap_or_default());
+    prim!(reg, editor, "font-list", |s| s.fonts.clone());
     prim!(reg, editor, "terminal-shell", |s| s.terminal_shell.clone());
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
     pure!(reg, "exec", |command: String, args: Vec<String>| {
@@ -3349,6 +3363,23 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
             "{}",
             editor.lock().buffer().text()
         );
+    }
+
+    #[test]
+    fn the_font_can_be_set_and_unknown_fonts_are_refused() {
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().fonts = vec!["Menlo".into(), "Hack Nerd Font Mono".into()];
+        typed(&mut lisp, ":font Hack Nerd Font Mono\n");
+        assert_eq!(editor.lock().font.as_deref(), Some("Hack Nerd Font Mono"), "a name with spaces");
+        typed(&mut lisp, ":font Nope\n");
+        assert_eq!(editor.lock().font.as_deref(), Some("Hack Nerd Font Mono"));
+        assert_eq!(editor.lock().message, "no font named Nope (:fonts lists them)");
+        lisp.eval_lua(r#"gmacs.set_font("Menlo")"#).unwrap();
+        assert_eq!(lisp.eval("(font)").unwrap(), "\"Menlo\"");
+        typed(&mut lisp, ":fonts\n");
+        assert!(editor.lock().picker.is_some());
+        typed(&mut lisp, "hack\n");
+        assert_eq!(editor.lock().font.as_deref(), Some("Hack Nerd Font Mono"), "picked from the list");
     }
 
     #[test]

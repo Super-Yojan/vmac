@@ -44,6 +44,17 @@ impl Shell {
     pub fn new(editor: Editor, lisp: Lisp, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        // The installed fonts, and a Nerd Font to start with if there is one.
+        {
+            let mut fonts = cx.text_system().all_font_names();
+            fonts.sort();
+            fonts.dedup();
+            let mut st = editor.lock();
+            if st.font.is_none() {
+                st.font = crate::editor::default_font(&fonts);
+            }
+            st.fonts = fonts;
+        }
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
         Self::drive_terminals(cx);
@@ -548,6 +559,7 @@ impl Render for Shell {
         let search = st.search_regex(&pattern);
         let minibuffer_open = st.minibuffer_prompt.is_some();
         let selected = st.selected_window();
+        let font = st.font.clone().map(gpui_kit::SharedString::from);
         let syntax_theme = self.lisp.syntax_theme();
         let syntax = &mut self.syntax;
         let theme = cx.theme();
@@ -827,7 +839,7 @@ impl Render for Shell {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .font_family(theme.mono_font_family.clone())
+            .font_family(font.unwrap_or_else(|| theme.mono_font_family.clone()))
             .text_size(px(FONT_SIZE))
             .line_height(px(ROW_HEIGHT))
             .child(div().relative().w_full().h(px(area)).children(windows))

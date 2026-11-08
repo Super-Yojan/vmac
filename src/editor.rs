@@ -111,6 +111,29 @@ impl Completion {
     }
 }
 
+/// Monospace Nerd Fonts, most wanted first: they carry the icons programs
+/// like eza and starship print.
+const NERD_FONTS: &[&str] = &[
+    "JetBrainsMono NFM",
+    "JetBrainsMono Nerd Font Mono",
+    "FiraCode Nerd Font Mono",
+    "Hack Nerd Font Mono",
+    "Iosevka NFM",
+    "Iosevka Nerd Font Mono",
+    "MesloLGS NF",
+    "CaskaydiaCove Nerd Font Mono",
+];
+
+/// The font to start with: the first installed Nerd Font from the list,
+/// else any installed monospace Nerd Font, else none (the theme's font).
+pub fn default_font(installed: &[String]) -> Option<String> {
+    NERD_FONTS
+        .iter()
+        .find(|f| installed.iter().any(|i| i == *f))
+        .map(|f| f.to_string())
+        .or_else(|| installed.iter().find(|f| f.ends_with("Nerd Font Mono") || f.ends_with(" NFM")).cloned())
+}
+
 /// fish if it's installed (on PATH or where Homebrew puts it), else $SHELL.
 pub fn default_shell() -> String {
     let on_path = std::env::var_os("PATH")
@@ -283,6 +306,10 @@ pub struct EditorState {
     /// The shell a terminal runs when given no command: fish when it's
     /// installed, else the login shell ($SHELL).
     pub terminal_shell: String,
+    /// The editor's font (None: the theme's monospace font), and the font
+    /// families installed, which the view fills in.
+    pub font: Option<String>,
+    pub fonts: Vec<String>,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
@@ -323,6 +350,8 @@ impl EditorState {
             terminals: Vec::new(),
             terminal_backend: "local".into(),
             terminal_shell: default_shell(),
+            font: None,
+            fonts: Vec::new(),
             terminals_to_kill: Vec::new(),
             events: Vec::new(),
             search_cache: None,
@@ -1296,6 +1325,14 @@ mod tests {
         s.close_sidebar();
         assert_eq!(s.sidebar(), None);
         assert!(!s.is_sidebar(s.selected_window()));
+    }
+
+    #[test]
+    fn a_nerd_font_is_the_default_when_installed() {
+        let names = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(default_font(&names(&["Menlo", "Hack Nerd Font Mono", "JetBrainsMono NFM"])).as_deref(), Some("JetBrainsMono NFM"));
+        assert_eq!(default_font(&names(&["Menlo", "Agave Nerd Font Mono"])).as_deref(), Some("Agave Nerd Font Mono"));
+        assert_eq!(default_font(&names(&["Menlo", "Monaco"])), None);
     }
 
     #[test]

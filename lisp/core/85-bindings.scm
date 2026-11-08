@@ -68,6 +68,7 @@
         (list "SPC f f" 'find-file-command) (list "SPC SPC" 'find-file-command)
         (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
         (list "SPC o t" 'terminal-toggle) (list "SPC o T" 'terminal-new)
+        (list "SPC h F" 'font-picker)
         (list "SPC m a" 'table-align)
         ;; Language servers
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
