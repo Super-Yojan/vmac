@@ -1,12 +1,13 @@
-//! The window: draws each editor window (its buffer and modeline, laid out
-//! by the split tree), the echo area and the picker, and sends every
-//! keystroke to Scheme. It decides nothing about what keys do.
+//! The window: draws the `Frame`s a `Session` lays out (each editor window,
+//! its modeline, the echo area, popups and the picker) and sends it every
+//! keystroke and mouse event as an `Input`. It decides nothing about what
+//! keys do, and holds none of the editor's state.
 
-use crate::buffer::Buffer;
-use crate::editor::{Editor, Rect};
-use crate::lisp::{FaceSpec, Lisp, Segment};
-use crate::picker::Picker;
-use crate::syntax::{Syntax, face_for, language_for_path};
+use crate::frame::{
+    CHAR_WIDTH, Content, Echo, FONT_SIZE, Face, Frame, FrameLine, FrameWindow, Input, Mods, PickerView, ROW_HEIGHT,
+    ThemeRequest, Viewport, WindowId,
+};
+use crate::session::Session;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
@@ -16,44 +17,38 @@ use gpui_kit::{
 };
 use std::time::Duration;
 
-const ROW_HEIGHT: f32 = 20.;
-const FONT_SIZE: f32 = 14.;
 const RELOAD_POLL: Duration = Duration::from_millis(400);
 /// How often language servers are synced and read.
 const LSP_POLL: Duration = Duration::from_millis(100);
 /// How often terminals' screens are read.
 const TERMINAL_POLL: Duration = Duration::from_millis(30);
-/// How wide the sidebar (the file tree) is.
-const SIDEBAR_WIDTH: f32 = 260.;
-/// A monospace character's width, as a share of the font size (Menlo, SF Mono).
-const CHAR_WIDTH: f32 = 0.6;
 /// The documentation popup K shows.
 const HOVER_WIDTH: f32 = 560.;
 const HOVER_MAX_HEIGHT: f32 = 320.;
 /// The completion popup.
 const COMPLETION_WIDTH: f32 = 460.;
-const COMPLETION_ROWS: usize = 10;
 
 pub struct Shell {
-    editor: Editor,
-    lisp: Lisp,
+    session: Session,
     focus: FocusHandle,
-    syntax: Syntax,
-    /// The light/dark mode last applied, and the subscription that hears
-    /// the system's appearance change.
+    /// The light/dark mode last applied, the system appearance last told
+    /// to the session, and the subscription that hears it change.
     applied_mode: Option<(gpui_kit::component::ThemeMode, String)>,
+    told_dark: Option<bool>,
     _appearance: gpui_kit::Subscription,
     /// Markdown buffers shown rendered in normal state (opt-in, `SPC t m`;
     /// the default hides the markup instead): their gpui-kit
     /// view, the text it last got and the cursor line it last revealed.
-    md_views: std::collections::HashMap<crate::editor::BufferId, MdView>,
+    md_views: std::collections::HashMap<crate::frame::BufferId, MdView>,
     /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
     /// parsed from, and the cursor line it last selected.
     review_view: Option<ReviewView>,
-    /// Where the last frame drew each window's lines, for the mouse.
+    /// Where the last frame drew each window's lines, for the mouse, and
+    /// whether a prompt or the picker had the screen.
     hits: Vec<WindowHit>,
-    /// The button held down since a press in a window.
-    drag: Option<Drag>,
+    modal: bool,
+    /// The window a button went down in, while it's held.
+    dragging: Option<WindowId>,
     /// Wheel movement short of a whole line, kept for the next event.
     wheel: f32,
 }
@@ -61,8 +56,7 @@ pub struct Shell {
 /// A window as last drawn: its area in pixels and where each line is.
 #[derive(Debug, Clone, Default)]
 struct WindowHit {
-    id: crate::editor::WindowId,
-    buffer: crate::editor::BufferId,
+    id: WindowId,
     /// The whole window, modeline included.
     left: f32,
     top: f32,
@@ -71,14 +65,30 @@ struct WindowHit {
     /// Where text starts, after the padding and line numbers.
     text_left: f32,
     /// Each line on screen: its buffer line, top, height and screen
-    /// column per character (`layout_line`'s map).
+    /// column per character.
     lines: Vec<(usize, f32, f32, Vec<usize>)>,
     /// Drawn by gpui-kit (rendered Markdown, the review), which has its own mouse.
     custom: bool,
-    terminal: bool,
 }
 
 impl WindowHit {
+    fn of(w: &FrameWindow) -> Self {
+        let lines = match &w.content {
+            Content::Text(lines) => lines.iter().map(|l| (l.line, l.top, l.height, l.cols.clone())).collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            id: w.id,
+            left: w.left,
+            top: w.top,
+            right: w.left + w.width,
+            bottom: w.top + w.height,
+            text_left: w.text_left,
+            lines,
+            custom: !matches!(w.content, Content::Text(_)),
+        }
+    }
+
     fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
@@ -100,17 +110,6 @@ impl WindowHit {
     }
 }
 
-/// A button held down: in a window's text (dragging selects), or reported
-/// to the terminal program that asked for the mouse.
-#[derive(Debug, Clone, Copy)]
-struct Drag {
-    window: crate::editor::WindowId,
-    /// The terminal's button, when the program has the mouse.
-    terminal: Option<u8>,
-    /// The last position reported: a buffer position, or a terminal cell.
-    last: (usize, usize),
-}
-
 struct ReviewView {
     state: gpui_kit::Entity<gpui_kit::component::diff::DiffState>,
     revision: u64,
@@ -125,76 +124,71 @@ struct MdView {
 }
 
 impl Shell {
-    pub fn new(editor: Editor, lisp: Lisp, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(mut session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        // The installed fonts, and a Nerd Font to start with if there is one.
-        {
-            let mut fonts = cx.text_system().all_font_names();
-            fonts.sort();
-            fonts.dedup();
-            let mut st = editor.lock();
-            if st.font.is_none() {
-                st.font = crate::editor::default_font(&fonts);
-            }
-            st.fonts = fonts;
+        // What this machine has: its fonts, and the themes (built in, then
+        // yours, ~/.config/vmac/themes/*.json).
+        let mut fonts = cx.text_system().all_font_names();
+        fonts.sort();
+        fonts.dedup();
+        let mut files: Vec<String> = crate::themes::BUILT_IN.iter().map(|s| s.to_string()).collect();
+        if let Some(dir) = crate::lisp::config_dir() {
+            files.extend(crate::themes::user_themes(&dir.join("themes")));
         }
-        // The themes: built in, then yours (~/.config/vmac/themes/*.json).
-        {
-            let mut files: Vec<String> = crate::themes::BUILT_IN.iter().map(|s| s.to_string()).collect();
-            if let Some(dir) = crate::lisp::config_dir() {
-                files.extend(crate::themes::user_themes(&dir.join("themes")));
+        let mut themes = vec![("Default Light".to_string(), false), ("Default Dark".to_string(), true)];
+        let mut errors = Vec::new();
+        let registry = gpui_kit::component::ThemeRegistry::global_mut(cx);
+        for file in &files {
+            match registry.load_themes_from_str(file) {
+                Ok(()) => themes.extend(crate::themes::names(file)),
+                Err(e) => errors.push(e.to_string()),
             }
-            let mut names = vec![("Default Light".to_string(), false), ("Default Dark".to_string(), true)];
-            let registry = gpui_kit::component::ThemeRegistry::global_mut(cx);
-            for file in &files {
-                match registry.load_themes_from_str(file) {
-                    Ok(()) => names.extend(crate::themes::names(file)),
-                    Err(e) => editor.lock().message = format!("a theme file didn't load: {e}"),
-                }
-            }
-            editor.lock().theme_names = names;
         }
+        session.handle(Input::Client { fonts, themes, errors });
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
         Self::drive_terminals(cx);
         // Light or dark as the system is, and again whenever it changes.
-        let appearance = cx.observe_window_appearance(window, |shell, window, cx| {
+        let appearance = cx.observe_window_appearance(window, |shell, _, cx| {
             shell.applied_mode = None;
-            shell.apply_theme(window, cx);
+            cx.notify();
         });
-        let mut shell = Self {
-            editor,
-            lisp,
+        Self {
+            session,
             focus,
-            syntax: Syntax::default(),
             applied_mode: None,
+            told_dark: None,
             _appearance: appearance,
             md_views: Default::default(),
             review_view: None,
             hits: Vec::new(),
-            drag: None,
+            modal: false,
+            dragging: None,
             wheel: 0.,
-        };
-        shell.apply_theme(window, cx);
-        shell
+        }
     }
 
-    /// Applies the theme mode the editor asks for (`:theme`): the system's
+    /// Tells the session whether the system is dark, when that changed.
+    fn tell_appearance(&mut self, window: &Window) {
+        let dark = gpui_kit::component::ThemeMode::from(window.appearance()).is_dark();
+        if self.told_dark != Some(dark) {
+            self.told_dark = Some(dark);
+            self.session.handle(Input::Appearance { dark });
+        }
+    }
+
+    /// Applies the theme the frame asks for (`:theme`): the system's
     /// appearance for "system". Does nothing when it's already applied.
-    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_theme(&mut self, request: &ThemeRequest, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
         let system: ThemeMode = window.appearance().into();
-        let (wanted, name) = {
-            let mut st = self.editor.lock();
-            st.system_dark = system.is_dark();
-            let mode = match st.theme_mode.as_str() {
-                "light" => ThemeMode::Light,
-                "dark" => ThemeMode::Dark,
-                _ => system,
-            };
-            (mode, st.theme_name(mode.is_dark()))
+        let wanted = match request.mode.as_str() {
+            "light" => ThemeMode::Light,
+            "dark" => ThemeMode::Dark,
+            _ => system,
         };
+        let name = if wanted.is_dark() { request.dark.clone() } else { request.light.clone() };
         if self.applied_mode.as_ref() == Some(&(wanted, name.clone())) {
             return;
         }
@@ -220,16 +214,18 @@ impl Shell {
             ((c.r * 255.).round() as u32) << 16 | ((c.g * 255.).round() as u32) << 8 | (c.b * 255.).round() as u32
         };
         let t = cx.theme();
-        crate::terminal::set_colors(hex(t.foreground), hex(t.background));
+        let (foreground, background) = (hex(t.foreground), hex(t.background));
+        self.session.handle(Input::TerminalColors { foreground, background });
     }
 
-    /// Reloads lisp/core/ and init.scm when they change on disk.
-    fn watch_sources(cx: &mut Context<Self>) {
+    /// Calls `work` on the session every `every`, drawing again when it says
+    /// something changed.
+    fn every(cx: &mut Context<Self>, every: Duration, work: fn(&mut Session) -> bool) {
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(RELOAD_POLL).await;
+                cx.background_executor().timer(every).await;
                 let alive = this.update(cx, |shell, cx| {
-                    if shell.lisp.reload_if_changed() {
+                    if work(&mut shell.session) {
                         cx.notify();
                     }
                 });
@@ -239,79 +235,41 @@ impl Shell {
             }
         })
         .detach();
+    }
+
+    /// Reloads lisp/core/ and init.scm when they change on disk.
+    fn watch_sources(cx: &mut Context<Self>) {
+        Self::every(cx, RELOAD_POLL, Session::reload_if_changed);
     }
 
     /// Reads terminals' screens into their buffers, often enough that typing
     /// into one feels immediate.
     fn drive_terminals(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(TERMINAL_POLL).await;
-                let alive = this.update(cx, |shell, cx| {
-                    if !shell.editor.lock().terminals.is_empty() && shell.lisp.pump_terminals() {
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        Self::every(cx, TERMINAL_POLL, Session::pump_terminals);
     }
 
     /// Syncs files with their language servers and reads what they report.
     fn drive_language_servers(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(LSP_POLL).await;
-                let alive = this.update(cx, |shell, cx| {
-                    let configs = shell.lisp.lsp_servers();
-                    let changed = {
-                        let mut editor = shell.editor.lock();
-                        editor.lsp_pump(configs) | editor.agent_pump() | editor.dashboard_refresh()
-                    };
-                    // Replies that Scheme handles (the references picker).
-                    if shell.lisp.run_events() || changed {
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        Self::every(cx, LSP_POLL, Session::pump_servers);
+    }
+
+    /// Hands the session an input, then draws again (or quits).
+    fn send(&mut self, input: Input, cx: &mut Context<Self>) {
+        self.session.handle(input);
+        if self.session.quit_requested() {
+            cx.quit();
+        }
+        cx.notify();
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Some((key, text)) = key_name(&event.keystroke) else { return };
-        self.dispatch(&key, &text, cx);
-    }
-
-    fn dispatch(&mut self, key: &str, text: &str, cx: &mut Context<Self>) {
-        self.lisp.dispatch_key(key, text);
-        if self.editor.lock().quit_requested {
-            cx.quit();
-        }
-        cx.notify();
-    }
-
-    /// Runs a mouse call in Scheme; its error, if any, in the echo area.
-    fn mouse_call(&mut self, code: &str, cx: &mut Context<Self>) {
-        if let Err(e) = self.lisp.eval(code) {
-            self.editor.lock().message = format!("mouse: {}", e.lines().next().unwrap_or(""));
-        }
-        if self.editor.lock().quit_requested {
-            cx.quit();
-        }
-        cx.notify();
+        self.send(Input::Key { key, text }, cx);
     }
 
     /// The window under a point, unless a picker or prompt has the screen.
     fn hit_at(&self, x: f32, y: f32) -> Option<WindowHit> {
-        let st = self.editor.lock();
-        if st.picker.is_some() || st.minibuffer_prompt.is_some() {
+        if self.modal {
             return None;
         }
         self.hits.iter().find(|h| h.contains(x, y)).cloned()
@@ -328,86 +286,31 @@ impl Shell {
             _ => return,
         };
         let (line, col, ch) = hit.at(x, y);
-        // A program that asked for the mouse gets it; shift selects its text instead.
-        if hit.terminal && !event.modifiers.shift {
-            let taken = {
-                let mut st = self.editor.lock();
-                let taken = st.terminal_mouse(hit.buffer, crate::terminal::MouseAction::Press(button), line, col, mouse_mods(&event.modifiers));
-                if taken {
-                    st.select_window(hit.id);
-                }
-                taken
-            };
-            if taken {
-                self.drag = Some(Drag { window: hit.id, terminal: Some(button), last: (line, col) });
-                // Typing goes to the program you clicked in.
-                self.mouse_call("(set! evil-state 'insert)", cx);
-                return;
-            }
-        }
-        if button != 0 {
-            return;
-        }
-        let pos = {
-            let mut st = self.editor.lock();
-            st.select_window(hit.id);
-            let text = st.buffer().text();
-            let line = line.min(text.len_lines().saturating_sub(1));
-            let start = text.line_to_char(line);
-            let len = text_line_len(text, line);
-            start + ch.min(len)
-        };
-        if hit.custom {
-            cx.notify();
-            return;
-        }
-        self.drag = Some(Drag { window: hit.id, terminal: None, last: (pos, 0) });
-        self.mouse_call(&format!("(mouse-click {pos} {})", event.click_count.max(1)), cx);
+        self.dragging = Some(hit.id);
+        let mods = mouse_mods(&event.modifiers);
+        self.send(Input::MouseDown { window: hit.id, button, line, col, ch, clicks: event.click_count, mods }, cx);
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(drag) = self.drag else { return };
+        let Some(id) = self.dragging else { return };
         if event.pressed_button.is_none() {
-            self.drag = None;
+            self.dragging = None;
+            self.session.handle(Input::MouseLost);
             return;
         }
-        let Some(hit) = self.hits.iter().find(|h| h.id == drag.window).cloned() else { return };
-        let (x, y): (f32, f32) = (event.position.x.into(), event.position.y.into());
-        let (line, col, ch) = hit.at(x, y);
-        if let Some(button) = drag.terminal {
-            if (line, col) != drag.last {
-                self.drag = Some(Drag { last: (line, col), ..drag });
-                let action = crate::terminal::MouseAction::Drag(button);
-                self.editor.lock().terminal_mouse(hit.buffer, action, line, col, mouse_mods(&event.modifiers));
-            }
-            return;
-        }
-        let pos = {
-            let st = self.editor.lock();
-            if st.selected_window() != drag.window {
-                return;
-            }
-            let text = st.buffer().text();
-            let line = line.min(text.len_lines().saturating_sub(1));
-            let len = text_line_len(text, line);
-            // Dragging past the end of a line selects up to its last character.
-            text.line_to_char(line) + ch.min(len.saturating_sub(1))
-        };
-        if pos != drag.last.0 {
-            self.drag = Some(Drag { last: (pos, 0), ..drag });
-            self.mouse_call(&format!("(mouse-drag {pos})"), cx);
-        }
+        let Some(hit) = self.hits.iter().find(|h| h.id == id) else { return };
+        let (line, col, ch) = hit.at(event.position.x.into(), event.position.y.into());
+        self.send(Input::MouseDrag { window: id, line, col, ch, mods: mouse_mods(&event.modifiers) }, cx);
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        let Some(drag) = self.drag.take() else { return };
-        if let Some(button) = drag.terminal
-            && let Some(hit) = self.hits.iter().find(|h| h.id == drag.window)
-        {
-            let (line, col, _) = hit.at(event.position.x.into(), event.position.y.into());
-            let action = crate::terminal::MouseAction::Release(button);
-            self.editor.lock().terminal_mouse(hit.buffer, action, line, col, mouse_mods(&event.modifiers));
-        }
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.dragging.take() else { return };
+        let Some(hit) = self.hits.iter().find(|h| h.id == id) else {
+            self.session.handle(Input::MouseLost);
+            return;
+        };
+        let (line, col, _) = hit.at(event.position.x.into(), event.position.y.into());
+        self.send(Input::MouseUp { window: id, line, col, mods: mouse_mods(&event.modifiers) }, cx);
     }
 
     /// The wheel scrolls the window under the pointer, selected or not; a
@@ -423,33 +326,93 @@ impl Shell {
         if n == 0. {
             return;
         }
-        let n = n as isize;
-        let mut st = self.editor.lock();
-        if hit.terminal && !event.modifiers.shift {
-            let (line, col, _) = hit.at(x, y);
-            let action = if n < 0 { crate::terminal::MouseAction::WheelUp } else { crate::terminal::MouseAction::WheelDown };
-            let mods = mouse_mods(&event.modifiers);
-            if st.terminal_mouse(hit.buffer, action, line, col, mods) {
-                for _ in 1..n.unsigned_abs() {
-                    st.terminal_mouse(hit.buffer, action, line, col, mods);
+        let (line, col, _) = hit.at(x, y);
+        let mods = mouse_mods(&event.modifiers);
+        self.send(Input::Wheel { window: hit.id, lines: n as isize, line, col, mods }, cx);
+    }
+
+    /// Keeps the rendered Markdown view of a buffer in step with its text,
+    /// and the cursor's line revealed and marked in it.
+    fn markdown_view(
+        &mut self,
+        buffer: crate::frame::BufferId,
+        source: &str,
+        revision: u64,
+        cursor_line: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Entity<gpui_kit::base::text::TextViewState> {
+        // The line you are on, in the theme's selection color: plain to see.
+        let highlight = cx.theme().selection;
+        let view = self.md_views.entry(buffer).or_insert_with(|| {
+            let state = gpui_kit::AppContext::new(cx, |cx| gpui_kit::base::text::TextViewState::markdown(source, cx));
+            // Its parse lands later: draw again then.
+            let changed = cx.observe(&state, |_, _, cx| cx.notify());
+            MdView { state, revision, revealed: None, _changed: changed }
+        });
+        if view.revision != revision {
+            view.revision = revision;
+            view.revealed = None;
+            view.state.update(cx, |s, cx| s.set_text(source, cx));
+        }
+        // The cursor's line: scrolled to and marked, once the parse matches the text.
+        if view.revealed != Some(cursor_line) {
+            let text = view.state.read(cx).rendered_text();
+            if text.source() == source {
+                let rope = ropey::Rope::from_str(source);
+                let found = (cursor_line..rope.len_lines().min(cursor_line + 40)).find_map(|l| {
+                    let a = rope.line_to_byte(l);
+                    let b = rope.line_to_byte((l + 1).min(rope.len_lines()));
+                    text.range_for_source(a..b)
+                });
+                if let Some(range) = found {
+                    view.state.update(cx, |s, cx| {
+                        let _ = s.reveal_range(range.clone(), cx);
+                        let _ = s.set_range_highlights([gpui_kit::base::text::RangeHighlight::new(range, highlight)], cx);
+                    });
                 }
-                return;
+                view.revealed = Some(cursor_line);
             }
         }
-        st.scroll_window_by(hit.id, n);
-        drop(st);
-        cx.notify();
+        view.state.clone()
+    }
+
+    /// Keeps *agent-review*'s diff in step with the frame, the cursor's row selected.
+    fn review_state(
+        &mut self,
+        review: &crate::frame::ReviewView,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Entity<gpui_kit::component::diff::DiffState> {
+        use gpui_kit::component::diff::{DiffFile, DiffLinePosition, DiffLineRange, DiffSide, DiffState};
+        let files = DiffFile::parse(&review.patch).unwrap_or_default();
+        let revision = review.revision;
+        let view = self.review_view.get_or_insert_with(|| {
+            let files = files.clone();
+            let state = gpui_kit::AppContext::new(cx, |cx| DiffState::new(files, cx));
+            ReviewView { state, revision, selected: None }
+        });
+        if view.revision != revision {
+            view.revision = revision;
+            view.selected = None;
+            view.state.update(cx, |s, cx| s.set_files(files, cx));
+        }
+        if view.selected != Some(review.cursor_line) {
+            view.selected = Some(review.cursor_line);
+            if let Some(row) = &review.row {
+                let side = if row.modified { DiffSide::Modified } else { DiffSide::Original };
+                let (rel, line) = (row.rel.clone(), row.line);
+                view.state.update(cx, |s, cx| {
+                    s.set_selected_lines(Some(DiffLineRange::new(rel.clone(), side, line, line)), cx);
+                    s.scroll_to_line(DiffLinePosition::new(rel, side, line), cx);
+                });
+            }
+        }
+        view.state.clone()
     }
 }
 
-/// A line's length in characters, without its line break.
-fn text_line_len(text: &ropey::Rope, line: usize) -> usize {
-    text.line(line).to_string().trim_end_matches(['\n', '\r']).chars().count()
-}
-
-/// The modifier keys of a mouse event, as terminals report them.
-fn mouse_mods(m: &gpui_kit::Modifiers) -> crate::terminal::MouseMods {
-    crate::terminal::MouseMods { shift: m.shift, alt: m.alt, control: m.control }
+/// The modifier keys of a mouse event.
+fn mouse_mods(m: &gpui_kit::Modifiers) -> Mods {
+    Mods { shift: m.shift, alt: m.alt, control: m.control }
 }
 
 gpui_kit::actions!(vmac, [TabKey, ShiftTabKey]);
@@ -567,25 +530,15 @@ struct Style {
     sans: bool,
 }
 
-impl Style {
-    fn color(color: Hsla) -> Self {
-        Self { color: Some(color), background: None, scale: 1., bold: false, italic: false, underline: false, sans: false }
-    }
-}
-
-/// A face by name: its spec from `(face-specs)` if it has one, else a color.
-fn resolve_style(face: &str, specs: &[FaceSpec], cx: &App) -> Style {
-    match specs.iter().find(|s| s.name == face) {
-        Some(spec) => Style {
-            color: spec.color.as_deref().map(|c| face_color(c, cx)),
-            background: spec.background.as_deref().map(|c| face_color(c, cx)),
-            scale: spec.scale.unwrap_or(1.),
-            bold: spec.bold,
-            italic: spec.italic,
-            underline: spec.underline,
-            sans: spec.sans,
-        },
-        None => Style::color(face_color(face, cx)),
+fn resolve_style(face: &Face, cx: &App) -> Style {
+    Style {
+        color: face.color.as_deref().map(|c| face_color(c, cx)),
+        background: face.background.as_deref().map(|c| face_color(c, cx)),
+        scale: face.scale,
+        bold: face.bold,
+        italic: face.italic,
+        underline: face.underline,
+        sans: face.sans,
     }
 }
 
@@ -605,25 +558,13 @@ struct Cell {
     diagnostic: Option<Hsla>,
 }
 
-/// Column ranges where the search pattern matches in a line of text.
-fn match_columns(text: &str, re: Option<&regex::Regex>) -> Vec<(usize, usize)> {
-    let Some(re) = re else { return vec![] };
-    let col = |byte: usize| text[..byte].chars().count();
-    re.find_iter(text)
-        .filter(|m| !m.is_empty())
-        .map(|m| (col(m.start()), col(m.end())))
-        .collect()
-}
-
-/// One line of text. `cursor` is a column; `selected` a column range, which
-/// may include the line break (one past the last character), drawn as a
-/// space like Vim does.
 /// What one line shows, all in screen columns.
 #[derive(Default)]
 struct LineView {
     text: String,
     cursor: Option<usize>,
-    /// The selected columns; may include the line break (one past the end).
+    /// The selected columns; may include the line break (one past the end),
+    /// drawn as a space like Vim does.
     selected: Option<(usize, usize)>,
     /// Search matches.
     matches: Vec<(usize, usize)>,
@@ -636,6 +577,18 @@ impl LineView {
     /// Just text with a cursor (the minibuffer, the picker's query).
     fn input(text: String, cursor: usize) -> Self {
         Self { text, cursor: Some(cursor), ..Default::default() }
+    }
+
+    /// A window's line, its faces resolved against the theme.
+    fn of(line: &FrameLine, cx: &App) -> Self {
+        Self {
+            text: line.text.clone(),
+            cursor: line.cursor,
+            selected: line.selected,
+            matches: line.matches.clone(),
+            styles: line.styles.iter().map(|(a, b, f)| (*a, *b, resolve_style(f, cx))).collect(),
+            diagnostics: line.diagnostics.iter().map(|&(a, b, s)| (a, b, severity_color(s, cx))).collect(),
+        }
     }
 }
 
@@ -700,6 +653,46 @@ fn line_element(view: LineView, bar: bool, cx: &App) -> impl IntoElement {
     }))
 }
 
+/// A window's line with what goes around it: its number, the sidebar's
+/// cursor band, code-block band, and the review and comment marks.
+fn window_line_element(line: &FrameLine, selected: bool, bar: bool, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let row = line_element(LineView::of(line, cx), bar, cx);
+    let row = match &line.number {
+        Some(shown) => h_flex()
+            .items_end()
+            .child(
+                div()
+                    .h(px(line.height))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(if line.number_current { theme.foreground } else { theme.muted_foreground.opacity(0.7) })
+                    .child(shown.clone()),
+            )
+            .child(row)
+            .into_any_element(),
+        None => row.into_any_element(),
+    };
+    div()
+        .relative()
+        .when(line.code_block, |d| d.bg(theme.foreground.opacity(0.06)))
+        .when(line.current, |d| d.bg(if selected { theme.list_active } else { theme.list_hover }))
+        // The agent's unreviewed lines: a green band, and a red rule where
+        // it deleted lines.
+        .when(line.added, |d| {
+            d.bg(theme.green.opacity(0.14))
+                .child(div().absolute().left(px(-6.)).top_0().bottom_0().w(px(3.)).bg(theme.green))
+        })
+        .when(line.deleted_above, |d| {
+            d.child(div().absolute().left(px(-6.)).right_0().top_0().h(px(2.)).bg(theme.red))
+        })
+        // A comment on this line: a yellow mark in the margin.
+        .when(line.comment, |d| {
+            d.child(div().absolute().left(px(-6.)).top(px(3.)).w(px(4.)).h(px(10.)).rounded(px(1.)).bg(theme.yellow))
+        })
+        .child(row)
+}
+
 /// The which-key popup: a panel just above the echo area listing available keys.
 fn whichkey_element(entries: &[(String, String)], width: f32, cx: &App) -> gpui_kit::AnyElement {
     let t = cx.theme();
@@ -726,23 +719,15 @@ fn whichkey_element(entries: &[(String, String)], width: f32, cx: &App) -> gpui_
         .shadow_lg()
         .px(px(10.))
         .py(px(6.))
-        .child(
+        .child(h_flex().flex_wrap().children(entries.iter().map(|(key, label)| {
+            let is_group = label.starts_with('+');
             h_flex()
-                .flex_wrap()
-                .children(entries.iter().map(|(key, label)| {
-                    let is_group = label.starts_with('+');
-                    h_flex()
-                        .w(px(col_width))
-                        .h(px(ROW_HEIGHT))
-                        .gap(px(4.))
-                        .child(div().text_color(t.primary).min_w(px(24.)).child(key.clone()))
-                        .child(
-                            div()
-                                .text_color(if is_group { t.primary } else { t.muted_foreground })
-                                .child(label.clone()),
-                        )
-                })),
-        )
+                .w(px(col_width))
+                .h(px(ROW_HEIGHT))
+                .gap(px(4.))
+                .child(div().text_color(t.primary).min_w(px(24.)).child(key.clone()))
+                .child(div().text_color(if is_group { t.primary } else { t.muted_foreground }).child(label.clone()))
+        })))
         .into_any_element()
 }
 
@@ -771,28 +756,15 @@ fn match_row(item: &str, positions: &[usize], selected: bool, cx: &App) -> impl 
 
 /// The telescope-style panel: title and count, the query, results on the
 /// left and a preview of the selected file on the right.
-fn picker_element(
-    picker: &Picker,
-    query: &Buffer,
-    bar: bool,
-    window_height: f32,
-    cx: &App,
-) -> gpui_kit::AnyElement {
+fn picker_element(picker: &PickerView, bar: bool, cx: &App) -> gpui_kit::AnyElement {
     let t = cx.theme();
-    let panel_height = (window_height * 0.72).max(ROW_HEIGHT * 8.);
-    // Title, query and their borders take about three rows.
-    let rows = ((panel_height / ROW_HEIGHT) as usize).saturating_sub(3).max(1);
-    let matches = picker.matches();
-    let first = picker.selected().saturating_sub(rows / 2).min(matches.len().saturating_sub(rows));
-    let results = matches.iter().enumerate().skip(first).take(rows).map(|(i, m)| {
-        match_row(&m.item, &m.positions, i == picker.selected(), cx)
-    });
-    let preview = picker.preview();
+    let results = picker.rows.iter().map(|(item, positions, selected)| match_row(item, positions, *selected, cx));
+    let preview = picker.preview.clone();
 
     div().absolute().inset_0().flex().items_center().justify_center().child(
         v_flex()
             .w(gpui_kit::relative(0.84))
-            .h(px(panel_height))
+            .h(px(picker.panel_height))
             .bg(t.popover)
             .text_color(t.popover_foreground)
             .border_1()
@@ -807,12 +779,8 @@ fn picker_element(
                     .justify_between()
                     .border_b_1()
                     .border_color(t.border)
-                    .child(div().text_color(t.primary).child(picker.title().to_string()))
-                    .child(
-                        div()
-                            .text_color(t.muted_foreground)
-                            .child(format!("{} / {}", matches.len(), picker.total())),
-                    ),
+                    .child(div().text_color(t.primary).child(picker.title.clone()))
+                    .child(div().text_color(t.muted_foreground).child(format!("{} / {}", picker.matched, picker.total))),
             )
             .child(
                 h_flex()
@@ -821,7 +789,7 @@ fn picker_element(
                     .border_b_1()
                     .border_color(t.border)
                     .child(div().text_color(t.primary).child("> "))
-                    .child(line_element(LineView::input(display_line(query.text().slice(..)), query.column()), bar, cx)),
+                    .child(line_element(LineView::input(picker.query.clone(), picker.cursor), bar, cx)),
             )
             .child(
                 h_flex()
@@ -833,7 +801,7 @@ fn picker_element(
                             .h_full()
                             .overflow_hidden()
                             .children(results)
-                            .when(matches.is_empty(), |d| {
+                            .when(picker.matched == 0, |d| {
                                 d.child(div().px(px(10.)).text_color(t.muted_foreground).child("No matches"))
                             }),
                     )
@@ -847,7 +815,7 @@ fn picker_element(
                                 .border_color(t.border)
                                 .text_color(t.muted_foreground)
                                 .overflow_hidden()
-                                .children(lines.into_iter().take(rows).enumerate().map(|(i, l)| {
+                                .children(lines.into_iter().enumerate().map(|(i, l)| {
                                     // The line a reference points at stands out.
                                     let marked = mark == Some(i);
                                     div()
@@ -861,21 +829,6 @@ fn picker_element(
             ),
     )
     .into_any_element()
-}
-
-/// Display columns of a line's characters: a tab takes four.
-/// `map[col]` is where character `col` starts on screen; one extra entry
-/// covers the position after the last character.
-fn display_columns(raw: &str) -> Vec<usize> {
-    let mut map = Vec::with_capacity(raw.len() + 2);
-    let mut at = 0;
-    for ch in raw.chars() {
-        map.push(at);
-        at += if ch == '\t' { 4 } else { 1 };
-    }
-    map.push(at);
-    map.push(at + 1);
-    map
 }
 
 /// Where a Markdown image is on disk: a path (relative to the file's
@@ -892,551 +845,149 @@ fn local_image(folder: &std::path::Path, url: &str) -> Option<std::path::PathBuf
     Some(if path.is_absolute() { path.to_path_buf() } else { folder.join(path) })
 }
 
-/// A line as shown, and each character's screen column (and one past the
-/// end): tabs as four spaces, and Markdown's hidden markup (`ops`: column,
-/// replacement or None to hide) taking no room.
-fn layout_line(raw: &str, ops: &[(usize, Option<char>)]) -> (String, Vec<usize>) {
-    if ops.is_empty() {
-        return (raw.replace('\t', "    "), display_columns(raw));
-    }
-    let mut text = String::with_capacity(raw.len());
-    let mut map = Vec::with_capacity(raw.len() + 2);
-    let mut at = 0;
-    let mut op = ops.iter().peekable();
-    for (i, ch) in raw.chars().enumerate() {
-        map.push(at);
-        while op.peek().is_some_and(|o| o.0 < i) {
-            op.next();
-        }
-        match op.peek().filter(|o| o.0 == i).map(|o| o.1) {
-            Some(None) => {}
-            Some(Some(r)) => {
-                text.push(r);
-                at += 1;
-            }
-            None if ch == '\t' => {
-                text.push_str("    ");
-                at += 4;
-            }
-            None => {
-                text.push(ch);
-                at += 1;
-            }
-        }
-    }
-    map.push(at);
-    map.push(at + 1);
-    (text, map)
-}
-
-fn display_line(rope_line: ropey::RopeSlice<'_>) -> String {
-    rope_line
-        .to_string()
-        .trim_end_matches(['\n', '\r'])
-        .replace('\t', "    ")
-}
-
-/// Which lines fill `room` pixels: scrolls down from `top` until the
-/// cursor's line fits, then takes lines while they fit (at least one), up to
-/// `end`. Returns the first and one-past-last lines, and the row capacity.
-fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl Fn(usize) -> f32) -> (usize, usize, usize) {
-    while top < cursor && (top..=cursor).map(&height).sum::<f32>() > room {
-        top += 1;
-    }
-    let mut last = top;
-    let mut used = 0.;
-    while last < end && (last == top || used + height(last) <= room) {
-        used += height(last);
-        last += 1;
-    }
-    // Blank space below a short buffer still fits terminal rows. Counting
-    // only drawn lines would resize a newly opened PTY to one or two rows.
-    let rows = last - top + ((room - used).max(0.) / ROW_HEIGHT) as usize;
-    (top, last, rows.max(1))
-}
-
-/// Text rows a window of this size shows: its height less its modeline.
-fn window_rows(r: &Rect, area_height: f32) -> usize {
-    ((r.h * area_height / ROW_HEIGHT) as usize).saturating_sub(1).max(1)
-}
-
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.apply_theme(window, cx);
+        self.tell_appearance(window);
         let viewport = window.viewport_size();
         let (width, height): (f32, f32) = (viewport.width.into(), viewport.height.into());
-        // The echo area takes the bottom row; windows share the rest.
-        let area = (height - ROW_HEIGHT).max(ROW_HEIGHT * 2.);
+        let frame: Frame = self.session.frame(Viewport { width, height });
+        self.apply_theme(&frame.theme, window, cx);
+        let area = frame.area;
+        let bar = frame.bar;
 
-        let bar = self.lisp.cursor_shape() == "bar";
-        let markdown_raw = self.lisp.markdown_raw();
-        let selection = self.lisp.selection();
-        let pattern = self.lisp.search_highlight();
-        let mut modeline = Some(self.lisp.modeline());
-        let mut st = self.editor.lock();
-        st.sidebar_width = (SIDEBAR_WIDTH / width.max(1.)).clamp(0.12, 0.45);
-        let rects = st.window_rects();
-        for (id, r) in &rects {
-            st.fit_window(*id, window_rows(r, area));
-        }
-        let search = st.search_regex(&pattern);
-        let minibuffer_open = st.minibuffer_prompt.is_some();
-        let selected = st.selected_window();
-        let font = st.font.clone().map(gpui_kit::SharedString::from);
-        // Markdown files shown rendered, like the preview: in every window on
-        // one, except the window you're typing or selecting in.
-        let mut rendered: std::collections::HashMap<crate::editor::WindowId, gpui_kit::Entity<gpui_kit::base::text::TextViewState>> =
-            Default::default();
-        let selected_now = st.selected_window();
-        if st.markdown_rendered {
-            // The line you are on, in the theme's selection color: plain to see.
-            let highlight = cx.theme().selection;
-            for (id, _) in &rects {
-                let Some(w) = st.window_by_id(*id).cloned() else { continue };
-                if st.is_sidebar(*id) || (*id == selected_now && markdown_raw) {
-                    continue;
-                }
-                let Some(buffer) = st.buffer_by_id(w.buffer) else { continue };
-                let is_md = buffer.file().and_then(|f| language_for_path(f)) == Some("markdown");
-                if !is_md {
-                    continue;
-                }
-                let source = buffer.text().to_string();
-                let revision = buffer.revision();
-                let cursor_line = buffer.text().char_to_line(st.window_point(*id).min(buffer.len()));
-                let view = self.md_views.entry(w.buffer).or_insert_with(|| {
-                    let state = gpui_kit::AppContext::new(cx, |cx| gpui_kit::base::text::TextViewState::markdown(&source, cx));
-                    // Its parse lands later: draw again then.
-                    let changed = cx.observe(&state, |_, _, cx| cx.notify());
-                    MdView { state, revision, revealed: None, _changed: changed }
-                });
-                if view.revision != revision {
-                    view.revision = revision;
-                    view.revealed = None;
-                    view.state.update(cx, |s, cx| s.set_text(&source, cx));
-                }
-                // The cursor's line: scrolled to and marked, once the parse matches the text.
-                if view.revealed != Some(cursor_line) {
-                    let text = view.state.read(cx).rendered_text();
-                    if text.source() == source {
-                        let rope = buffer.text();
-                        let found = (cursor_line..rope.len_lines().min(cursor_line + 40)).find_map(|l| {
-                            let a = rope.line_to_byte(l);
-                            let b = rope.line_to_byte((l + 1).min(rope.len_lines()));
-                            text.range_for_source(a..b)
-                        });
-                        if let Some(range) = found {
-                            view.state.update(cx, |s, cx| {
-                                let _ = s.reveal_range(range.clone(), cx);
-                                let _ = s.set_range_highlights([gpui_kit::base::text::RangeHighlight::new(range, highlight)], cx);
-                            });
-                        }
-                        view.revealed = Some(cursor_line);
-                    }
-                }
-                rendered.insert(*id, view.state.clone());
-            }
-        }
-        let live: std::collections::HashSet<crate::editor::BufferId> = st.buffer_ids().into_iter().collect();
+        self.hits = frame.windows.iter().map(WindowHit::of).collect();
+        self.modal = frame.modal;
+        let live: std::collections::HashSet<_> = frame.buffers.iter().copied().collect();
         self.md_views.retain(|id, _| live.contains(id));
 
-        // *agent-review* as gpui-kit's Diff, the cursor's row selected in it.
-        let review_state = st.review_buffer_id().filter(|id| rects.iter().any(|(w, _)| st.window_by_id(*w).is_some_and(|w| w.buffer == *id))).map(|id| {
-            use gpui_kit::component::diff::{DiffFile, DiffLinePosition, DiffLineRange, DiffSide, DiffState};
-            let buffer = st.buffer_by_id(id).expect("checked above");
-            let revision = buffer.revision();
-            let patch: String = buffer.text().to_string().lines().filter(|l| !l.is_empty() && *l != "Nothing to review.").map(|l| format!("{l}\n")).collect();
-            let files = DiffFile::parse(&patch).unwrap_or_default();
-            let view = self.review_view.get_or_insert_with(|| {
-                let files = files.clone();
-                let state = gpui_kit::AppContext::new(cx, |cx| DiffState::new(files, cx));
-                ReviewView { state, revision, selected: None }
-            });
-            if view.revision != revision {
-                view.revision = revision;
-                view.selected = None;
-                view.state.update(cx, |s, cx| s.set_files(files, cx));
-            }
-            let window_line = rects
-                .iter()
-                .find_map(|(w, _)| st.window_by_id(*w).filter(|w| w.buffer == id).map(|w| w.id))
-                .map(|w| buffer.text().char_to_line(st.window_point(w).min(buffer.len())))
-                .unwrap_or(0);
-            if view.selected != Some(window_line) {
-                view.selected = Some(window_line);
-                if let Some(Some(row)) = st.review_rows.get(window_line) {
-                    let side = if row.modified { DiffSide::Modified } else { DiffSide::Original };
-                    let (rel, line) = (row.rel.clone(), row.line);
-                    view.state.update(cx, |s, cx| {
-                        s.set_selected_lines(Some(DiffLineRange::new(rel.clone(), side, line, line)), cx);
-                        s.scroll_to_line(DiffLinePosition::new(rel, side, line), cx);
-                    });
-                }
-            }
-            view.state.clone()
-        });
-
-        let syntax_theme = self.lisp.syntax_theme();
-        let syntax = &mut self.syntax;
-        let theme = cx.theme();
-
-        let face_specs = self.lisp.face_specs();
-        // Where each window ends up scrolled and how many lines it shows,
-        // once line heights are known (headings are taller).
-        let mut fitted: Vec<(crate::editor::WindowId, usize, usize)> = Vec::new();
-        // Where the cursor is on screen (x, line top, line height), for K's popup.
-        let mut cursor_at: Option<(f32, f32, f32)> = None;
-
-        // Lines the agent changed and nobody reviewed yet, per window.
-        let review_marks: std::collections::HashMap<crate::editor::WindowId, Vec<(usize, bool)>> = rects
+        let this = cx.entity().downgrade();
+        let windows: Vec<_> = frame
+            .windows
             .iter()
-            .filter_map(|(id, _)| {
-                let buffer = st.window_by_id(*id)?.buffer;
-                let marks = st.review_marks(buffer);
-                (!marks.is_empty()).then_some((*id, marks))
-            })
-            .collect();
-
-        // Lines with your comments on them, per window.
-        let comment_marks: std::collections::HashMap<crate::editor::WindowId, Vec<usize>> = rects
-            .iter()
-            .filter_map(|(id, _)| {
-                let lines = st.comment_lines(st.window_by_id(*id)?.buffer);
-                (!lines.is_empty()).then_some((*id, lines))
-            })
-            .collect();
-        let comments: Vec<crate::editor::ReviewComment> = st.review_comments.clone();
-        let review_id = st.review_buffer_id();
-
-        let mut hits: Vec<WindowHit> = Vec::new();
-        let terminal_buffers: std::collections::HashSet<crate::editor::BufferId> = st.terminals.iter().map(|t| t.buffer).collect();
-        let windows: Vec<_> = rects
-            .iter()
-            .filter_map(|(id, r)| {
-                let w = st.window_by_id(*id)?.clone();
-                let buffer = st.buffer_by_id(w.buffer)?;
-                let text = buffer.text();
-                let is_selected = *id == selected;
-                // The sidebar marks its cursor's line instead of drawing a cursor.
-                let is_sidebar = st.is_sidebar(*id);
-                let point = st.window_point(*id);
-                let cur_line = text.char_to_line(point);
-                let cur_col = point - text.line_to_char(cur_line);
-
-                // Styles for every line that could be on screen: from the top (or
-                // the cursor, if above) through as many normal-height rows as fit.
-                let estimate = window_rows(r, area);
-                let lo = w.scroll_top.min(cur_line);
-                let hi = (w.scroll_top + estimate).max(cur_line + 1).min(text.len_lines());
-                let language = buffer.language().or_else(|| buffer.file().and_then(|f| language_for_path(f)));
-                let spans = match language {
-                    Some(lang) => syntax.highlight(w.buffer, lang, buffer.revision(), text, lo..hi),
-                    None => Vec::new(),
-                };
-                // Markdown with its markup hidden, except where you're typing.
-                let conceal_here = st.markdown_conceal && language == Some("markdown") && !(is_selected && markdown_raw);
-                let conceals = if conceal_here { crate::markdown::conceal(text, lo..hi) } else { Vec::new() };
-                let ops_of = |i: usize| conceals.get(i.wrapping_sub(lo)).map(Vec::as_slice).unwrap_or(&[]);
-                // Styles of line i, in character columns (not yet screen columns).
-                let styles_of = |i: usize| -> Vec<(usize, usize, Style)> {
-                    let start = text.line_to_char(i);
-                    let line_len = text.line(i).len_chars();
-                    let mut out: Vec<(usize, usize, Style)> = spans
-                        .get(i - lo)
-                        .map(|line_spans| {
-                            line_spans
-                                .iter()
-                                .filter_map(|sp| {
-                                    let face = face_for(&sp.capture, &syntax_theme)?;
-                                    Some((sp.start, sp.end, resolve_style(face, &face_specs, cx)))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // Faces Scheme put on the text (the tree's folders, ...).
-                    out.extend(buffer.faces().iter().filter(|f| f.0 < start + line_len && f.1 > start).map(
-                        |(a, b, face)| {
-                            (a.saturating_sub(start), b.saturating_sub(start), resolve_style(face, &face_specs, cx))
-                        },
-                    ));
-                    out
-                };
-                let styles: Vec<_> = (lo..hi).map(styles_of).collect();
-                // Language server diagnostics, as character ranges and squiggle colors.
-                let diagnostics: Vec<(usize, usize, Hsla)> = buffer
-                    .file()
-                    .map(|f| {
-                        st.lsp
-                            .diagnostics(f)
+            .map(|w| {
+                let body = match &w.content {
+                    Content::Review(review) => {
+                        use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffLinePosition, DiffSide};
+                        let state = self.review_state(review, cx);
+                        let annotations: Vec<DiffAnnotation> = review
+                            .comments
                             .iter()
-                            .map(|d| {
-                                let (a, b) = d.to_chars(text);
-                                (a, b, severity_color(d.severity, cx))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
-                // Line numbers, in a gutter: for files, when they're on.
-                let numbers = match st.line_numbers.as_str() {
-                    "on" | "relative" if buffer.file().is_some() && !is_sidebar && !rendered.contains_key(id) => Some(st.line_numbers == "relative"),
-                    _ => None,
-                };
-                let gutter = numbers.map_or(0, |_| text.len_lines().max(1).to_string().len() + 1);
-
-                let room = (r.h * area - ROW_HEIGHT).max(ROW_HEIGHT);
-                let (top, last, rows) = fit_lines(w.scroll_top.min(cur_line), cur_line, hi, room, height_of);
-                fitted.push((*id, top, rows));
-                {
-                    let mut y = r.y * area;
-                    let lines = (top..last)
-                        .map(|i| {
-                            let raw = text.line(i).to_string();
-                            let cols = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(i)).1;
-                            let at = (i, y, height_of(i), cols);
-                            y += height_of(i);
-                            at
-                        })
-                        .collect();
-                    hits.push(WindowHit {
-                        id: *id,
-                        buffer: w.buffer,
-                        left: r.x * width,
-                        top: r.y * area,
-                        right: (r.x + r.w) * width,
-                        bottom: (r.y + r.h) * area,
-                        text_left: r.x * width + 8. + gutter as f32 * FONT_SIZE * CHAR_WIDTH,
-                        lines,
-                        custom: rendered.contains_key(id) || (review_state.is_some() && Some(w.buffer) == review_id),
-                        terminal: terminal_buffers.contains(&w.buffer),
-                    });
-                }
-                if is_selected && (top..last).contains(&cur_line) {
-                    let raw = text.line(cur_line).to_string();
-                    let col = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(cur_line))
-                        .1
-                        .get(cur_col)
-                        .copied()
-                        .unwrap_or(cur_col);
-                    let x = r.x * width + 8. + (col + gutter) as f32 * FONT_SIZE * CHAR_WIDTH;
-                    let y = r.y * area + (top..cur_line).map(height_of).sum::<f32>();
-                    cursor_at = Some((x, y, height_of(cur_line)));
-                }
-
-                let lines: Vec<_> = (top..last)
-                    .map(|i| {
-                        let raw = text.line(i).to_string();
-                        let (line, cols) = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(i));
-                        let to_screen = |col: usize| cols.get(col).copied().unwrap_or(col);
-                        let cursor = (is_selected && !is_sidebar && i == cur_line && !minibuffer_open)
-                            .then_some(to_screen(cur_col));
-                        let start = text.line_to_char(i);
-                        // The selected range touching this line (a block has one per line);
-                        // it may run past the line's end, over its line break.
-                        let line_len = text.line(i).len_chars();
-                        let selected = selection
-                            .iter()
-                            .filter(|_| is_selected)
-                            .find(|&&(a, b)| a < start + line_len.max(1) && b > start)
-                            .map(|&(a, b)| {
-                                (to_screen(a.saturating_sub(start)), to_screen(b.saturating_sub(start)))
-                            });
-                        let line_styles = styles[i - lo]
-                            .iter()
-                            .map(|&(a, b, style)| (to_screen(a), to_screen(b), style))
-                            .collect();
-                        let matches = match_columns(&line, search.as_ref());
-                        let line_diagnostics = diagnostics
-                            .iter()
-                            .filter(|&&(a, b, _)| a < start + line_len.max(1) && b > start)
-                            .map(|&(a, b, color)| {
-                                (to_screen(a.saturating_sub(start)), to_screen(b.saturating_sub(start)), color)
+                            .map(|c| {
+                                let side = if c.at.modified { DiffSide::Modified } else { DiffSide::Original };
+                                DiffAnnotation::line(
+                                    gpui_kit::SharedString::from(format!("comment-{}", c.id)),
+                                    DiffLinePosition::new(c.at.rel.clone(), side, c.at.line),
+                                )
                             })
                             .collect();
-                        let view = LineView {
-                            text: line,
-                            cursor,
-                            selected,
-                            matches,
-                            styles: line_styles,
-                            diagnostics: line_diagnostics,
-                        };
-                        let row = line_element(view, bar, cx);
-                        // The number beside it: the current line's brighter; relative
-                        // numbers count from the cursor (the current line its own).
-                        let row = match numbers {
-                            Some(relative) => {
-                                let n = if relative && i != cur_line { i.abs_diff(cur_line) } else { i + 1 };
-                                let shown = if i + 1 == text.len_lines() && text.line(i).len_chars() == 0 { String::new() } else { format!("{n:>width$} ", width = gutter - 1) };
-                                h_flex()
-                                    .items_end()
-                                    .child(
-                                        div()
-                                            .h(px(height_of(i)))
-                                            .flex_shrink_0()
-                                            .whitespace_nowrap()
-                                            .text_color(if i == cur_line { theme.foreground } else { theme.muted_foreground.opacity(0.7) })
-                                            .child(shown),
-                                    )
-                                    .child(row)
-                                    .into_any_element()
-                            }
-                            None => row.into_any_element(),
-                        };
-                        let current = is_sidebar && i == cur_line;
-                        let marks = review_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
-                        let added = marks.contains(&(i, true));
-                        // Markdown code blocks: a band across the window.
-                        let code_block = language == Some("markdown")
-                            && spans.get(i.wrapping_sub(lo)).is_some_and(|l| l.iter().any(|sp| sp.capture == "markup.raw.block"));
-                        let deleted_above = marks.contains(&(i, false));
-                        div().relative()
-                        .when(code_block, |d| d.bg(theme.foreground.opacity(0.06)))
-                        .when(current, |d| {
-                            d.bg(if is_selected { theme.list_active } else { theme.list_hover })
-                        })
-                        // The agent's unreviewed lines: a green band, and a
-                        // red rule where it deleted lines.
-                        .when(added, |d| d.bg(theme.green.opacity(0.14)).child(
-                            div().absolute().left(px(-6.)).top_0().bottom_0().w(px(3.)).bg(theme.green),
-                        ))
-                        .when(deleted_above, |d| d.child(
-                            div().absolute().left(px(-6.)).right_0().top_0().h(px(2.)).bg(theme.red),
-                        ))
-                        // A comment on this line: a yellow mark in the margin.
-                        .when(comment_marks.get(id).is_some_and(|l| l.contains(&i)), |d| d.child(
-                            div().absolute().left(px(-6.)).top(px(3.)).w(px(4.)).h(px(10.)).rounded(px(1.)).bg(theme.yellow),
-                        ))
-                        .child(row)
-                    })
-                    .collect();
-                // The selected window's modeline comes from Scheme; others show their buffer.
-                let status: Vec<Segment> = match is_selected.then(|| modeline.take()).flatten() {
-                    Some(segments) => segments,
-                    None => vec![Segment { text: buffer.name().to_string(), face: "dim".into() }],
-                };
-                Some(
-                    v_flex()
-                        .absolute()
-                        .left(px(r.x * width))
-                        .top(px(r.y * area))
-                        .w(px(r.w * width))
-                        .h(px(r.h * area))
-                        .when(r.x > 0., |d| d.border_l_1().border_color(theme.border))
-                        .when(is_sidebar, |d| d.bg(theme.sidebar))
-                        .child(match (rendered.get(id), review_state.as_ref().filter(|_| Some(w.buffer) == review_id)) {
-                            (_, Some(state)) => {
-                                use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffLinePosition, DiffSide};
-                                let annotations: Vec<DiffAnnotation> = comments
-                                    .iter()
-                                    .map(|c| {
-                                        let side = if c.at.modified { DiffSide::Modified } else { DiffSide::Original };
-                                        DiffAnnotation::line(gpui_kit::SharedString::from(format!("comment-{}", c.id)), DiffLinePosition::new(c.at.rel.clone(), side, c.at.line))
+                        let texts: std::collections::HashMap<String, String> =
+                            review.comments.iter().map(|c| (format!("comment-{}", c.id), c.text.clone())).collect();
+                        let (on_add, on_click) = (this.clone(), this.clone());
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(
+                                Diff::new(&state)
+                                    .size_full()
+                                    .annotations(annotations)
+                                    .render_annotation(move |a, _, cx| {
+                                        let t = cx.theme();
+                                        let text = texts.get(&a.id().to_string()).cloned().unwrap_or_default();
+                                        h_flex()
+                                            .gap(px(8.))
+                                            .px(px(10.))
+                                            .py(px(6.))
+                                            .border_l_2()
+                                            .border_color(t.yellow)
+                                            .bg(t.yellow.opacity(0.08))
+                                            .child(div().text_color(t.yellow).child("comment"))
+                                            .child(div().child(text))
                                     })
-                                    .collect();
-                                let texts: std::collections::HashMap<String, String> =
-                                    comments.iter().map(|c| (format!("comment-{}", c.id), c.text.clone())).collect();
-                                let editor_add = self.editor.clone();
-                                let editor_click = self.editor.clone();
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(
-                                        Diff::new(state)
-                                            .size_full()
-                                            .annotations(annotations)
-                                            .render_annotation(move |a, _, cx| {
-                                                let t = cx.theme();
-                                                let text = texts.get(&a.id().to_string()).cloned().unwrap_or_default();
-                                                h_flex()
-                                                    .gap(px(8.))
-                                                    .px(px(10.))
-                                                    .py(px(6.))
-                                                    .border_l_2()
-                                                    .border_color(t.yellow)
-                                                    .bg(t.yellow.opacity(0.08))
-                                                    .child(div().text_color(t.yellow).child("comment"))
-                                                    .child(div().child(text))
-                                            })
-                                            // The + beside a hovered line: a comment on it.
-                                            .on_add_annotation(move |range, window, _| {
-                                                let side = if range.side() == DiffSide::Modified { "modified" } else { "original" };
-                                                editor_add.lock().push_event(
-                                                    "lua-event",
-                                                    vec!["review_comment_at".into(), range.path().to_string(), side.into(), range.start().to_string()],
-                                                );
-                                                window.refresh();
-                                            })
-                                            // A click puts the cursor on that row.
-                                            .on_line_click(move |pos, _, window, _| {
-                                                editor_click.lock().review_select(pos.path(), pos.side() == DiffSide::Modified, pos.line());
-                                                window.refresh();
-                                            }),
-                                    )
-                                    .into_any_element()
-                            }
-                            (Some(state), None) => {
-                            // Rendered Markdown: images, code blocks, tables, HTML.
-
-                                let folder = buffer.file().and_then(|f| f.parent()).map(|d| d.to_path_buf()).unwrap_or_default();
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .px(px(20.))
-                                    .py(px(10.))
-                                    .font_family(theme.font_family.clone())
-                                    .text_size(px(15.))
-                                    .line_height(px(22.))
-                                    .child(
-                                        gpui_kit::base::text::TextView::new(state)
-                                            .scrollable(true)
-                                            .selectable(false)
-                                            .image_source(move |uri| match local_image(&folder, uri.as_ref()) {
-                                                Some(path) => path.into(),
-                                                None => uri.clone().into(),
-                                            }),
-                                    )
-                                    .into_any_element()
-                            }
-                            (None, None) => v_flex().flex_1().overflow_hidden().px(px(8.)).children(lines).into_any_element(),
-                        })
-                        .child(
-                            h_flex()
-                                .h(px(ROW_HEIGHT))
-                                .px(px(8.))
-                                .gap(px(14.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .bg(if is_selected { theme.status_bar } else { theme.background })
-                                .border_t_1()
-                                .border_color(theme.status_bar_border)
-                                .children(
-                                    status
-                                        .into_iter()
-                                        .filter(|s| !s.text.is_empty())
-                                        .map(|s| div().text_color(face_color(&s.face, cx)).child(s.text)),
-                                ),
-                        ),
-                )
+                                    // The + beside a hovered line: a comment on it.
+                                    .on_add_annotation(move |range, _, cx| {
+                                        let input = Input::ReviewCommentAt {
+                                            path: range.path().to_string(),
+                                            modified: range.side() == DiffSide::Modified,
+                                            line: range.start(),
+                                        };
+                                        let _ = on_add.update(cx, |shell, cx| shell.send(input, cx));
+                                    })
+                                    // A click puts the cursor on that row.
+                                    .on_line_click(move |pos, _, _, cx| {
+                                        let input = Input::ReviewSelect {
+                                            path: pos.path().to_string(),
+                                            modified: pos.side() == DiffSide::Modified,
+                                            line: pos.line(),
+                                        };
+                                        let _ = on_click.update(cx, |shell, cx| shell.send(input, cx));
+                                    }),
+                            )
+                            .into_any_element()
+                    }
+                    Content::Markdown { source, revision, cursor_line, folder } => {
+                        // Rendered Markdown: images, code blocks, tables, HTML.
+                        let state = self.markdown_view(w.buffer, source, *revision, *cursor_line, cx);
+                        let folder = folder.clone();
+                        let theme = cx.theme();
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .px(px(20.))
+                            .py(px(10.))
+                            .font_family(theme.font_family.clone())
+                            .text_size(px(15.))
+                            .line_height(px(22.))
+                            .child(
+                                gpui_kit::base::text::TextView::new(&state)
+                                    .scrollable(true)
+                                    .selectable(false)
+                                    .image_source(move |uri| match local_image(&folder, uri.as_ref()) {
+                                        Some(path) => path.into(),
+                                        None => uri.clone().into(),
+                                    }),
+                            )
+                            .into_any_element()
+                    }
+                    Content::Text(lines) => v_flex()
+                        .flex_1()
+                        .overflow_hidden()
+                        .px(px(8.))
+                        .children(lines.iter().map(|l| window_line_element(l, w.selected, bar, cx)))
+                        .into_any_element(),
+                };
+                let theme = cx.theme();
+                v_flex()
+                    .absolute()
+                    .left(px(w.left))
+                    .top(px(w.top))
+                    .w(px(w.width))
+                    .h(px(w.height))
+                    .when(w.left > 0., |d| d.border_l_1().border_color(theme.border))
+                    .when(w.sidebar, |d| d.bg(theme.sidebar))
+                    .child(body)
+                    .child(
+                        h_flex()
+                            .h(px(ROW_HEIGHT))
+                            .px(px(8.))
+                            .gap(px(14.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .bg(if w.selected { theme.status_bar } else { theme.background })
+                            .border_t_1()
+                            .border_color(theme.status_bar_border)
+                            .children(
+                                w.modeline
+                                    .iter()
+                                    .filter(|s| !s.text.is_empty())
+                                    .map(|s| div().text_color(face_color(&s.face, cx)).child(s.text.clone())),
+                            ),
+                    )
             })
             .collect();
 
-        self.hits = hits;
-        for (id, top, rows) in fitted {
-            if let Some(w) = st.window_by_id_mut(id) {
-                w.scroll_top = top;
-                w.rows = rows.max(1);
-            }
-        }
-        // Columns of monospace text each window fits (terminals size to it).
-        for (id, r) in &rects {
-            if let Some(w) = st.window_by_id_mut(*id) {
-                w.cols = ((r.w * width - 16.) / (FONT_SIZE * CHAR_WIDTH)).max(10.) as usize;
-            }
-        }
-        syntax.retain(|id| st.buffer_by_id(id).is_some());
+        let theme = cx.theme();
         // K's documentation, by the cursor: below its line, or above when near the bottom.
-        let hover = st.hover.clone().zip(cursor_at).map(|(doc, (x, y, line_height))| {
+        let hover = frame.hover.clone().zip(frame.cursor_at).map(|(doc, (x, y, line_height))| {
             let w = HOVER_WIDTH.min(width - 16.);
             let left = x.min(width - w - 8.).max(8.);
             let below = y + line_height + HOVER_MAX_HEIGHT < area;
@@ -1461,12 +1012,10 @@ impl Render for Shell {
                 .child(gpui_kit::component::text::TextView::markdown("hover-doc", doc))
         });
         // Completions, under the word being typed.
-        let completion = st.completion.as_ref().zip(cursor_at).map(|(c, (x, y, line_height))| {
-            let rows = COMPLETION_ROWS.min(c.len());
-            let first = c.selected().saturating_sub(rows - 1).min(c.len() - rows);
+        let completion = frame.completion.as_ref().zip(frame.cursor_at).map(|(rows, (x, y, line_height))| {
             let w = COMPLETION_WIDTH.min(width - 16.);
             let left = x.min(width - w - 8.).max(8.);
-            let below = y + line_height + rows as f32 * ROW_HEIGHT + 8. < area;
+            let below = y + line_height + rows.len() as f32 * ROW_HEIGHT + 8. < area;
             div()
                 .absolute()
                 .left(px(left))
@@ -1479,58 +1028,43 @@ impl Render for Shell {
                 .border_color(theme.border)
                 .rounded(theme.radius)
                 .shadow_lg()
-                .children(c.items().enumerate().skip(first).take(rows).map(|(i, item)| {
+                .children(rows.iter().map(|item| {
                     h_flex()
                         .h(px(ROW_HEIGHT))
                         .px(px(8.))
                         .gap(px(10.))
                         .whitespace_nowrap()
                         .overflow_hidden()
-                        .when(i == c.selected(), |d| d.bg(theme.list_active))
+                        .when(item.selected, |d| d.bg(theme.list_active))
                         .child(div().flex_none().text_color(theme.foreground).child(item.label.clone()))
                         .child(div().flex_1().overflow_hidden().text_color(theme.muted_foreground).child(item.detail.clone()))
-                        .child(div().flex_none().text_color(theme.primary).child(item.kind))
+                        .child(div().flex_none().text_color(theme.primary).child(item.kind.clone()))
                 }))
         });
         // Which-key popup, just above the echo area when a prefix key is pending.
-        let whichkey = st.whichkey.as_ref().map(|wk| whichkey_element(wk, width, cx));
-        // The picker draws its own query line; the echo area keeps the message.
-        let overlay = st.picker.as_ref().map(|p| picker_element(p, &st.minibuffer, bar, height, cx));
-        let echo = match &st.minibuffer_prompt {
-            Some(prompt) if overlay.is_none() => {
-                let mb = &st.minibuffer;
-                h_flex()
-                    .child(div().text_color(theme.primary).child(prompt.clone()))
-                    .child(line_element(LineView::input(display_line(mb.text().slice(..)), mb.column()), true, cx))
-            }
-            _ if st.message.is_empty() && st.minibuffer_prompt.is_none() => {
-                // With nothing else to say, the diagnostic under the cursor.
-                let point = st.buffer().point();
-                let here = st.buffer_diagnostics().into_iter().find(|((a, b), _)| point >= *a && point < *b);
-                match here {
-                    Some((_, d)) => h_flex()
-                        .gap(px(6.))
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(div().text_color(severity_color(d.severity, cx)).child(format!("{}:", d.severity_name())))
-                        .child(div().text_color(theme.foreground).child(d.message.lines().next().unwrap_or("").to_string())),
-                    None => h_flex(),
-                }
-            }
-            _ => h_flex().text_color(theme.muted_foreground).child(st.message.clone()),
+        let whichkey = frame.whichkey.as_ref().map(|wk| whichkey_element(wk, width, cx));
+        let overlay = frame.picker.as_ref().map(|p| picker_element(p, bar, cx));
+        let echo = match &frame.echo {
+            Echo::Prompt { prompt, text, cursor } => h_flex()
+                .child(div().text_color(theme.primary).child(prompt.clone()))
+                .child(line_element(LineView::input(text.clone(), *cursor), true, cx)),
+            Echo::Diagnostic { severity, label, message } => h_flex()
+                .gap(px(6.))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(div().text_color(severity_color(*severity, cx)).child(format!("{label}:")))
+                .child(div().text_color(theme.foreground).child(message.clone())),
+            Echo::Message(message) => h_flex().text_color(theme.muted_foreground).child(message.clone()),
+            Echo::Empty => h_flex(),
         };
         // The Markdown preview, rendered by gpui-kit, on the right.
-        let preview_target = st.preview_buffer();
-        if preview_target.is_some() {
-            st.preview_last = preview_target;
-        }
-        let preview = st.preview_rect().zip(preview_target).map(|(r, id)| {
-            let source = st.buffer_by_id(id).map(|b| b.text().to_string()).unwrap_or_default();
+        let preview = frame.preview.as_ref().map(|p| {
+            let folder = p.folder.clone();
             div()
                 .absolute()
-                .left(px(r.x * width))
+                .left(px(p.left))
                 .top_0()
-                .w(px(r.w * width))
+                .w(px(p.width))
                 .h(px(area))
                 .border_l_1()
                 .border_color(theme.border)
@@ -1540,26 +1074,19 @@ impl Render for Shell {
                 .line_height(px(22.))
                 .px(px(20.))
                 .py(px(12.))
-                .child({
-                    // Images by path load from the file's folder (README's assets/...).
-                    let folder = st
-                        .buffer_by_id(id)
-                        .and_then(|b| b.file())
-                        .and_then(|f| f.parent())
-                        .map(|d| d.to_path_buf())
-                        .unwrap_or_default();
+                .child(
                     gpui_kit::base::TextView::markdown(
-                        gpui_kit::SharedString::from(format!("markdown-preview-{id}")),
-                        source,
+                        gpui_kit::SharedString::from(format!("markdown-preview-{}", p.buffer)),
+                        p.source.clone(),
                     )
                     .scrollable(true)
                     .image_source(move |uri| match local_image(&folder, uri.as_ref()) {
                         Some(path) => path.into(),
                         None => uri.clone().into(),
-                    })
-                })
+                    }),
+                )
         });
-        drop(st);
+        let font = frame.font.clone().map(gpui_kit::SharedString::from);
 
         v_flex()
             .relative()
@@ -1567,8 +1094,10 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|shell, _: &TabKey, _, cx| shell.dispatch("TAB", "", cx)))
-            .on_action(cx.listener(|shell, _: &ShiftTabKey, _, cx| shell.dispatch("S-TAB", "", cx)))
+            .on_action(cx.listener(|shell, _: &TabKey, _, cx| shell.send(Input::Key { key: "TAB".into(), text: String::new() }, cx)))
+            .on_action(
+                cx.listener(|shell, _: &ShiftTabKey, _, cx| shell.send(Input::Key { key: "S-TAB".into(), text: String::new() }, cx)),
+            )
             .on_any_mouse_down(cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1593,23 +1122,12 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::display_columns;
 
     fn ks(s: &str, key_char: Option<&str>) -> Keystroke {
         let mut k = Keystroke::parse(s).unwrap();
         k.key_char = key_char.map(Into::into);
         k
-    }
-
-    #[test]
-    fn tall_lines_scroll_the_cursor_into_view() {
-        // Line 0 is a heading twice as tall; room for 4 normal rows.
-        let h = |i: usize| if i == 0 { 2. * ROW_HEIGHT } else { ROW_HEIGHT };
-        let room = 4. * ROW_HEIGHT;
-        assert_eq!(fit_lines(0, 1, 10, room, h), (0, 3, 3), "heading + 2 lines fit");
-        assert_eq!(fit_lines(0, 3, 10, room, h), (1, 5, 4), "the cursor on line 3 scrolls the heading off");
-        assert_eq!(fit_lines(0, 0, 1, room, h), (0, 1, 3), "stops drawing at the buffer's end, with room below the heading");
-        let huge = |_| 10. * ROW_HEIGHT;
-        assert_eq!(fit_lines(0, 0, 10, room, huge), (0, 1, 1), "always at least one line");
     }
 
     #[test]
@@ -1622,10 +1140,7 @@ mod tests {
             bottom: 200.,
             text_left: 8. + 3. * cw,
             // A heading twice as tall, then a line with a tab (four columns).
-            lines: vec![
-                (10, 0., 40., display_columns("# Hi")),
-                (11, 40., 20., display_columns("\tx")),
-            ],
+            lines: vec![(10, 0., 40., display_columns("# Hi")), (11, 40., 20., display_columns("\tx"))],
             ..Default::default()
         };
         assert!(hit.contains(10., 10.) && !hit.contains(410., 10.));
@@ -1639,43 +1154,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_terminal_keeps_the_panes_full_height() {
-        // The first frame has one empty buffer line, but space for 40 rows.
-        // Feeding the content count back to the PTY used to shrink it to 2.
-        let (top, last, rows) = fit_lines(0, 0, 1, 800., |_| ROW_HEIGHT);
-        assert_eq!((top, last), (0, 1), "only existing buffer lines are drawn");
-        let mut st = crate::editor::EditorState::new(Buffer::new("*agent*"));
-        let id = st.selected_window();
-        st.fit_window(id, rows);
-        assert_eq!(st.selected_size().0, 40, "the PTY must get the pane's capacity");
-
-        // Output arriving and a later pane resize must preserve the same rule.
-        for (lines, room, expected) in [(2, 800., 40), (40, 800., 40), (2, 200., 10)] {
-            let (_, _, rows) = fit_lines(0, 0, lines, room, |_| ROW_HEIGHT);
-            st.fit_window(id, rows);
-            assert_eq!(st.selected_size().0, expected);
-        }
-    }
-
-    #[test]
-    fn tabs_take_four_columns() {
-        assert_eq!(display_columns("a\tb"), vec![0, 1, 5, 6, 7]);
+    fn images_load_from_the_files_folder() {
         let folder = std::path::Path::new("/notes");
         assert_eq!(local_image(folder, "assets/logo.svg"), Some("/notes/assets/logo.svg".into()));
         assert_eq!(local_image(folder, "file:///tmp/a%20b.png"), Some("/tmp/a b.png".into()));
         assert_eq!(local_image(folder, "https://x.dev/a.png"), None);
-        // Hidden markup takes no room; a replacement takes one column.
-        let (text, cols) = layout_line("## **Hi**\t-", &[(0, None), (1, None), (2, None), (3, None), (4, None), (7, None), (8, None), (10, Some('•'))]);
-        assert_eq!(text, "Hi    •");
-        assert_eq!(cols, vec![0, 0, 0, 0, 0, 0, 1, 2, 2, 2, 6, 7, 8]);
-        assert_eq!(layout_line("a\tb", &[]), ("a    b".to_string(), display_columns("a\tb")));
-    }
-
-    #[test]
-    fn match_columns_are_in_characters() {
-        let re = regex::Regex::new("b+").unwrap();
-        assert_eq!(match_columns("éabbxb", Some(&re)), vec![(2, 4), (5, 6)]);
-        assert_eq!(match_columns("abc", None), vec![]);
     }
 
     #[test]

@@ -7444,6 +7444,7 @@ dependencies = [
  "qwertty-term-vt",
  "regex",
  "ropey 1.6.1",
+ "serde",
  "serde_json",
  "similar",
  "steel-core",

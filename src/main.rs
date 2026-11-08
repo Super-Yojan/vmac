@@ -10,7 +10,9 @@ mod lsp;
 mod markdown;
 mod packages;
 mod picker;
+mod frame;
 mod review;
+mod session;
 mod sessions;
 mod plugins;
 mod projects;
@@ -65,7 +67,7 @@ fn main() {
                 if dashboard {
                     let _ = lisp.eval("(when dashboard-on-start (call-binding 'dashboard))");
                 }
-                cx.new(|cx| Shell::new(editor, lisp, window, cx))
+                cx.new(|cx| Shell::new(session::Session::new(editor, lisp), window, cx))
             })
             .expect("failed to open window");
             cx.activate(true);
