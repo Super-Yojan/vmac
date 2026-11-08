@@ -16,7 +16,8 @@ cargo run -- path/to/file
 | Primitives | `src/lisp.rs` | `insert`, `char-at`, `delete-region`, `find-file`, ... in both Scheme and Lua |
 | Window | `src/shell.rs` | draws windows, modelines, popups; sends every key to Scheme |
 | The editor | `lisp/core/*.scm` | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
-| Your config | `~/.config/gmacs/init.scm`, `~/.config/gmacs/init.lua` | loaded after the core |
+| Plugins | `~/.config/gmacs/plugins/` | Scheme and Lua, loaded after the core |
+| Your config | `~/.config/gmacs/init.scm`, `~/.config/gmacs/init.lua` | loaded last |
 
 The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
 `75-file-tree.scm`, ...), loaded as one program in name order.
@@ -111,6 +112,28 @@ to log every message to and from the servers.
 (define (lsp-servers)
   (list (list "python" "pylsp") (list "rust" "rust-analyzer")))
 ```
+
+## Plugins
+
+Plugins live in `~/.config/gmacs/plugins/`: a folder with an `init.scm`
+and/or `init.lua` (Lua can `require` modules from the folder or its `lua/`),
+or a single `name.scm` / `name.lua`. They load after the core and before
+your init files, so your config can change anything a plugin sets. A plugin
+that fails to load is skipped, with its error shown; the rest still load.
+Editing a plugin's files reloads it.
+
+- `SPC h p` (or `:plugins`) lists them with their status; `RET` turns one on
+  or off (a `disabled` file in its folder).
+- `:plugin-install URL` clones one with git (in the background, then reloads),
+  `:plugin-update` pulls them all, `:plugin-remove NAME` deletes one.
+
+`examples/plugins/` has two: `word-count` (Lua, `SPC t w`) and `zen`
+(Scheme, `SPC t z`). To try them:
+`cp -r examples/plugins/* ~/.config/gmacs/plugins/`
+
+A plugin is just config that can be shared: in Scheme, `defcommand` and
+`define-key`; in Lua, `gmacs.command` and `gmacs.map`. To publish one, put
+its folder in a git repository.
 
 ## Markdown
 

@@ -41,6 +41,7 @@ const CORE_FILES: &[(&str, &str)] = &[
     ("92-syntax.scm", include_str!("../lisp/core/92-syntax.scm")),
     ("95-modeline.scm", include_str!("../lisp/core/95-modeline.scm")),
     ("97-lua.scm", include_str!("../lisp/core/97-lua.scm")),
+    ("98-plugins.scm", include_str!("../lisp/core/98-plugins.scm")),
 ];
 
 /// The core files joined, each under a comment naming it (errors show the
@@ -162,8 +163,11 @@ pub struct Lisp {
     /// Lua files loaded after the Scheme (init.lua), and when they last changed.
     lua_sources: Vec<PathBuf>,
     lua_stamps: Vec<Option<SystemTime>>,
-    /// The source texts of the last load that succeeded, to fall back on.
-    last_good: Option<Vec<String>>,
+    /// Where plugins live (~/.config/gmacs/plugins), and their files' state.
+    plugin_dir: Option<PathBuf>,
+    plugin_signature: Vec<(PathBuf, Option<SystemTime>)>,
+    /// Each source's last text that loaded, by label, to fall back on.
+    last_good: std::collections::HashMap<String, String>,
 }
 
 impl Lisp {
@@ -172,7 +176,20 @@ impl Lisp {
         Self::with_lua(editor, sources, Vec::new())
     }
 
+    #[cfg(test)]
     pub fn with_lua(editor: Editor, sources: Vec<Source>, lua_sources: Vec<PathBuf>) -> Self {
+        Self::with_config(editor, sources, lua_sources, None)
+    }
+
+    /// `sources[0]` is the core; plugins load after it, then the rest
+    /// (init.scm), then plugins' Lua, then `lua_sources` (init.lua).
+    pub fn with_config(
+        editor: Editor,
+        sources: Vec<Source>,
+        lua_sources: Vec<PathBuf>,
+        plugin_dir: Option<PathBuf>,
+    ) -> Self {
+        editor.lock().plugin_dir = plugin_dir.clone();
         let lua = Arc::new(Mutex::new(fresh_lua(&editor)));
         let mut lisp = Self {
             engine: fresh_engine(&editor, &lua),
@@ -182,10 +199,17 @@ impl Lisp {
             sources,
             lua_stamps: vec![None; lua_sources.len()],
             lua_sources,
-            last_good: None,
+            plugin_dir,
+            plugin_signature: Vec::new(),
+            last_good: Default::default(),
         };
         lisp.reload();
         lisp
+    }
+
+    /// ~/.config/gmacs/plugins.
+    pub fn default_plugin_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/gmacs/plugins"))
     }
 
     /// The user's Lua: ~/.config/gmacs/init.lua.
@@ -195,30 +219,43 @@ impl Lisp {
             .unwrap_or_default()
     }
 
-    /// Loads the Lua files into a fresh Lua (so a reload starts clean, like
-    /// Scheme's), then runs the Scheme they queued. Returns the files loaded.
-    fn load_lua(&mut self) -> Vec<String> {
+    /// Loads Lua into a fresh Lua (so a reload starts clean, like Scheme's):
+    /// the plugins' first, each able to `require` from its own folder, then
+    /// `lua_sources`. Runs the Scheme they queue. Returns what loaded, and
+    /// errors (a plugin's name with its error) without stopping.
+    fn load_lua(&mut self, plugins: &[crate::plugins::Plugin]) -> (Vec<String>, Vec<(Option<String>, String)>) {
         *self.lua.lock().unwrap_or_else(|e| e.into_inner()) = fresh_lua(&self.editor);
         let mut loaded = Vec::new();
+        let mut errors = Vec::new();
+        let plugin_files = plugins
+            .iter()
+            .filter(|p| !p.disabled)
+            .filter_map(|p| Some((Some(p.name.clone()), p.lua.clone()?, Some(p.lua_root()))));
         for (i, path) in self.lua_sources.clone().iter().enumerate() {
             self.lua_stamps[i] = path.metadata().ok().and_then(|m| m.modified().ok());
-            let Ok(code) = std::fs::read_to_string(path) else { continue };
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        }
+        let user_files = self.lua_sources.clone().into_iter().map(|p| (None, p, None));
+        for (plugin, path, root) in plugin_files.chain(user_files).collect::<Vec<_>>() {
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            let label = plugin.clone().unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
             let result = {
                 let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
-                lua.load(code).set_name(&name).exec()
-            };
-            match result {
-                Ok(()) => loaded.push(name),
-                Err(e) => {
-                    self.run_pending_scheme();
-                    self.editor.lock().message = format!("{name}: {}", first_line(&e));
-                    return loaded;
+                if let Some(root) = &root {
+                    // require("x") finds x.lua in the plugin's folder or its lua/.
+                    let root = root.display().to_string().replace('\\', "/");
+                    let _ = lua
+                        .load(format!("package.path = {root:?} .. '/?.lua;' .. {root:?} .. '/lua/?.lua;' .. package.path"))
+                        .exec();
                 }
+                lua.load(code).set_name(&label).exec()
+            };
+            self.run_pending_scheme();
+            match result {
+                Ok(()) => loaded.push(label),
+                Err(e) => errors.push((plugin, format!("{label}: {}", first_line(&e)))),
             }
         }
-        self.run_pending_scheme();
-        loaded
+        (loaded, errors)
     }
 
     /// Runs the Scheme Lua queued (gmacs.scheme), quietly unless it fails.
@@ -273,48 +310,97 @@ impl Lisp {
         out
     }
 
-    /// Re-evaluates every source in order. Redefinitions replace the old ones;
-    /// the buffer and its text are untouched. When a source fails to load, the
-    /// interpreter is rebuilt from the last texts that loaded, so a bad save
-    /// never leaves the editor without its commands; the error is shown.
+    /// Loads everything again, in order: the core, plugins, the user's
+    /// Scheme, then plugins' Lua and the user's Lua. Buffers are untouched.
+    /// When something fails to load, the interpreter is rebuilt from what
+    /// loaded before it (so the failure leaves nothing half-defined) and that
+    /// source's last version that loaded is used, if there is one; the rest
+    /// still load, and the error is shown. A failing plugin is marked failed.
     pub fn reload(&mut self) {
-        let texts: Vec<Option<String>> = self.sources.iter().map(Source::read).collect();
+        use crate::plugins::Status;
+        let plugins = self.plugin_dir.as_deref().map(crate::plugins::discover).unwrap_or_default();
+        self.plugin_signature = self.plugin_dir.as_deref().map(crate::plugins::signature).unwrap_or_default();
         for (i, src) in self.sources.iter().enumerate() {
             self.stamps[i] = src.mtime();
         }
-        match self.load(&texts) {
-            Ok(mut loaded) => {
-                self.last_good = Some(texts.into_iter().flatten().collect());
-                self.editor.lock().message.clear();
-                loaded.extend(self.load_lua());
-                let mut st = self.editor.lock();
-                if st.message.is_empty() {
-                    st.message = format!("loaded {}", loaded.join(", "));
-                }
-            }
-            Err(error) => {
-                if let Some(good) = self.last_good.clone() {
-                    self.engine = fresh_engine(&self.editor, &self.lua);
-                    for code in good {
-                        let _ = self.engine.run(code);
-                    }
-                    self.load_lua();
-                    self.editor.lock().message = format!("{error} (kept the last version that loaded)");
-                } else {
-                    self.editor.lock().message = error;
-                }
-            }
-        }
-    }
 
-    fn load(&mut self, texts: &[Option<String>]) -> Result<Vec<String>, String> {
-        let mut loaded = Vec::new();
-        for (src, code) in self.sources.iter().zip(texts) {
-            let Some(code) = code else { continue };
-            self.engine.run(code.clone()).map_err(|e| format!("{}: {e}", src.label))?;
-            loaded.push(src.label.clone());
+        // The Scheme to load, in order: (label, text, plugin name).
+        let mut items: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        if let Some(core) = self.sources.first() {
+            items.push((core.label.clone(), core.read(), None));
         }
-        Ok(loaded)
+        for p in plugins.iter().filter(|p| !p.disabled) {
+            if let Some(file) = &p.scheme {
+                items.push((p.name.clone(), std::fs::read_to_string(file).ok(), Some(p.name.clone())));
+            }
+        }
+        for src in self.sources.iter().skip(1) {
+            items.push((src.label.clone(), src.read(), None));
+        }
+
+        let mut statuses: std::collections::HashMap<String, Status> = plugins
+            .iter()
+            .map(|p| (p.name.clone(), if p.disabled { Status::Disabled } else { Status::Loaded }))
+            .collect();
+        let mut errors: Vec<String> = Vec::new();
+        let mut good: Vec<String> = Vec::new();
+        let mut loaded: Vec<String> = Vec::new();
+        for (label, text, plugin) in items {
+            let Some(text) = text else { continue };
+            match self.engine.run(text.clone()) {
+                Ok(_) => {
+                    good.push(text.clone());
+                    self.last_good.insert(label.clone(), text);
+                    if plugin.is_none() {
+                        loaded.push(label);
+                    }
+                }
+                Err(e) => {
+                    let error = format!("{label}: {e}");
+                    self.engine = fresh_engine(&self.editor, &self.lua);
+                    for t in &good {
+                        let _ = self.engine.run(t.clone());
+                    }
+                    let kept = self.last_good.get(&label).cloned().filter(|old| self.engine.run(old.clone()).is_ok());
+                    match kept {
+                        Some(old) => {
+                            good.push(old);
+                            errors.push(format!("{error} (kept the last version that loaded)"));
+                        }
+                        None => errors.push(error),
+                    }
+                    if let Some(name) = plugin {
+                        statuses.insert(name, Status::Failed(first_line(&e)));
+                    }
+                }
+            }
+        }
+
+        let (lua_loaded, lua_errors) = self.load_lua(&plugins);
+        for (plugin, error) in lua_errors {
+            if let Some(name) = plugin {
+                statuses.insert(name, Status::Failed(error.clone()));
+            }
+            errors.push(error);
+        }
+        loaded.extend(lua_loaded.into_iter().filter(|l| !plugins.iter().any(|p| &p.name == l)));
+
+        let enabled = plugins.iter().filter(|p| matches!(statuses.get(&p.name), Some(Status::Loaded))).count();
+        let mut st = self.editor.lock();
+        st.plugins = plugins.into_iter().map(|p| {
+            let status = statuses.remove(&p.name).unwrap_or(Status::Loaded);
+            (p, status)
+        }).collect();
+        st.message = match errors.first() {
+            Some(first) if errors.len() > 1 => format!("{first} (and {} more)", errors.len() - 1),
+            Some(first) => first.clone(),
+            None => {
+                if enabled > 0 {
+                    loaded.insert(1.min(loaded.len()), format!("{enabled} plugin{}", if enabled == 1 { "" } else { "s" }));
+                }
+                format!("loaded {}", loaded.join(", "))
+            }
+        };
     }
 
     /// Reloads when any source file changed since the last load.
@@ -324,7 +410,15 @@ impl Lisp {
             .iter()
             .zip(&self.lua_stamps)
             .any(|(p, old)| p.metadata().ok().and_then(|m| m.modified().ok()) != *old);
-        let changed = lua_changed || self.sources.iter().zip(&self.stamps).any(|(s, old)| s.mtime() != *old);
+        let plugins_changed = self
+            .plugin_dir
+            .as_deref()
+            .is_some_and(|dir| crate::plugins::signature(dir) != self.plugin_signature);
+        let requested = std::mem::take(&mut self.editor.lock().reload_requested);
+        let changed = requested
+            || lua_changed
+            || plugins_changed
+            || self.sources.iter().zip(&self.stamps).any(|(s, old)| s.mtime() != *old);
         if changed {
             self.reload();
         }
@@ -1045,6 +1139,105 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "minibuffer-close", |s| s.minibuffer_prompt = None);
     prim!(reg, editor, "minibuffer-active?", |s| s.minibuffer_prompt.is_some());
     prim!(reg, editor, "minibuffer-contents", |s| s.minibuffer.text().to_string());
+
+    // Plugins.
+    prim!(reg, editor, "plugin-list", |s| s
+        .plugins
+        .iter()
+        .map(|(p, status)| {
+            let state = match status {
+                crate::plugins::Status::Loaded => "loaded".to_string(),
+                crate::plugins::Status::Disabled => "off".to_string(),
+                crate::plugins::Status::Failed(e) => format!("failed: {e}"),
+            };
+            format!("{}  ({})  {state}", p.name, p.languages())
+        })
+        .collect::<Vec<_>>());
+    prim!(reg, editor, "plugin-dir", |s| s.plugin_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default());
+    // Turns a plugin on or off, then reloads.
+    prim!(reg, editor, "plugin-toggle", |s, name: String| {
+        let Some((plugin, _)) = s.plugins.iter().find(|(p, _)| p.name == name).cloned() else {
+            s.message = format!("no plugin named {name}");
+            return;
+        };
+        match crate::plugins::set_disabled(&plugin, !plugin.disabled) {
+            Ok(()) => {
+                s.message = format!("{name} {}", if plugin.disabled { "on" } else { "off" });
+                s.reload_requested = true;
+            }
+            Err(e) => s.message = format!("{name}: {e}"),
+        }
+    });
+    prim!(reg, editor, "plugin-remove", |s, name: String| {
+        let Some(dir) = s.plugin_dir.clone() else { return };
+        s.message = match crate::plugins::remove(&dir, &name) {
+            Ok(()) => {
+                s.reload_requested = true;
+                format!("removed {name}")
+            }
+            Err(e) => e,
+        };
+    });
+    // git clone and pull run off the UI thread; they reload when done.
+    {
+        let ed = editor.clone();
+        let install = move |url: String| {
+            let Some(dir) = ed.lock().plugin_dir.clone() else { return };
+            ed.lock().message = format!("installing {url}...");
+            let ed = ed.clone();
+            std::thread::spawn(move || {
+                let result = crate::plugins::install(&dir, &url);
+                let mut st = ed.lock();
+                st.message = match result {
+                    Ok(name) => {
+                        st.reload_requested = true;
+                        format!("installed {name}")
+                    }
+                    Err(e) => format!("install failed: {e}"),
+                };
+            });
+        };
+        if let Some(engine) = reg.engine.as_mut() {
+            engine.register_fn("plugin-install", install.clone());
+        }
+        if let Some((lua, gmacs)) = reg.lua.as_ref() {
+            let f = lua.create_function(move |_, url: String| {
+                install(url);
+                Ok(())
+            });
+            gmacs.set("plugin_install", f.expect("a Lua function")).expect("set in gmacs");
+        }
+    }
+    {
+        let ed = editor.clone();
+        let update = move || {
+            let Some(dir) = ed.lock().plugin_dir.clone() else { return };
+            ed.lock().message = "updating plugins...".into();
+            let ed = ed.clone();
+            std::thread::spawn(move || {
+                let results = crate::plugins::update_all(&dir);
+                let failed: Vec<String> =
+                    results.iter().filter_map(|(n, r)| r.as_ref().err().map(|e| format!("{n}: {e}"))).collect();
+                let mut st = ed.lock();
+                st.reload_requested = true;
+                st.message = if failed.is_empty() {
+                    format!("updated {} plugin{}", results.len(), if results.len() == 1 { "" } else { "s" })
+                } else {
+                    failed.join("; ")
+                };
+            });
+        };
+        if let Some(engine) = reg.engine.as_mut() {
+            engine.register_fn("plugin-update", update.clone());
+        }
+        if let Some((lua, gmacs)) = reg.lua.as_ref() {
+            let f = lua.create_function(move |_, ()| {
+                update();
+                Ok(())
+            });
+            gmacs.set("plugin_update", f.expect("a Lua function")).expect("set in gmacs");
+        }
+    }
 
     // Scheme for Lua to run (gmacs.scheme), silently, after the current command.
     prim!(reg, editor, "scheme", |s, code: String| s.pending_scheme.push(code));
@@ -2626,6 +2819,125 @@ mod tests {
         assert_eq!(text(&editor).len(), "TODO: ".len() + "2026-01-01".len());
         let modeline = lisp.modeline();
         assert_eq!(modeline[0].text, "notes ●");
+    }
+
+    /// A plugins folder with: `zen` (Scheme), `wc` (Lua, requiring a module
+    /// of its own), `broken` (bad Scheme), `off` (disabled), and `stamp.lua`.
+    fn plugin_setup(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("gmacs-plugin-load-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("plugins");
+        let write = |rel: &str, text: &str| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("zen/init.scm", r#"(defcommand (zen-insert) (insert "zen")) (define-key normal-map "Z" 'zen-insert)"#);
+        write("wc/init.lua", r#"local util = require("wc_util")
+gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_string()) .. " words") end)"#);
+        write("wc/lua/wc_util.lua", "return { count = function(s) local n = 0 for _ in s:gmatch('%S+') do n = n + 1 end return n end }");
+        write("broken/init.scm", "(define (oops) (no-such-function))");
+        write("off/init.scm", r#"(defcommand (off-insert) (insert "off"))"#);
+        write("off/disabled", "");
+        write("stamp.lua", r#"gmacs.command("stamp", function() gmacs.insert("stamped") end)"#);
+        (base, dir)
+    }
+
+    fn with_plugins(dir: &Path, init_scm: Option<&Path>) -> (Lisp, Editor) {
+        let editor = Editor::new(Buffer::new("t"));
+        let mut sources = vec![Source { label: "core".into(), path: None }];
+        if let Some(init) = init_scm {
+            sources.push(Source { label: "init.scm".into(), path: Some(init.to_path_buf()) });
+        }
+        let lisp = Lisp::with_config(editor.clone(), sources, vec![], Some(dir.to_path_buf()));
+        (lisp, editor)
+    }
+
+    #[test]
+    fn plugins_load_and_a_broken_one_is_skipped() {
+        let (base, dir) = plugin_setup("load");
+        let (mut lisp, editor) = with_plugins(&dir, None);
+        {
+            let m = editor.lock().message.clone();
+            assert!(m.starts_with("broken: "), "the broken plugin's error is shown: {m}");
+        }
+        typed(&mut lisp, "Z");
+        assert_eq!(text(&editor), "zen", "a Scheme plugin's key");
+        typed(&mut lisp, " :stamp\n");
+        assert!(text(&editor).contains("stamped"), "a single-file Lua plugin");
+        typed(&mut lisp, " :word-count\n");
+        assert_eq!(editor.lock().message, "1 words", "a Lua plugin requiring its own module");
+        typed(&mut lisp, " :off-insert\n");
+        assert_eq!(editor.lock().message, "off-insert is not a command", "disabled plugins don't load");
+        typed(&mut lisp, "0x");
+        assert_eq!(text(&editor).chars().count(), "zenstamped".len() - 1, "the core still works");
+
+        let list = lisp.eval("(plugin-list)").unwrap();
+        assert!(list.contains("broken  (scheme)  failed:"), "{list}");
+        assert!(list.contains("off  (scheme)  off") && list.contains("wc  (lua)  loaded"), "{list}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_users_init_loads_after_plugins() {
+        let (base, dir) = plugin_setup("order");
+        std::fs::remove_dir_all(dir.join("broken")).unwrap();
+        let init = base.join("init.scm");
+        std::fs::write(&init, r#"(define-key normal-map "Z" (lambda () (insert "mine")))"#).unwrap();
+        let (mut lisp, editor) = with_plugins(&dir, Some(&init));
+        assert_eq!(editor.lock().message, "loaded core, 3 plugins, init.scm");
+        typed(&mut lisp, "Z");
+        assert_eq!(text(&editor), "mine", "init.scm overrides the plugin's key");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn spc_h_p_toggles_plugins_and_edits_reload() {
+        let (base, dir) = plugin_setup("toggle");
+        std::fs::remove_dir_all(dir.join("broken")).unwrap();
+        let (mut lisp, editor) = with_plugins(&dir, None);
+        typed(&mut lisp, " hp");
+        assert!(editor.lock().picker.is_some());
+        typed(&mut lisp, "zen\n");
+        assert!(editor.lock().reload_requested);
+        assert!(lisp.reload_if_changed());
+        typed(&mut lisp, " :zen-insert\n");
+        assert_eq!(editor.lock().message, "zen-insert is not a command", "turned off");
+        assert!(dir.join("zen/disabled").exists());
+
+        lisp.eval(r#"(plugin-toggle "zen")"#).unwrap();
+        assert!(lisp.reload_if_changed());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("zen/init.scm"), r#"(defcommand (zen-insert) (insert "zen 2"))"#).unwrap();
+        assert!(lisp.reload_if_changed(), "editing a plugin reloads it");
+        typed(&mut lisp, " :zen-insert\n");
+        assert_eq!(text(&editor), "zen 2");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_plugin_fixed_on_disk_comes_back() {
+        let (base, dir) = plugin_setup("fix");
+        let (mut lisp, editor) = with_plugins(&dir, None);
+        std::fs::write(dir.join("broken/init.scm"), r#"(defcommand (fixed) (insert "fixed"))"#).unwrap();
+        lisp.reload();
+        typed(&mut lisp, " :fixed\n");
+        assert_eq!(text(&editor), "fixed");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_example_plugins_load() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/plugins");
+        let (mut lisp, editor) = with_plugins(&dir, None);
+        assert_eq!(editor.lock().message, "loaded core, 2 plugins");
+        typed(&mut lisp, "ione two\nthree");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " tw");
+        assert_eq!(editor.lock().message, "3 words, 2 lines");
+        typed(&mut lisp, " wv tz");
+        assert_eq!(editor.lock().window_count(), 1);
+        assert_eq!(editor.lock().message, "zen");
     }
 
     #[test]

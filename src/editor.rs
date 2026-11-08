@@ -198,6 +198,11 @@ pub struct EditorState {
     /// Scheme queued by Lua (gmacs.scheme): run silently after the current
     /// command, or after init.lua loads.
     pub pending_scheme: Vec<String>,
+    /// Where plugins live, the plugins found at the last load and how each
+    /// went, and whether something (an install) asked for a reload.
+    pub plugin_dir: Option<PathBuf>,
+    pub plugins: Vec<(crate::plugins::Plugin, crate::plugins::Status)>,
+    pub reload_requested: bool,
     pub quit_requested: bool,
     /// The open fuzzy picker, if any; its query is the minibuffer's text.
     pub picker: Option<Picker>,
@@ -235,6 +240,9 @@ impl EditorState {
             kill_ring: Vec::new(),
             pending_eval: Vec::new(),
             pending_scheme: Vec::new(),
+            plugin_dir: None,
+            plugins: Vec::new(),
+            reload_requested: false,
             quit_requested: false,
             picker: None,
             lsp: Lsp::default(),
