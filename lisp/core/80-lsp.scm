@@ -60,6 +60,10 @@
           (let ((dot (let loop ((i 0)) (if (equal? (substring item i (+ i 1)) ".") i (loop (+ i 1))))))
             (apply-code-action (- (string->number (substring item 0 dot)) 1))))))
 
+;; SPC c R or :lsp-restart: stop the language servers and start them again
+;; (also those that failed to start, e.g. after installing one).
+(defcommand (lsp-restart-command) (lsp-restart))
+
 ;; SPC c f: format the file, or the selected lines.
 (defcommand (format-buffer)
   (if (visual?)

@@ -10,6 +10,11 @@
 ;; sends it (C-RET or Cmd-RET from insert state). On a tool call, RET or TAB opens and
 ;; closes its details; on a file it touched, RET visits it.
 ;;
+;; When it asks permission (to edit, to run a command, to start coding
+;; after a plan), *agent* shows the question, what it's about (the plan, the
+;; command, the diff) and the choices: press a choice's number, or RET on
+;; it. SPC a p picks from a list instead.
+;;
 ;; SPC a a: type to the agent      SPC a s: ask about the line or selection
 ;; SPC a c: cancel the run         SPC a p: answer a permission it waits on
 ;; SPC a n: a new conversation     SPC a k: stop the agent
@@ -97,6 +102,12 @@
   (read-from-minibuffer "Ask about the problems: "
     (lambda (question) (agent-ask-about-problems question))))
 
+;; While it waits for permission, 1-9 in *agent* answer with that choice.
+(for-each (lambda (n)
+            (define-key agent-map (number->string n)
+              (lambda () (when (agent-permission-waiting?) (agent-permit (- n 1))))))
+          (list 1 2 3 4 5 6 7 8 9))
+
 (define-key agent-insert-map "C-RET" 'agent-send)
 (define-key agent-insert-map "s-RET" 'agent-send)
 
@@ -109,7 +120,7 @@
   (let ((options (agent-permission-options)))
     (if (null? options)
         (message "The agent isn't waiting for permission")
-        (pick (string-append "Allow " (agent-permission-title) "?") options ""
+        (pick (agent-permission-question) options ""
               agent-choose-permission))))
 
 ;;;; Choosing the agent, rules and hooks
@@ -156,9 +167,13 @@
     (cond ((and (equal? rule "allow") (agent-permit-kind "allow_once")) #t)
           ((and (equal? rule "always") (agent-permit-kind "allow_always")) #t)
           ((and (equal? rule "reject") (agent-permit-kind "reject_once")) #t)
-          ((minibuffer-active?)
-           (message (string-append "The agent asks to " title ": SPC a p to answer")))
-          (else (call-binding 'agent-permission)))))
+          ;; Typing (a prompt, insert state): don't take the cursor away.
+          ((or (minibuffer-active?) (equal? evil-state 'insert))
+           (message (string-append "The agent asks: " (agent-permission-question) " (SPC a p, or answer in *agent*)")))
+          ;; Else: *agent* at the question, to read what it's about first.
+          (else
+           (agent-show-permission)
+           (message (string-append (agent-permission-question) " Read it, then press a choice's number"))))))
 
 (define (agent-tool-event args)
   (let ((title (second args)) (kind (third args)) (status (list-ref args 3)))

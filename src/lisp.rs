@@ -533,6 +533,12 @@ impl Lisp {
     }
 
     /// Calls Scheme's `(cursor-shape)`: "box" or "bar".
+    /// Calls Scheme's `(markdown-raw?)`: whether the selected window shows
+    /// Markdown as typed (insert state) rather than with its markup hidden.
+    pub fn markdown_raw(&mut self) -> bool {
+        matches!(self.engine.call_function_by_name_with_args("markdown-raw?", vec![]), Ok(SteelVal::BoolV(true)))
+    }
+
     pub fn cursor_shape(&mut self) -> String {
         match self.engine.call_function_by_name_with_args("cursor-shape", vec![]) {
             Ok(SteelVal::SymbolV(s)) | Ok(SteelVal::StringV(s)) => s.to_string(),
@@ -1310,6 +1316,14 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "lsp-format", |s| s.lsp_format(None));
     prim!(reg, editor, "lsp-format-range", |s, start: isize, end: isize| s
         .lsp_format(Some((start.max(0) as usize, end.max(0) as usize))));
+    prim!(reg, editor, "lsp-restart", |s| {
+        let n = s.lsp.restart();
+        s.message = match n {
+            0 => "Starting the language servers again".into(),
+            1 => "Restarting the language server".into(),
+            n => format!("Restarting {n} language servers"),
+        };
+    });
     prim!(reg, editor, "lsp-code-actions", |s, start: isize, end: isize| s
         .lsp_code_actions(start.max(0) as usize, end.max(0) as usize));
     prim!(reg, editor, "apply-code-action", |s, index: isize| s.apply_code_action(index.max(0) as usize));
@@ -1529,15 +1543,29 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "font", |s| s.font.clone().unwrap_or_default());
     // Light or dark: "system" follows the system's appearance as it changes.
-    prim!(reg, editor, "set-theme", |s, mode: String| {
-        if matches!(mode.as_str(), "system" | "light" | "dark") {
-            s.message = format!("theme: {mode}");
-            s.theme_mode = mode;
-        } else {
-            s.message = format!("{mode}: the theme is system, light or dark");
-        }
+    prim!(reg, editor, "set-theme", |s, name: String| s.set_theme(&name));
+    prim!(reg, editor, "set-themes", |s, light: String, dark: String| s.set_themes(&light, &dark));
+    prim!(reg, editor, "theme-list", |s| s.theme_names.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+    prim!(reg, editor, "theme-name", |s| {
+        let dark = match s.theme_mode.as_str() { "dark" => true, "light" => false, _ => s.system_dark };
+        s.theme_name(dark)
     });
     prim!(reg, editor, "theme", |s| s.theme_mode.clone());
+    // Markdown: the preview pane, and markup hidden outside insert state.
+    prim!(reg, editor, "markdown-preview-toggle", |s| {
+        s.markdown_preview = !s.markdown_preview;
+        s.message = match (s.markdown_preview, s.preview_buffer().is_some()) {
+            (false, _) => "Preview closed".into(),
+            (true, true) => "Preview: the Markdown file you're in".into(),
+            (true, false) => "Preview on: open a Markdown file".into(),
+        };
+    });
+    prim!(reg, editor, "set-markdown-preview", |s, on: bool| s.markdown_preview = on);
+    prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
+    prim!(reg, editor, "markdown-conceal-toggle", |s| {
+        s.markdown_conceal = !s.markdown_conceal;
+        s.message = if s.markdown_conceal { "Markdown: markup hidden (shown while typing)".into() } else { "Markdown: as typed".into() };
+    });
     // The coding agent (ACP): prompts, permission answers, how to start it.
     prim!(reg, editor, "agent-prompt", |s, text: String| s.agent_prompt(&text));
     prim!(reg, editor, "agent-show", |s| s.agent_show());
@@ -1601,6 +1629,9 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "agent-status", |s| s.agent_status());
     prim!(reg, editor, "agent-permission-options", |s| s.agent_permission_options());
     prim!(reg, editor, "agent-permission-title", |s| s.agent_permission_title());
+    prim!(reg, editor, "agent-permission-question", |s| s.agent_permission_question());
+    prim!(reg, editor, "agent-permission-waiting?", |s| s.agent_permission_waiting());
+    prim!(reg, editor, "agent-show-permission", |s| s.agent_show_permission());
     prim!(reg, editor, "agent-permit", |s, index: isize| s.agent_permit(index.max(0) as usize));
     prim!(reg, editor, "set-agent-command", |s, line: String| {
         if s.agent_define("custom", &line) {
@@ -2915,9 +2946,15 @@ mod tests {
             }
             false
         };
-        assert!(pump(&mut lisp, &|s| s.picker.is_some()), "the permission picker opened: {}", editor.lock().message);
-        assert!(editor.lock().picker.as_ref().unwrap().title().contains("Allow Edit"));
-        lisp.dispatch_key("RET", "");
+        // It asks: *agent* shows the question, what it's about, and the choices.
+        assert!(pump(&mut lisp, &|s| s.agent_permission_waiting()), "{}", editor.lock().message);
+        assert!(editor.lock().picker.is_none(), "no picker over it");
+        let shown = editor.lock().buffer().text().to_string();
+        assert!(shown.contains("⚠ Allow Edit notes.txt?\n\n  Shout the file.\n\n  - read it\n  - upper-case it\n\n  1  Allow\n  2  Reject\n"), "{shown}");
+        let line = editor.lock().buffer().line();
+        assert!(shown.lines().nth(line).unwrap().starts_with("⚠ Allow Edit"), "the cursor is on the question");
+        assert!(editor.lock().message.contains("Allow Edit notes.txt?"));
+        typed(&mut lisp, "1");
         assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("✓ Edit")));
 
         let transcript = editor.lock().buffer().text().to_string();
@@ -2981,7 +3018,11 @@ mod tests {
         // A tool call: TAB opens it; RET on its file visits it.
         let path = file.display().to_string();
         editor.lock().agent.as_mut().unwrap().prompt(&format!("edit {path}"));
-        assert!(pump(&mut lisp, &|s| s.picker.is_some()));
+        assert!(pump(&mut lisp, &|s| s.agent_permission_waiting()));
+        // RET on a choice answers.
+        let allow = text().lines().position(|l| l == "  1  Allow").unwrap();
+        let pos = editor.lock().buffer().line_to_pos(allow);
+        editor.lock().buffer_mut().goto_char(pos);
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("▸ ✓ Edit lib.rs")), "{}", text());
         assert!(text().ends_with("─\nnext"), "the prompt survived: {:?}", text());
@@ -3339,6 +3380,57 @@ mod tests {
         assert_eq!(*board.lock().unwrap(), "elsewhere", "the yank stayed in vmac");
         typed(&mut lisp, "P");
         assert!(text(&editor).starts_with("one twoFROM MACone\none twoFROM MACone\n"), "{}", text(&editor));
+    }
+
+    #[test]
+    fn themes_by_name_and_the_markdown_views() {
+        let dir = std::env::temp_dir().join(format!("vmac-md-views-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().theme_names = vec![("Default Light".into(), false), ("Catppuccin Latte".into(), false), ("Catppuccin Mocha".into(), true)];
+
+        // A theme by name switches to its mode; system follows again.
+        typed(&mut lisp, ":theme catppuccin mocha");
+        lisp.dispatch_key("RET", "");
+        let (mode, dark) = { let st = editor.lock(); (st.theme_mode.clone(), st.dark_theme.clone()) };
+        assert_eq!((mode.as_str(), dark.as_str()), ("dark", "Catppuccin Mocha"));
+        lisp.eval(r#"(set-themes "Catppuccin Latte" "Catppuccin Mocha")"#).unwrap();
+        assert_eq!(editor.lock().theme_mode, "system");
+        assert_eq!(editor.lock().theme_name(false), "Catppuccin Latte");
+        lisp.eval(r#"(set-theme "Nope")"#).unwrap();
+        assert!(editor.lock().message.contains("No theme called Nope"));
+        lisp.eval("(call-binding 'theme-picker)").unwrap();
+        assert_eq!(editor.lock().picker.as_ref().map(|p| p.title().to_string()).as_deref(), Some("Theme"));
+        lisp.dispatch_key("ESC", "");
+        lisp.dispatch_key("ESC", "");
+
+        // Markup is hidden outside insert state; raw while typing.
+        assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#false");
+        typed(&mut lisp, "i");
+        assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#true");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " tm");
+        assert!(!editor.lock().markdown_conceal);
+
+        // The preview takes the right of the editor while a Markdown file shows.
+        let notes = dir.join("notes.md");
+        std::fs::write(&notes, "# Notes\n").unwrap();
+        typed(&mut lisp, " mp");
+        assert!(editor.lock().preview_rect().is_none(), "nothing to preview yet");
+        editor.lock().open_file(&notes).unwrap();
+        let (rect, widest) = {
+            let st = editor.lock();
+            (st.preview_rect(), st.window_rects().iter().map(|(_, r)| r.x + r.w).fold(0., f32::max))
+        };
+        assert!(rect.is_some());
+        assert!((widest - (1. - crate::editor::PREVIEW_WIDTH)).abs() < 1e-4, "windows make room: {widest}");
+        let code = dir.join("main.rs");
+        std::fs::write(&code, "fn main() {}\n").unwrap();
+        editor.lock().open_file(&code).unwrap();
+        assert!(editor.lock().preview_rect().is_some(), "from another file, it keeps showing the last Markdown file");
+        typed(&mut lisp, " mp");
+        assert!(editor.lock().preview_rect().is_none(), "closed");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// vmac on a file served by the fake language server (lsp.rs's tests).

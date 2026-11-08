@@ -71,13 +71,14 @@
         (list "SPC p d" 'project-forget-command) (list "SPC f P" 'open-config)
         (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
         (list "SPC o t" 'terminal-toggle) (list "SPC o T" 'terminal-new)
-        (list "SPC h F" 'font-picker)
-        (list "SPC m a" 'table-align)
+        (list "SPC h F" 'font-picker) (list "SPC h t" 'theme-picker)
+        (list "SPC m a" 'table-align) (list "SPC m p" 'markdown-preview)
+        (list "SPC t m" 'markdown-conceal)
         ;; Language servers
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
         (list "g d" 'goto-definition) (list "g r" 'find-references)
         (list "SPC c r" 'rename-symbol) (list "SPC c a" 'code-actions)
-        (list "SPC c f" 'format-buffer)
+        (list "SPC c f" 'format-buffer) (list "SPC c R" 'lsp-restart-command)
         (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
         (list "SPC c x" 'diagnostic-list)
         ;; The coding agent

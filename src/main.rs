@@ -15,6 +15,7 @@ mod projects;
 mod shell;
 mod syntax;
 mod terminal;
+mod themes;
 
 use buffer::Buffer;
 use editor::Editor;

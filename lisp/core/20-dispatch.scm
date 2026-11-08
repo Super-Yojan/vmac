@@ -22,6 +22,8 @@
        (equal? pending-keys "")
        ;; On the dashboard, digits open its projects.
        (not (and (dashboard-here?) (not (minibuffer-active?))))
+       ;; In *agent*, while it waits for permission, digits answer it.
+       (not (and (agent-here?) (agent-permission-waiting?) (not (minibuffer-active?))))
        (or (contains? '("1" "2" "3" "4" "5" "6" "7" "8" "9") text)
            (and (equal? text "0") (not (equal? pending-count ""))))))
 

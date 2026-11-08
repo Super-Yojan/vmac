@@ -14,3 +14,18 @@
 
 (for-each-pair (lambda (k b) (define-key insert-map k b)) completion-insert-keys)
 
+
+;;;; Viewing Markdown
+;;
+;; Outside insert state, Markdown shows without its markup: headings
+;; without #, bold and italic without the stars, code without backticks,
+;; links as their text, bullets, rules and table lines drawn. In insert
+;; state it shows everything, as typed. SPC t m (or
+;; (set-markdown-conceal #f)) shows the markup all the time.
+;;
+;; SPC m p opens a preview beside it instead, rendered like a web page (by
+;; gpui-kit), following the file you're in as you type; again closes it.
+;; (set-markdown-preview #t) opens it from the start.
+
+(defcommand (markdown-preview) (markdown-preview-toggle))
+(defcommand (markdown-conceal) (markdown-conceal-toggle))

@@ -641,6 +641,18 @@ impl std::fmt::Debug for Lsp {
 }
 
 impl Lsp {
+    /// Stops the servers and forgets which failed: the next `pump` starts
+    /// them again for the open files. Returns how many were running.
+    pub fn restart(&mut self) -> usize {
+        let n = self.clients.len();
+        self.clients.clear();
+        self.failed.clear();
+        self.diagnostics.clear();
+        self.replies.clear();
+        self.status.clear();
+        n
+    }
+
     pub fn set_configs(&mut self, configs: Vec<ServerConfig>) {
         self.configs = configs;
     }
@@ -1309,6 +1321,37 @@ while True:
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(notice.as_deref(), Some("sh stopped: error: no such toolchain"));
+    }
+
+    #[test]
+    fn restarting_starts_servers_again_even_failed_ones() {
+        let dir = std::env::temp_dir().join(format!("vmac-lsp-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("server.py");
+        let file = dir.join("main.fake");
+        let mut lsp = Lsp::default();
+        lsp.set_configs(vec![ServerConfig {
+            language: "rust".into(),
+            command: "python3".into(),
+            args: vec![server.display().to_string()],
+        }]);
+        let doc = Doc { path: file.clone(), language: "rust", revision: 1, saves: 0, text: Rope::from_str("ab\n") };
+        let docs = vec![doc];
+
+        // The server isn't there yet: it fails, and isn't tried again.
+        assert!(wait_for(&mut lsp, &docs, &dir, |l| l.failed.len() == 1));
+        assert!(lsp.diagnostics(&file).is_empty());
+        std::fs::write(&server, FAKE_SERVER).unwrap();
+        lsp.pump(&docs, |_| dir.clone());
+        assert!(lsp.clients.is_empty(), "a failed server waits for a restart");
+
+        // Restarted, it runs and reports.
+        lsp.restart();
+        assert!(wait_for(&mut lsp, &docs, &dir, |l| !l.diagnostics(&file).is_empty()));
+        assert_eq!(lsp.restart(), 1, "one was running");
+        assert!(lsp.diagnostics(&file).is_empty(), "its diagnostics went with it");
+        assert!(wait_for(&mut lsp, &docs, &dir, |l| !l.diagnostics(&file).is_empty()), "and it starts again");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

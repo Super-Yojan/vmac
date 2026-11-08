@@ -156,6 +156,32 @@ fn content_text(block: &Value) -> String {
     }
 }
 
+/// What a permission request is about, from its tool call: its content
+/// (a plan, a diff), else the plan, command or path it was given.
+fn permission_details(call: &Value) -> String {
+    let content: Vec<String> = call["content"]
+        .as_array()
+        .map(|c| c.iter().map(tool_content_text).filter(|t| !t.trim().is_empty()).collect())
+        .unwrap_or_default();
+    if !content.is_empty() {
+        return content.join("\n\n");
+    }
+    let input = &call["rawInput"];
+    for key in ["plan", "command", "description", "file_path", "path", "url", "query"] {
+        if let Some(v) = input[key].as_str().filter(|v| !v.trim().is_empty()) {
+            return v.to_string();
+        }
+    }
+    String::new()
+}
+
+/// A permission's title as a question: "Allow Edit a.rs?", or the title
+/// itself when it's one already ("Ready to code?").
+pub fn permission_question(title: &str) -> String {
+    let title = title.trim();
+    if title.ends_with('?') { title.to_string() } else { format!("Allow {title}?") }
+}
+
 /// An error's message, with the detail agents put in `data` (often the
 /// real reason, under a generic "Internal error").
 pub fn error_text(error: &Value) -> String {
@@ -199,6 +225,8 @@ pub struct Permission {
     pub title: String,
     /// The tool's kind: read, edit, delete, move, search, execute, fetch...
     pub kind: String,
+    /// What it's about, to read before answering: a plan, a command, a diff.
+    pub details: String,
     pub options: Vec<(String, String, String)>,
 }
 
@@ -522,7 +550,8 @@ impl Agent {
                             })
                             .unwrap_or_default();
                     }
-                    self.permissions.push(Permission { id: id.clone(), title, kind, options });
+                    let details = permission_details(&params["toolCall"]);
+                    self.permissions.push(Permission { id: id.clone(), title, kind, details, options });
                     self.revision += 1;
                 }
                 self.requests.push(Request { id, method, params });
@@ -809,8 +838,41 @@ impl Agent {
                 }
             }
         }
-        for p in &self.permissions {
-            r.styled(&format!("⚠ Allow {}?  SPC a p to answer", shorten(&p.title)), "yellow", Target::None);
+        // Permissions: the first can be answered here; its details to read
+        // first, then its choices (RET on one, or its number).
+        for (n, p) in self.permissions.iter().enumerate() {
+            let question = permission_question(&shorten(&p.title));
+            if n > 0 {
+                r.styled(&format!("⚠ {question}  (after the one above)"), "yellow", Target::None);
+                continue;
+            }
+            r.styled(&format!("⚠ {question}"), "agent-ask", Target::Ask);
+            if !p.details.trim().is_empty() {
+                r.line("", Target::Ask);
+                let mut code = false;
+                for line in p.details.trim().lines() {
+                    let fence = line.trim_start().starts_with("```");
+                    if line.trim().is_empty() {
+                        r.line("", Target::Ask);
+                    } else if code || fence {
+                        r.line(&format!("  {line}"), Target::Ask);
+                    } else {
+                        for piece in wrap(line, width.saturating_sub(2)) {
+                            r.line(&format!("  {piece}"), Target::Ask);
+                        }
+                    }
+                    code ^= fence;
+                }
+                r.line("", Target::Ask);
+            }
+            for (i, (_, name, kind)) in p.options.iter().enumerate() {
+                let face = if kind.starts_with("allow") { "green" } else { "red" };
+                let start = r.chars;
+                r.line(&format!("  {}  {name}", i + 1), Target::Permission(i));
+                r.faces.push((start + 2, start + 3, face));
+            }
+            r.styled("  RET or its number answers · SPC a p picks from a list", "dim", Target::None);
+            r.line("", Target::None);
         }
         if self.state == State::Running && self.permissions.is_empty() {
             r.styled("… working (SPC a c cancels)", "dim", Target::None);
@@ -835,6 +897,10 @@ pub enum Target {
     File(PathBuf, Option<u64>),
     /// A buffer (the terminal a command runs in): RET shows it.
     Buffer(String),
+    /// The permission waiting: its question and details.
+    Ask,
+    /// One of its choices: RET picks it.
+    Permission(usize),
 }
 
 /// The agent buffer's text, its faces (character ranges) and each line's target.
@@ -986,7 +1052,8 @@ while True:
             content = reply_to(100)["result"]["content"]
             update(s, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit " + path, "kind": "edit", "status": "pending"})
             send({"jsonrpc": "2.0", "id": 101, "method": "session/request_permission", "params": {"sessionId": s,
-                  "toolCall": {"toolCallId": "t1", "title": "Edit " + path},
+                  "toolCall": {"toolCallId": "t1", "title": "Edit " + path,
+                               "content": [{"type": "content", "content": {"type": "text", "text": "Shout the file.\n\n- read it\n- upper-case it"}}]},
                   "options": [{"optionId": "yes", "name": "Allow", "kind": "allow_once"},
                               {"optionId": "no", "name": "Reject", "kind": "reject_once"}]}})
             outcome = reply_to(101)["result"]["outcome"]

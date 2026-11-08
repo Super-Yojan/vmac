@@ -317,6 +317,18 @@ pub struct EditorState {
     pub fonts: Vec<String>,
     /// "system" (follow light or dark mode as the system does), "light" or "dark".
     pub theme_mode: String,
+    /// The themes used in light and dark mode ("" for the default ones),
+    /// and the themes there are: (name, dark?), filled in by the view.
+    pub light_theme: String,
+    pub dark_theme: String,
+    pub theme_names: Vec<(String, bool)>,
+    /// Whether the system is in dark mode (set by the view).
+    pub system_dark: bool,
+    /// Markdown: markup hidden outside insert state (headings without #,
+    /// bold without **...), and the preview pane, with the last buffer it showed.
+    pub markdown_conceal: bool,
+    pub markdown_preview: bool,
+    pub preview_last: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The coding agent (ACP), how to start it, its buffer, and the
     /// conversation revision that buffer shows.
@@ -358,6 +370,9 @@ pub struct EditorState {
     events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
 }
+
+/// The Markdown preview's share of the editor's width.
+pub const PREVIEW_WIDTH: f32 = 0.42;
 
 /// The system clipboard, behind its trait.
 pub struct SystemClipboard(pub Box<dyn crate::clipboard::Clipboard>);
@@ -453,6 +468,13 @@ impl EditorState {
             font: None,
             fonts: Vec::new(),
             theme_mode: "system".into(),
+            light_theme: String::new(),
+            dark_theme: String::new(),
+            theme_names: Vec::new(),
+            system_dark: false,
+            markdown_conceal: true,
+            markdown_preview: false,
+            preview_last: None,
             terminals_to_kill: Vec::new(),
             agent: None,
             agent_config: crate::agent::AgentConfig::claude(),
@@ -546,6 +568,10 @@ impl EditorState {
     pub fn show_buffer(&mut self, id: BufferId) {
         if self.buffer_by_id(id).is_none() || self.window().buffer == id {
             return;
+        }
+        // The Markdown file the preview keeps showing from other buffers.
+        if self.buffer_by_id(id).and_then(|b| b.file()).and_then(|f| crate::syntax::language_for_path(f)) == Some("markdown") {
+            self.preview_last = Some(id);
         }
         let point = self.buffer().point();
         self.window_mut().point = point;
@@ -799,8 +825,34 @@ impl EditorState {
             }
             None => 0.,
         };
-        self.layout.rects(Rect { x: left, y: 0., w: 1. - left, h: 1. }, &mut out);
+        // The Markdown preview takes the right side.
+        let right = if self.preview_buffer().is_some() { PREVIEW_WIDTH } else { 0. };
+        self.layout.rects(Rect { x: left, y: 0., w: 1. - left - right, h: 1. }, &mut out);
         out
+    }
+
+    /// The Markdown file the preview shows: the selected window's, else the
+    /// last one it showed. None when the preview is off or has nothing.
+    pub fn preview_buffer(&self) -> Option<BufferId> {
+        if !self.markdown_preview {
+            return None;
+        }
+        let is_markdown = |id: BufferId| {
+            self.buffer_by_id(id)
+                .and_then(|b| b.file())
+                .and_then(|f| crate::syntax::language_for_path(f))
+                == Some("markdown")
+        };
+        let here = self.window().buffer;
+        if is_markdown(here) {
+            return Some(here);
+        }
+        self.preview_last.filter(|&id| is_markdown(id))
+    }
+
+    /// Where the preview goes, as a share of the editor (x, width).
+    pub fn preview_rect(&self) -> Option<Rect> {
+        self.preview_buffer().map(|_| Rect { x: 1. - PREVIEW_WIDTH, y: 0., w: PREVIEW_WIDTH, h: 1. })
     }
 
     /// The window next to the selected one in a direction ("left", "right",
@@ -1232,6 +1284,31 @@ impl EditorState {
 
     pub fn agent_permission_title(&self) -> String {
         self.agent.as_ref().and_then(|a| a.permissions.first()).map(|p| p.title.clone()).unwrap_or_default()
+    }
+
+    /// The waiting permission as a question ("Allow Edit a.rs?", "Ready to code?").
+    pub fn agent_permission_question(&self) -> String {
+        let root = self.agent.as_ref().map(|a| format!("{}/", a.root.display())).unwrap_or_default();
+        let title = self.agent_permission_title();
+        crate::agent::permission_question(&if root.len() > 1 { title.replace(&root, "") } else { title })
+    }
+
+    pub fn agent_permission_waiting(&self) -> bool {
+        self.agent.as_ref().is_some_and(|a| !a.permissions.is_empty())
+    }
+
+    /// Shows *agent* at the waiting permission's question, to read its
+    /// details and answer.
+    pub fn agent_show_permission(&mut self) {
+        self.agent_show();
+        self.agent_refresh();
+        if let Some(line) = self.agent_lines.iter().position(|t| *t == crate::agent::Target::Ask) {
+            let pos = self.buffer().line_to_pos(line);
+            self.buffer_mut().goto_char(pos);
+            self.window_mut().point = pos;
+            // The question at the top of the window, its details below it.
+            self.window_mut().scroll_top = line;
+        }
     }
 
     /// Answers the waiting permission with its first option of a kind
@@ -1891,6 +1968,7 @@ impl EditorState {
             Some(crate::agent::Target::File(path, line)) => {
                 self.agent_visit(&path, line);
             }
+            Some(crate::agent::Target::Permission(i)) => self.agent_permit(i),
             Some(crate::agent::Target::Buffer(name)) => {
                 let here = self.selected;
                 match self.window_order().into_iter().find(|&w| w != here && !self.is_sidebar(w)) {
@@ -1979,6 +2057,50 @@ impl EditorState {
             self.message = e;
         }
         self.agent_refresh();
+    }
+
+    // ---- Themes
+
+    /// Sets the theme: "system", "light" or "dark" (the mode), or a theme's
+    /// name, which is then used, in its mode.
+    pub fn set_theme(&mut self, name: &str) {
+        match name {
+            "system" | "light" | "dark" => {
+                self.theme_mode = name.to_string();
+                self.message = format!("theme: {name}");
+            }
+            _ => match self.theme_names.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).cloned() {
+                Some((n, dark)) => {
+                    if dark {
+                        self.dark_theme = n.clone();
+                    } else {
+                        self.light_theme = n.clone();
+                    }
+                    self.theme_mode = if dark { "dark" } else { "light" }.into();
+                    self.message = format!("theme: {n}");
+                }
+                // Before the view listed them (init files): kept, checked when drawn.
+                None if self.theme_names.is_empty() => {
+                    self.dark_theme = name.to_string();
+                    self.theme_mode = "dark".into();
+                }
+                None => self.message = format!("No theme called {name} (SPC h t lists them)"),
+            },
+        }
+    }
+
+    /// The themes for light and dark mode, following the system's.
+    pub fn set_themes(&mut self, light: &str, dark: &str) {
+        self.light_theme = light.to_string();
+        self.dark_theme = dark.to_string();
+        self.theme_mode = "system".into();
+        self.message = format!("themes: {light} / {dark}");
+    }
+
+    /// The theme in use now, by name.
+    pub fn theme_name(&self, dark: bool) -> String {
+        let name = if dark { &self.dark_theme } else { &self.light_theme };
+        if name.is_empty() { if dark { "Default Dark".into() } else { "Default Light".into() } } else { name.clone() }
     }
 
     // ---- Registers and the system clipboard

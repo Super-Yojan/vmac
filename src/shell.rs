@@ -40,7 +40,7 @@ pub struct Shell {
     syntax: Syntax,
     /// The light/dark mode last applied, and the subscription that hears
     /// the system's appearance change.
-    applied_mode: Option<gpui_kit::component::ThemeMode>,
+    applied_mode: Option<(gpui_kit::component::ThemeMode, String)>,
     _appearance: gpui_kit::Subscription,
 }
 
@@ -58,6 +58,22 @@ impl Shell {
                 st.font = crate::editor::default_font(&fonts);
             }
             st.fonts = fonts;
+        }
+        // The themes: built in, then yours (~/.config/vmac/themes/*.json).
+        {
+            let mut files: Vec<String> = crate::themes::BUILT_IN.iter().map(|s| s.to_string()).collect();
+            if let Some(dir) = crate::lisp::config_dir() {
+                files.extend(crate::themes::user_themes(&dir.join("themes")));
+            }
+            let mut names = vec![("Default Light".to_string(), false), ("Default Dark".to_string(), true)];
+            let registry = gpui_kit::component::ThemeRegistry::global_mut(cx);
+            for file in &files {
+                match registry.load_themes_from_str(file) {
+                    Ok(()) => names.extend(crate::themes::names(file)),
+                    Err(e) => editor.lock().message = format!("a theme file didn't load: {e}"),
+                }
+            }
+            editor.lock().theme_names = names;
         }
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
@@ -82,16 +98,37 @@ impl Shell {
     /// Applies the theme mode the editor asks for (`:theme`): the system's
     /// appearance for "system". Does nothing when it's already applied.
     fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_kit::component::ThemeMode;
-        let wanted = match self.editor.lock().theme_mode.as_str() {
-            "light" => ThemeMode::Light,
-            "dark" => ThemeMode::Dark,
-            _ => window.appearance().into(),
+        use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
+        let system: ThemeMode = window.appearance().into();
+        let (wanted, name) = {
+            let mut st = self.editor.lock();
+            st.system_dark = system.is_dark();
+            let mode = match st.theme_mode.as_str() {
+                "light" => ThemeMode::Light,
+                "dark" => ThemeMode::Dark,
+                _ => system,
+            };
+            (mode, st.theme_name(mode.is_dark()))
         };
-        if self.applied_mode != Some(wanted) {
-            self.applied_mode = Some(wanted);
-            gpui_kit::component::Theme::change(wanted, Some(window), cx);
+        if self.applied_mode.as_ref() == Some(&(wanted, name.clone())) {
+            return;
         }
+        self.applied_mode = Some((wanted, name.clone()));
+        // The named theme for this mode (the default when there's none such).
+        let registry = ThemeRegistry::global(cx);
+        let config = registry.themes().get(name.as_str()).filter(|c| c.mode.is_dark() == wanted.is_dark()).cloned();
+        let config = config.unwrap_or_else(|| {
+            if wanted.is_dark() { registry.default_dark_theme().clone() } else { registry.default_light_theme().clone() }
+        });
+        {
+            let theme = Theme::global_mut(cx);
+            if wanted.is_dark() {
+                theme.dark_theme = config;
+            } else {
+                theme.light_theme = config;
+            }
+        }
+        Theme::change(wanted, Some(window), cx);
     }
 
     /// Reloads lisp/core/ and init.scm when they change on disk.
@@ -547,6 +584,57 @@ fn display_columns(raw: &str) -> Vec<usize> {
     map
 }
 
+/// Where a Markdown image is on disk: a path (relative to the file's
+/// folder, or absolute, or file://). None for web addresses and data.
+fn local_image(folder: &std::path::Path, url: &str) -> Option<std::path::PathBuf> {
+    let url = url.trim();
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        return None;
+    }
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    // Spaces written as %20 in Markdown links.
+    let path = path.replace("%20", " ");
+    let path = std::path::Path::new(&path);
+    Some(if path.is_absolute() { path.to_path_buf() } else { folder.join(path) })
+}
+
+/// A line as shown, and each character's screen column (and one past the
+/// end): tabs as four spaces, and Markdown's hidden markup (`ops`: column,
+/// replacement or None to hide) taking no room.
+fn layout_line(raw: &str, ops: &[(usize, Option<char>)]) -> (String, Vec<usize>) {
+    if ops.is_empty() {
+        return (raw.replace('\t', "    "), display_columns(raw));
+    }
+    let mut text = String::with_capacity(raw.len());
+    let mut map = Vec::with_capacity(raw.len() + 2);
+    let mut at = 0;
+    let mut op = ops.iter().peekable();
+    for (i, ch) in raw.chars().enumerate() {
+        map.push(at);
+        while op.peek().is_some_and(|o| o.0 < i) {
+            op.next();
+        }
+        match op.peek().filter(|o| o.0 == i).map(|o| o.1) {
+            Some(None) => {}
+            Some(Some(r)) => {
+                text.push(r);
+                at += 1;
+            }
+            None if ch == '\t' => {
+                text.push_str("    ");
+                at += 4;
+            }
+            None => {
+                text.push(ch);
+                at += 1;
+            }
+        }
+    }
+    map.push(at);
+    map.push(at + 1);
+    (text, map)
+}
+
 fn display_line(rope_line: ropey::RopeSlice<'_>) -> String {
     rope_line
         .to_string()
@@ -584,6 +672,7 @@ impl Render for Shell {
         let area = (height - ROW_HEIGHT).max(ROW_HEIGHT * 2.);
 
         let bar = self.lisp.cursor_shape() == "bar";
+        let markdown_raw = self.lisp.markdown_raw();
         let selection = self.lisp.selection();
         let pattern = self.lisp.search_highlight();
         let mut modeline = Some(self.lisp.modeline());
@@ -636,10 +725,15 @@ impl Render for Shell {
                 let estimate = window_rows(r, area);
                 let lo = w.scroll_top.min(cur_line);
                 let hi = (w.scroll_top + estimate).max(cur_line + 1).min(text.len_lines());
-                let spans = match buffer.language().or_else(|| buffer.file().and_then(|f| language_for_path(f))) {
+                let language = buffer.language().or_else(|| buffer.file().and_then(|f| language_for_path(f)));
+                let spans = match language {
                     Some(lang) => syntax.highlight(w.buffer, lang, buffer.revision(), text, lo..hi),
                     None => Vec::new(),
                 };
+                // Markdown with its markup hidden, except where you're typing.
+                let conceal_here = st.markdown_conceal && language == Some("markdown") && !(is_selected && markdown_raw);
+                let conceals = if conceal_here { crate::markdown::conceal(text, lo..hi) } else { Vec::new() };
+                let ops_of = |i: usize| conceals.get(i.wrapping_sub(lo)).map(Vec::as_slice).unwrap_or(&[]);
                 // Styles of line i, in character columns (not yet screen columns).
                 let styles_of = |i: usize| -> Vec<(usize, usize, Style)> {
                     let start = text.line_to_char(i);
@@ -686,7 +780,8 @@ impl Render for Shell {
                 fitted.push((*id, top, last - top));
                 if is_selected && (top..last).contains(&cur_line) {
                     let raw = text.line(cur_line).to_string();
-                    let col = display_columns(raw.trim_end_matches(['\n', '\r']))
+                    let col = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(cur_line))
+                        .1
                         .get(cur_col)
                         .copied()
                         .unwrap_or(cur_col);
@@ -698,7 +793,7 @@ impl Render for Shell {
                 let lines: Vec<_> = (top..last)
                     .map(|i| {
                         let raw = text.line(i).to_string();
-                        let cols = display_columns(raw.trim_end_matches(['\n', '\r']));
+                        let (line, cols) = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(i));
                         let to_screen = |col: usize| cols.get(col).copied().unwrap_or(col);
                         let cursor = (is_selected && !is_sidebar && i == cur_line && !minibuffer_open)
                             .then_some(to_screen(cur_col));
@@ -717,7 +812,6 @@ impl Render for Shell {
                             .iter()
                             .map(|&(a, b, style)| (to_screen(a), to_screen(b), style))
                             .collect();
-                        let line = display_line(text.line(i));
                         let matches = match_columns(&line, search.as_ref());
                         let line_diagnostics = diagnostics
                             .iter()
@@ -885,6 +979,46 @@ impl Render for Shell {
             }
             _ => h_flex().text_color(theme.muted_foreground).child(st.message.clone()),
         };
+        // The Markdown preview, rendered by gpui-kit, on the right.
+        let preview_target = st.preview_buffer();
+        if preview_target.is_some() {
+            st.preview_last = preview_target;
+        }
+        let preview = st.preview_rect().zip(preview_target).map(|(r, id)| {
+            let source = st.buffer_by_id(id).map(|b| b.text().to_string()).unwrap_or_default();
+            div()
+                .absolute()
+                .left(px(r.x * width))
+                .top_0()
+                .w(px(r.w * width))
+                .h(px(area))
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .font_family(theme.font_family.clone())
+                .text_size(px(15.))
+                .line_height(px(22.))
+                .px(px(20.))
+                .py(px(12.))
+                .child({
+                    // Images by path load from the file's folder (README's assets/...).
+                    let folder = st
+                        .buffer_by_id(id)
+                        .and_then(|b| b.file())
+                        .and_then(|f| f.parent())
+                        .map(|d| d.to_path_buf())
+                        .unwrap_or_default();
+                    gpui_kit::base::TextView::markdown(
+                        gpui_kit::SharedString::from(format!("markdown-preview-{id}")),
+                        source,
+                    )
+                    .scrollable(true)
+                    .image_source(move |uri| match local_image(&folder, uri.as_ref()) {
+                        Some(path) => path.into(),
+                        None => uri.clone().into(),
+                    })
+                })
+        });
         drop(st);
 
         v_flex()
@@ -901,7 +1035,7 @@ impl Render for Shell {
             .font_family(font.unwrap_or_else(|| theme.mono_font_family.clone()))
             .text_size(px(FONT_SIZE))
             .line_height(px(ROW_HEIGHT))
-            .child(div().relative().w_full().h(px(area)).children(windows))
+            .child(div().relative().w_full().h(px(area)).children(windows).children(preview))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
             .children(hover)
             .children(completion)
@@ -934,6 +1068,15 @@ mod tests {
     #[test]
     fn tabs_take_four_columns() {
         assert_eq!(display_columns("a\tb"), vec![0, 1, 5, 6, 7]);
+        let folder = std::path::Path::new("/notes");
+        assert_eq!(local_image(folder, "assets/logo.svg"), Some("/notes/assets/logo.svg".into()));
+        assert_eq!(local_image(folder, "file:///tmp/a%20b.png"), Some("/tmp/a b.png".into()));
+        assert_eq!(local_image(folder, "https://x.dev/a.png"), None);
+        // Hidden markup takes no room; a replacement takes one column.
+        let (text, cols) = layout_line("## **Hi**\t-", &[(0, None), (1, None), (2, None), (3, None), (4, None), (7, None), (8, None), (10, Some('•'))]);
+        assert_eq!(text, "Hi    •");
+        assert_eq!(cols, vec![0, 0, 0, 0, 0, 0, 1, 2, 2, 2, 6, 7, 8]);
+        assert_eq!(layout_line("a\tb", &[]), ("a    b".to_string(), display_columns("a\tb")));
     }
 
     #[test]

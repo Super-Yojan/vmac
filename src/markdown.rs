@@ -58,6 +58,73 @@ pub fn highlight(rope: &Rope, lines: Range<usize>) -> Vec<Vec<Span>> {
         .collect()
 }
 
+/// What the normal-state view does to each line of `lines`: a list of
+/// (column, replacement) where None hides the character. Headings lose
+/// their `#`s, bold and italic their `*`s, code its backticks, links show
+/// only their text; list marks become bullets, quote marks a bar, rules and
+/// table borders lines. Code blocks are left as they are.
+pub fn conceal(rope: &Rope, lines: Range<usize>) -> Vec<Vec<(usize, Option<char>)>> {
+    let spans = highlight(rope, lines.clone());
+    lines
+        .zip(spans)
+        .map(|(i, spans)| {
+            if i >= rope.len_lines() {
+                return Vec::new();
+            }
+            let text = rope.line(i).to_string();
+            let chars: Vec<char> = text.trim_end_matches(['\n', '\r']).chars().collect();
+            let mut out: Vec<(usize, Option<char>)> = Vec::new();
+            // In a table, hiding markup would undo the columns' alignment:
+            // only its borders are drawn.
+            let table = spans.iter().any(|sp| sp.capture == "markup.table.delimiter");
+            let hide = |a: usize, b: usize, out: &mut Vec<(usize, Option<char>)>| out.extend((a..b).map(|c| (c, None)));
+            for sp in &spans {
+                let (a, b) = (sp.start, sp.end.min(chars.len()));
+                if a >= b {
+                    continue;
+                }
+                let c = sp.capture.as_str();
+                if table && c != "markup.table.delimiter" {
+                    continue;
+                }
+                let heading_marker = c.starts_with("markup.heading.") && c.ends_with(".marker");
+                // The first and last character: [text], *italic*, `code`.
+                let wrapped = (c == "markup.link.text" && chars[a] == '[' && chars[b - 1] == ']')
+                    || (c == "markup.italic" && b - a >= 2)
+                    || (c == "markup.raw" && chars[a] == '`' && chars[b - 1] == '`' && b - a >= 2);
+                if heading_marker || c == "markup.link.url" {
+                    hide(a, b, &mut out);
+                } else if wrapped {
+                    out.push((a, None));
+                    out.push((b - 1, None));
+                } else if c == "markup.bold" && b - a >= 4 {
+                    hide(a, a + 2, &mut out);
+                    hide(b - 2, b, &mut out);
+                } else if c == "markup.list" {
+                    if let Some(k) = (a..b).find(|&k| matches!(chars[k], '-' | '*' | '+')) {
+                        out.push((k, Some('•')));
+                    }
+                } else if c == "markup.quote.marker" {
+                    if let Some(k) = (a..b).find(|&k| chars[k] == '>') {
+                        out.push((k, Some('▎')));
+                    }
+                } else if c == "markup.rule" {
+                    out.extend((a..b).filter(|&k| !chars[k].is_whitespace()).map(|k| (k, Some('─'))));
+                } else if c == "markup.table.delimiter" {
+                    out.extend((a..b).filter_map(|k| match chars[k] {
+                        '|' => Some((k, Some('│'))),
+                        '-' => Some((k, Some('─'))),
+                        _ => None,
+                    }));
+                }
+            }
+            out.sort_by_key(|o| o.0);
+            out.dedup_by_key(|o| o.0);
+            out
+        })
+        .collect()
+}
+
 /// A table row: pipes dimmed, the header row (the one above `|---|`) named
 /// `markup.table.header`, cells otherwise styled like any text.
 fn table_spans(text: &str, header: bool) -> Vec<Span> {
@@ -212,6 +279,35 @@ mod tests {
         assert_eq!(line("12. item"), vec![pair("12. ", "markup.list")]);
         assert_eq!(line("> said"), vec![pair("> ", "markup.quote.marker"), pair("said", "markup.quote")]);
         assert_eq!(line("---"), vec![pair("---", "markup.rule")]);
+    }
+
+    /// A line as the normal-state view shows it.
+    fn concealed(text: &str) -> String {
+        let rope = Rope::from_str(text);
+        let ops = conceal(&rope, 0..1).remove(0);
+        text.trim_end()
+            .chars()
+            .enumerate()
+            .filter_map(|(i, c)| match ops.iter().find(|o| o.0 == i) {
+                Some((_, None)) => None,
+                Some((_, Some(r))) => Some(*r),
+                None => Some(c),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normal_state_hides_the_markup() {
+        assert_eq!(concealed("## Keys\n"), "Keys");
+        assert_eq!(concealed("a **b** *c* `d` [e](f)\n"), "a b c d e");
+        assert_eq!(concealed("- item **x**\n"), "• item x");
+        assert_eq!(concealed("> said\n"), "▎ said");
+        assert_eq!(concealed("---\n"), "───");
+        assert_eq!(concealed("| a | b |\n"), "│ a │ b │");
+        assert_eq!(concealed("| `a` | **b** |\n"), "│ `a` │ **b** │", "cells keep their width");
+        assert_eq!(concealed("`**raw**`\n"), "**raw**", "inside code, only the backticks go");
+        let rope = Rope::from_str("```\n**kept**\n```\n");
+        assert!(conceal(&rope, 1..2)[0].is_empty(), "code blocks are left alone");
     }
 
     #[test]

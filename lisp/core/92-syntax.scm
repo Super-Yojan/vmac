@@ -59,6 +59,7 @@
          ;; The agent buffer
          (list "agent-user" 'weight 'bold 'color 'accent)
          (list "agent-heading" 'weight 'bold)
+         (list "agent-ask" 'weight 'bold 'color 'yellow)
          (list "agent-thought" 'slant 'italic 'color 'dim)
          (list "agent-output" 'color 'dim))))
 
@@ -68,3 +69,17 @@
 (define (set-faces! specs) (set! custom-face-specs (append specs custom-face-specs)))
 (define (face-specs) (append custom-face-specs (default-face-specs)))
 
+
+;;;; Themes
+;;
+;; SPC h t (or :theme NAME) picks a color theme: Catppuccin, Tokyo Night,
+;; Gruvbox, Solarized, Everforest, Ayu, Flexoki... (built in), or yours in
+;; ~/.config/vmac/themes/*.json (gpui-kit's theme format). A theme is light
+;; or dark and switches to its mode; :theme system follows the system again,
+;; with the themes last picked for each mode. In init.scm:
+;;   (set-themes "Catppuccin Latte" "Catppuccin Mocha")   ; light, dark
+;; or (set-theme "Tokyo Night"). The syntax and Markdown colors above are
+;; the theme's own red, green, blue..., so they follow it.
+
+(defcommand (theme-picker)
+  (pick "Theme" (theme-list) "" (lambda (name) (set-theme name))))

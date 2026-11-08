@@ -144,7 +144,9 @@ insert state pops up completions that narrow as you type: `C-n`/`C-p` move,
 `RET`/`TAB` accept, `ESC` closes; `.` and `:` ask afresh. `SPC c r` renames
 what's under the cursor everywhere (starting from its current name), and
 `SPC c a` lists fixes and refactorings for the cursor or a visual selection,
-and `SPC c f` formats the file (or, in visual state, the selected lines).
+and `SPC c f` formats the file (or, in visual state, the selected lines). `SPC c R` (or `:lsp-restart`) restarts
+the language servers, and tries again those that failed to start (after you
+install one, say).
 Edits to other files open them unsaved, so you can review before `:w`. A server that fails
 to start or stops says why in the echo area. Set `VMAC_LSP_LOG=/tmp/lsp.log`
 to log every message to and from the servers.
@@ -256,8 +258,11 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   where the same keys work and `RET` goes to one; `SPC a A` and `SPC a X`
   accept or reject them all. `*agent*` counts what's left. To accept edits
   as they're made: `(set-agent-review #f)` or `vmac.set_agent_review(false)`.
-- When it needs permission (to edit, to run a command), a picker asks you;
-  `SPC a p` reopens it if you were busy.
+- **When it needs permission** (to edit, to run a command, to start coding
+  after a plan), `*agent*` shows the question with what it's about (the
+  plan, the command, the diff) and the choices, and puts the cursor on it so
+  you can read first. Press a choice's number, or `RET` on it; `SPC a p`
+  picks from a list. While you're typing, vmac only tells you it's asking.
 - `SPC a c` (or `C-c` in `*agent*`) cancels the run, `SPC a n` starts a new
   conversation, `SPC a k` stops the agent, `SPC a o` shows `*agent*`.
   `:agent PROMPT` asks from the command line.
@@ -325,9 +330,18 @@ its folder in a git repository.
 ## Markdown
 
 `.md` files are styled in place, still fully editable: headings are larger,
-bold and in the UI's sans-serif font (the `#` marks stay, dimmed), with
-`**bold**`, `*italic*`, `` `code` ``, links, quotes, lists and code blocks
-each styled.
+bold and in the UI's sans-serif font, with `**bold**`, `*italic*`,
+`` `code` ``, links, quotes, lists and code blocks each styled.
+
+**Two ways to read it.** Outside insert state the markup is hidden, so it
+reads like the rendered page: headings without `#`, bold and italic without
+their stars, code without backticks, links as their text, bullets, rules and
+table borders drawn as lines. In insert state everything shows, as typed.
+`SPC t m` (or `(set-markdown-conceal #f)`) shows the markup all the time.
+Or `SPC m p` opens a preview on the right, rendered by gpui-kit (headings,
+code blocks, tables, images and HTML like a web page), following the
+Markdown file you're in as you type; `SPC m p` again closes it.
+`(set-markdown-preview #t)` opens it from the start.
 
 Tables work like Org mode's: leaving insert state in one aligns it (every
 column padded to its widest cell, the `|---|` row redrawn, `:---:` alignment
@@ -343,11 +357,24 @@ The styles are faces, defined in Scheme with attributes:
                     (list (list "md-bold" 'weight 'bold 'color 'yellow))))
 ```
 
-## Light and dark
+## Themes
 
-vmac follows the system: light or dark, switching when the system does.
-`:theme dark` (or `light`, or `system` to follow it again), `(set-theme "dark")`
-or `vmac.set_theme("dark")` pins one.
+`SPC h t` (or `:theme NAME`) picks a color theme: Catppuccin (Latte, Frappé,
+Macchiato, Mocha), Tokyo Night, Gruvbox, Solarized, Everforest, Ayu, Flexoki,
+Molokai and more, 36 built in (from
+[gpui-component](https://github.com/longbridge/gpui-component/tree/main/themes),
+Apache-2.0). Syntax and Markdown colors are the theme's own, so everything
+follows. Add your own as `~/.config/vmac/themes/*.json`, in the same format.
+
+vmac follows the system's light or dark mode, switching when it does, with
+the themes you chose for each:
+
+```lua
+vmac.set_themes("Catppuccin Latte", "Catppuccin Mocha")   -- light, dark
+-- or one theme, always: vmac.set_theme("Tokyo Night")
+```
+
+`:theme dark` (or `light`, or `system` to follow it again) pins a mode.
 
 ## Font
 
