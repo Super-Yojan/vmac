@@ -24,6 +24,7 @@
 vmac.agent_backend("claude-cli", { terminal = "claude", resume = "claude --resume {id}" })
 vmac.agent_backend("codex-cli", { terminal = "codex" })
 vmac.agent_backend("gemini-cli", { terminal = "gemini" })
+vmac.agent_backend("pi-cli", { terminal = "pi" })
 
 -- SPC a t: the CLI agent's pane, shown or hidden; with an ACP agent, *agent*.
 vmac.command("agent-pane-toggle", function()
