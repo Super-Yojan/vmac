@@ -7,7 +7,7 @@ use crate::frame::{
     CHAR_WIDTH, Content, Echo, FONT_SIZE, Face, Frame, FrameLine, FrameWindow, Input, Mods, PickerView, ROW_HEIGHT,
     ThemeRequest, Viewport, WindowId,
 };
-use crate::session::Session;
+use crate::server::Server;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
@@ -29,7 +29,7 @@ const HOVER_MAX_HEIGHT: f32 = 320.;
 const COMPLETION_WIDTH: f32 = 460.;
 
 pub struct Shell {
-    session: Session,
+    session: Server,
     focus: FocusHandle,
     /// The light/dark mode last applied, the system appearance last told
     /// to the session, and the subscription that hears it change.
@@ -124,7 +124,7 @@ struct MdView {
 }
 
 impl Shell {
-    pub fn new(mut session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(mut session: Server, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         // What this machine has: its fonts, and the themes (built in, then
@@ -220,7 +220,7 @@ impl Shell {
 
     /// Calls `work` on the session every `every`, drawing again when it says
     /// something changed.
-    fn every(cx: &mut Context<Self>, every: Duration, work: fn(&mut Session) -> bool) {
+    fn every(cx: &mut Context<Self>, every: Duration, work: fn(&mut Server) -> bool) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(every).await;
@@ -239,18 +239,18 @@ impl Shell {
 
     /// Reloads lisp/core/ and init.scm when they change on disk.
     fn watch_sources(cx: &mut Context<Self>) {
-        Self::every(cx, RELOAD_POLL, Session::reload_if_changed);
+        Self::every(cx, RELOAD_POLL, Server::reload_if_changed);
     }
 
     /// Reads terminals' screens into their buffers, often enough that typing
     /// into one feels immediate.
     fn drive_terminals(cx: &mut Context<Self>) {
-        Self::every(cx, TERMINAL_POLL, Session::pump_terminals);
+        Self::every(cx, TERMINAL_POLL, Server::pump_terminals);
     }
 
     /// Syncs files with their language servers and reads what they report.
     fn drive_language_servers(cx: &mut Context<Self>) {
-        Self::every(cx, LSP_POLL, Session::pump_servers);
+        Self::every(cx, LSP_POLL, Server::pump_servers);
     }
 
     /// Hands the session an input, then draws again (or quits).

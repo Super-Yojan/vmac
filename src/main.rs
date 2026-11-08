@@ -12,6 +12,7 @@ mod packages;
 mod picker;
 mod frame;
 mod review;
+mod server;
 mod session;
 mod sessions;
 mod plugins;
@@ -54,22 +55,30 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, move |window, cx| {
-                let editor = Editor::new(buffer);
-                editor.lock().set_state_dir(projects::History::default_dir());
-                editor.lock().clipboard = Some(editor::SystemClipboard(Box::new(clipboard::System)));
-                let mut lisp = Lisp::with_config(
-                    editor.clone(),
-                    Lisp::default_sources(),
-                    Lisp::default_lua_sources(),
-                    Lisp::default_plugin_dir(),
-                );
+                let (editor, mut lisp) = new_session(buffer);
                 // Started without a file: the dashboard (unless turned off).
                 if dashboard {
                     let _ = lisp.eval("(when dashboard-on-start (call-binding 'dashboard))");
                 }
-                cx.new(|cx| Shell::new(session::Session::new(editor, lisp), window, cx))
+                let first = session::Session::new(editor, lisp);
+                // Each further session: a fresh editor with the config, on the dashboard.
+                let make = Box::new(|| {
+                    let (editor, lisp) = new_session(Buffer::new("*scratch*"));
+                    session::Session::new(editor, lisp)
+                });
+                let server = server::Server::new(first, make).follow_cwd();
+                cx.new(|cx| Shell::new(server, window, cx))
             })
             .expect("failed to open window");
             cx.activate(true);
         });
+}
+
+/// An editor showing `buffer`, and its scripting engine with the config loaded.
+fn new_session(buffer: Buffer) -> (Editor, Lisp) {
+    let editor = Editor::new(buffer);
+    editor.lock().set_state_dir(projects::History::default_dir());
+    editor.lock().clipboard = Some(editor::SystemClipboard(Box::new(clipboard::System)));
+    let lisp = Lisp::with_config(editor.clone(), Lisp::default_sources(), Lisp::default_lua_sources(), Lisp::default_plugin_dir());
+    (editor, lisp)
 }

@@ -42,6 +42,17 @@ impl Session {
         self.editor.lock().quit_requested
     }
 
+    pub fn editor(&self) -> &Editor {
+        &self.editor
+    }
+
+    /// Runs a command by name (Scheme's or Lua's), as a key bound to it would.
+    pub fn run_command(&mut self, name: &str) {
+        if let Err(e) = self.lisp.eval(&format!("(call-binding '{name})")) {
+            self.editor.lock().message = format!("{name}: {}", e.lines().next().unwrap_or(""));
+        }
+    }
+
     // ---- Work that happens on its own (the window calls these on timers)
 
     /// Reloads the core and init files when they change on disk.

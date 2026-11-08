@@ -391,6 +391,35 @@ pub struct EditorState {
     /// raised where Rust can't call Scheme (server replies).
     events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
+    /// The folder relative paths, pickers and new programs start from. Each
+    /// session has its own; nothing changes the process's.
+    pub cwd: PathBuf,
+    /// Sessions (projects open side by side, each with its own buffers):
+    /// this one's name and all of them in order (both kept by the server),
+    /// what this session's commands asked the server to do, whether a
+    /// server runs this editor, and whether opening another project opens
+    /// it in a session of its own.
+    pub session_name: String,
+    pub session_names: Vec<String>,
+    pub session_requests: Vec<SessionRequest>,
+    pub in_server: bool,
+    pub session_per_project: bool,
+}
+
+/// What a session asks the server that runs it to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRequest {
+    Switch(String),
+    /// The session switched from last.
+    Last,
+    /// A new session: its name, and the project it opens (none: the dashboard).
+    New { name: String, root: Option<PathBuf> },
+    /// Kill a session; `force` even with unsaved changes.
+    Kill { name: String, force: bool },
+    /// Rename this session.
+    Rename(String),
+    /// Open a project: its session, made if it has none.
+    Project(PathBuf),
 }
 
 /// A line of the review: its file, on the new (modified) or old side, 1-based.
@@ -547,6 +576,12 @@ impl EditorState {
             dashboard_width: 0,
             events: Vec::new(),
             search_cache: None,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            session_name: "main".into(),
+            session_names: Vec::new(),
+            session_requests: Vec::new(),
+            in_server: false,
+            session_per_project: true,
         }
     }
 
@@ -644,6 +679,7 @@ impl EditorState {
     /// Opens a file in the selected window: its buffer if it is open already,
     /// else a new one.
     pub fn open_file(&mut self, path: &Path) -> std::io::Result<()> {
+        let path = &self.resolve(path);
         let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let want = canonical(path);
         let existing = self
@@ -1250,8 +1286,7 @@ impl EditorState {
             .or(self.project.as_ref())
             .or_else(|| self.buffers.iter().find_map(|(_, b)| b.file()))
             .cloned()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.cwd.clone());
         crate::picker::project_root(&start)
     }
 
@@ -2748,22 +2783,36 @@ impl EditorState {
         }
     }
 
+    /// A path as given, or relative to this session's folder.
+    pub fn resolve(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() { path.to_path_buf() } else { self.cwd.join(path) }
+    }
+
     /// Makes a folder the current project: remembered, and the working
     /// folder (where the file picker, :e and terminals start). Err if it
-    /// isn't a folder.
-    pub fn project_open(&mut self, path: &Path) -> Result<PathBuf, String> {
-        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    /// isn't a folder. Under a server, another project goes to its own
+    /// session (Ok(None): the server takes it from here), and the first
+    /// project a session opens names it.
+    pub fn project_open(&mut self, path: &Path) -> Result<Option<PathBuf>, String> {
+        let path = self.resolve(path);
+        let path = std::path::absolute(&path).unwrap_or(path);
         if !path.is_dir() {
             return Err(format!("{}: not a folder", path.display()));
         }
-        // The working folder too, in the app (tests share theirs).
-        if self.history.is_saved() {
-            std::env::set_current_dir(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let sessions = self.in_server && self.session_per_project;
+        if sessions && self.project.as_ref().is_some_and(|p| *p != path) {
+            self.session_requests.push(SessionRequest::Project(path));
+            return Ok(None);
         }
+        if sessions && self.project.is_none() {
+            let name = path.file_name().map_or("main".into(), |n| n.to_string_lossy().into_owned());
+            self.session_requests.push(SessionRequest::Rename(name));
+        }
+        self.cwd = path.clone();
         self.project = Some(path.clone());
         self.history.opened_project(&path);
         self.message = format!("Project: {}", crate::projects::abbreviate(&path));
-        Ok(path)
+        Ok(Some(path))
     }
 
     /// Projects to open: those opened before, then others found on disk.
@@ -2971,7 +3020,7 @@ impl EditorState {
     /// at its place, remembering where it came from for C-o.
     pub fn goto_location(&mut self, item: &str) -> bool {
         let Some((path, line, col)) = crate::picker::parse_location(item) else { return false };
-        let root = crate::picker::project_root(self.buffer().file().map(PathBuf::as_path).unwrap_or(Path::new(".")));
+        let root = crate::picker::project_root(self.buffer().file().cloned().unwrap_or_else(|| self.cwd.clone()).as_path());
         let path = if Path::new(&path).is_absolute() { PathBuf::from(&path) } else { root.join(&path) };
         let from = (self.window().buffer, self.buffer().point());
         match self.open_file(&path) {
@@ -3012,7 +3061,7 @@ impl EditorState {
             Reply::Hover(Some(text)) => self.hover = Some(text),
             Reply::Hover(None) => self.message = "No documentation here".into(),
             Reply::References(locations) => {
-                let root = crate::picker::project_root(self.buffer().file().map(PathBuf::as_path).unwrap_or(Path::new(".")));
+                let root = crate::picker::project_root(self.buffer().file().cloned().unwrap_or_else(|| self.cwd.clone()).as_path());
                 let items: Vec<String> = locations.iter().map(|l| self.location_item(l, &root)).collect();
                 match items.len() {
                     0 => self.message = "No references found".into(),

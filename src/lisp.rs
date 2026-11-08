@@ -6,7 +6,7 @@
 //! editor runs.
 
 use crate::buffer::Buffer;
-use crate::editor::Editor;
+use crate::editor::{Editor, SessionRequest};
 use crate::picker::Picker;
 use mlua::Lua;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("agents.lua", include_str!("../lua/core/agents.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
+    ("sessions.lua", include_str!("../lua/core/sessions.lua")),
 ];
 
 /// The Lua core's files, in name order: (name, code).
@@ -1082,6 +1083,16 @@ function vmac.run(name)
   vmac.scheme("(call-binding '" .. name .. ")")
 end
 
+-- vmac.pick(title, items, fn, root): the fuzzy picker over items; fn gets
+-- the one picked. With root (a folder), items are paths in it, previewed.
+function vmac.pick(title, items, fn, root)
+  vmac.hooks._pick = function(choice) fn(choice) end
+  local quoted = {}
+  for _, item in ipairs(items) do quoted[#quoted + 1] = quote(item) end
+  vmac.scheme("(pick " .. quote(title) .. " (list " .. table.concat(quoted, " ") .. ") " .. quote(root or "")
+    .. " (lambda (choice) (lua-hook \"_pick\" (list choice))))")
+end
+
 -- print shows in the echo area.
 function print(...)
   local parts = {}
@@ -1189,8 +1200,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             .file()
             .cloned()
             .or_else(|| s.project.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| s.cwd.clone());
         crate::picker::project_root(&start).display().to_string()
     });
     pure!(reg, "project-files", |root: String| crate::picker::project_files(Path::new(&root)));
@@ -1738,7 +1748,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // Opens a folder as the project; its full path, or "" (and why, in the echo area).
     prim!(reg, editor, "project-open", |s, path: String| {
         match s.project_open(&crate::projects::expand(&path)) {
-            Ok(p) => p.display().to_string(),
+            Ok(p) => p.map(|p| p.display().to_string()).unwrap_or_default(),
             Err(e) => {
                 s.message = e;
                 String::new()
@@ -1835,10 +1845,25 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "agent-command", |s| s.agent_config.line());
     prim!(reg, editor, "font-list", |s| s.fonts.clone());
     prim!(reg, editor, "terminal-shell", |s| s.terminal_shell.clone());
+    // Sessions: the server acts on what these ask after the current command.
+    prim!(reg, editor, "session-name", |s| s.session_name.clone());
+    prim!(reg, editor, "session-list", |s| s.session_names.clone());
+    prim!(reg, editor, "session-switch", |s, name: String| s.session_requests.push(SessionRequest::Switch(name)));
+    prim!(reg, editor, "session-last", |s| s.session_requests.push(SessionRequest::Last));
+    prim!(reg, editor, "session-new", |s, name: String, root: String| {
+        let root = (!root.is_empty()).then(|| s.resolve(&crate::projects::expand(&root)));
+        s.session_requests.push(SessionRequest::New { name, root });
+    });
+    prim!(reg, editor, "session-kill", |s, name: String, force: bool| {
+        s.session_requests.push(SessionRequest::Kill { name, force })
+    });
+    prim!(reg, editor, "session-rename", |s, name: String| s.session_requests.push(SessionRequest::Rename(name)));
+    prim!(reg, editor, "set-session-per-project", |s, on: bool| s.session_per_project = on);
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
-    pure!(reg, "exec", |command: String, args: Vec<String>| {
+    prim!(reg, editor, "exec", |s, command: String, args: Vec<String>| {
         std::process::Command::new(&command)
             .args(&args)
+            .current_dir(&s.cwd)
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default()

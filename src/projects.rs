@@ -40,11 +40,6 @@ impl History {
         Some(base.join("vmac"))
     }
 
-    /// Whether the lists are kept on disk (the app; not tests).
-    pub fn is_saved(&self) -> bool {
-        self.dir.is_some()
-    }
-
     /// Recent files that still exist.
     pub fn files(&self) -> Vec<PathBuf> {
         self.files.iter().filter(|p| p.is_file()).cloned().collect()
