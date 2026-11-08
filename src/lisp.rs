@@ -1270,10 +1270,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // Zoom: times `by`, or back to fitting the window with 0.
     prim!(reg, editor, "pdf-zoom", |s, by: f64| {
         let id = s.window().buffer;
-        let now = s.pdf_zoom.get(&id).copied().unwrap_or(1.);
-        let zoom = if by <= 0. { 1. } else { (now * by as f32).clamp(0.25, 8.) };
-        s.pdf_zoom.insert(id, zoom);
-        s.message = format!("Zoom {:.0}%", zoom * 100.);
+        s.zoom_pdf(id, by as f32);
     });
     prim!(reg, editor, "pdf-zoom-level", |s| s.pdf_zoom.get(&s.window().buffer).copied().unwrap_or(1.) as f64);
     prim!(reg, editor, "pdf-here?", |s| {

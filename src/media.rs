@@ -9,7 +9,11 @@ use gpui_kit::{
     ParentElement as _, Render, RenderImage, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
     StyledImage as _, Window, div, img, list, point, prelude::FluentBuilder as _, px,
 };
+use crate::frame::{ROW_HEIGHT, WindowId};
+use gpui_kit::{App, DispatchPhase, ScrollWheelEvent, canvas};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -81,6 +85,12 @@ pub struct PdfView {
     pixels_per_point: f32,
     /// Sideways, across pages wider than the window.
     sideways: ScrollHandle,
+    /// The window it was last shown in, and what to call with Ctrl and the
+    /// wheel over it (whole lines of it; negative: up).
+    window: WindowId,
+    on_zoom: Rc<dyn Fn(WindowId, isize, &mut App)>,
+    /// Ctrl-wheel movement short of a whole line, kept for the next event.
+    zoom_wheel: Rc<Cell<f32>>,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -88,7 +98,7 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 impl PdfView {
-    pub fn new(path: PathBuf, scrolled: u64) -> Self {
+    pub fn new(path: PathBuf, scrolled: u64, on_zoom: impl Fn(WindowId, isize, &mut App) + 'static) -> Self {
         let sizes = crate::pdf::page_sizes(&path);
         let count = sizes.as_ref().map_or(0, Vec::len);
         Self {
@@ -106,7 +116,14 @@ impl PdfView {
             width: 800.,
             pixels_per_point: 2.,
             sideways: ScrollHandle::new(),
+            window: 0,
+            on_zoom: Rc::new(on_zoom),
+            zoom_wheel: Rc::new(Cell::new(0.)),
         }
+    }
+
+    pub fn set_window(&mut self, window: WindowId) {
+        self.window = window;
     }
 
     pub fn path(&self) -> &Path {
@@ -302,6 +319,35 @@ impl PdfView {
     }
 }
 
+impl PdfView {
+    /// Catches Ctrl and the wheel over the view before the pages see it (they
+    /// would scroll), and hands it on as whole lines to zoom by.
+    fn zoom_catcher(&self) -> impl IntoElement {
+        let (window_id, on_zoom, pending) = (self.window, self.on_zoom.clone(), self.zoom_wheel.clone());
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture || !event.modifiers.control || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let dy: f32 = event.delta.pixel_delta(px(ROW_HEIGHT)).y.into();
+                    // Up (content down) is negative lines, as the session counts them.
+                    let lines = pending.get() - dy / ROW_HEIGHT;
+                    let whole = lines.trunc();
+                    pending.set(lines - whole);
+                    if whole != 0. {
+                        on_zoom(window_id, whole as isize, cx);
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+    }
+}
+
 impl Render for PdfView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.pixels_per_point = window.scale_factor();
@@ -312,7 +358,7 @@ impl Render for PdfView {
             Err(e) => d.flex().items_center().justify_center().text_color(muted).child(e.clone()),
             // Pages scroll up and down in the list, and the list sideways
             // when they're zoomed wider than the window.
-            Ok(_) => d.child(
+            Ok(_) => d.relative().child(self.zoom_catcher()).child(
                 div()
                     .id("pdf-sideways")
                     .size_full()
@@ -335,7 +381,7 @@ mod tests {
 
     #[test]
     fn pages_fit_the_window_then_grow_with_the_zoom() {
-        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0);
+        let mut view = PdfView::new(PathBuf::from("/nonexistent.pdf"), 0, |_, _, _| {});
         view.sizes = Ok(vec![(612., 792.), (1200., 800.)]);
         view.width = 2000.;
         assert_eq!(view.page_width(0), 612., "its own width when there's room");

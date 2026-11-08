@@ -392,7 +392,14 @@ impl Shell {
             .or_insert_with(|| {
                 // Scrolls asked for before this view existed are done with.
                 let seen = scroll.last().map_or(0, |(n, _)| *n);
-                gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf(), seen))
+                // Ctrl and the wheel over it: told to the session as such, to zoom.
+                let shell = cx.entity().downgrade();
+                let on_zoom = move |window: WindowId, lines: isize, cx: &mut gpui_kit::App| {
+                    let mods = Mods { control: true, ..Default::default() };
+                    let input = Input::Wheel { window, lines, line: 0, col: 0, mods };
+                    let _ = shell.update(cx, |shell, cx| shell.send(input, cx));
+                };
+                gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf(), seen, on_zoom))
             })
             .clone();
         view.update(cx, |v, cx| {
@@ -1030,6 +1037,7 @@ impl Render for Shell {
                     Content::Media { path, kind: MediaKind::Image, .. } => crate::media::image_element(path, cx),
                     Content::Media { path, kind: MediaKind::Pdf, themed, scroll, zoom } => {
                         let view = self.pdf_view(w.buffer, path, *themed, scroll, *zoom, w.width, cx);
+                        view.update(cx, |v, _| v.set_window(w.id));
                         div().flex_1().overflow_hidden().child(view).into_any_element()
                     }
                     Content::Text(lines) => v_flex()

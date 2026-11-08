@@ -100,6 +100,13 @@ impl Session {
             Input::Wheel { window, lines, line, col, mods } => {
                 let mut st = self.editor.lock();
                 let Some(buffer) = st.window_by_id(window).map(|w| w.buffer) else { return };
+                // Ctrl and the wheel over a PDF zoom it: up (away) in, down out.
+                let pdf = st.buffer_by_id(buffer).and_then(|b| b.file()).and_then(|f| crate::frame::media_kind(f))
+                    == Some(crate::frame::MediaKind::Pdf);
+                if pdf && mods.control {
+                    st.zoom_pdf(buffer, PDF_WHEEL_ZOOM.powi(-lines as i32));
+                    return;
+                }
                 // A terminal program that asked for the mouse gets the wheel.
                 if is_terminal(&st, buffer) && !mods.shift {
                     use crate::terminal::MouseAction::{WheelDown, WheelUp};
@@ -621,6 +628,9 @@ impl Session {
     }
 }
 
+/// How much each line of Ctrl and the wheel zooms a PDF.
+const PDF_WHEEL_ZOOM: f32 = 1.05;
+
 fn is_terminal(st: &crate::editor::EditorState, buffer: BufferId) -> bool {
     st.terminals.iter().any(|t| t.buffer == buffer)
 }
@@ -791,6 +801,31 @@ mod tests {
             }
             other => panic!("not media: {other:?}"),
         }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ctrl_and_the_wheel_zoom_a_pdf() {
+        let mut s = session_with("");
+        let path = std::env::temp_dir().join(format!("vmac-wheel-{}.pdf", std::process::id()));
+        std::fs::write(&path, b"%PDF-1.4").unwrap();
+        s.editor.lock().open_file(&path).unwrap();
+        let window = s.frame(VIEW).windows[0].id;
+        let zoom = |s: &mut Session| match &s.frame(VIEW).windows[0].content {
+            Content::Media { zoom, .. } => *zoom,
+            other => panic!("not media: {other:?}"),
+        };
+        let wheel = |s: &mut Session, lines: isize, control: bool| {
+            let mods = Mods { control, ..Default::default() };
+            s.handle(Input::Wheel { window, lines, line: 0, col: 0, mods });
+        };
+        wheel(&mut s, -2, true);
+        assert!((zoom(&mut s) - PDF_WHEEL_ZOOM.powi(2)).abs() < 1e-4, "up zooms in: {}", zoom(&mut s));
+        wheel(&mut s, 4, true);
+        assert!((zoom(&mut s) - PDF_WHEEL_ZOOM.powi(-2)).abs() < 1e-4, "down zooms out: {}", zoom(&mut s));
+        let before = zoom(&mut s);
+        wheel(&mut s, 3, false);
+        assert_eq!(zoom(&mut s), before, "without Ctrl the wheel doesn't zoom");
         std::fs::remove_file(path).ok();
     }
 

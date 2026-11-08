@@ -996,6 +996,15 @@ impl EditorState {
 
     /// Scrolls any window by `n` lines (the mouse wheel), moving its point
     /// onto the screen when it scrolls off, as `C-e` and `C-y` do.
+    /// Zooms a PDF buffer by `by` times (from a quarter to eight times its
+    /// fitted size), or back to fitting the window with 0.
+    pub fn zoom_pdf(&mut self, buffer: BufferId, by: f32) {
+        let now = self.pdf_zoom.get(&buffer).copied().unwrap_or(1.);
+        let zoom = if by <= 0. { 1. } else { (now * by).clamp(0.25, 8.) };
+        self.pdf_zoom.insert(buffer, zoom);
+        self.message = format!("Zoom {:.0}%", zoom * 100.);
+    }
+
     pub fn scroll_window_by(&mut self, id: WindowId, n: isize) {
         let Some(w) = self.window_by_id(id) else { return };
         let Some(buffer) = self.buffer_by_id(w.buffer) else { return };

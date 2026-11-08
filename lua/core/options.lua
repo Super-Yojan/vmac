@@ -26,7 +26,7 @@ vmac.map("normal", "SPC t p", "toggle-pdf-theme")
 -- In a PDF, in front of normal state's keys (core.keymaps.pdf): j k and
 -- C-e C-y scroll a little, C-d C-u half a window, C-f C-b a window, J K a
 -- page, gg the first page and G the last (5G page 5). Counts work: 3j.
--- + and - zoom (Cmd = and Cmd - too), = fits the pages to the window again
+-- + and - zoom (Cmd = and Cmd -, and Ctrl with the wheel, too), = fits the pages to the window again
 -- (Cmd 0), and h l scroll sideways across pages zoomed wider than it.
 
 vmac.command("pdf-down", function() vmac.pdf_scroll("lines", 1) end)
