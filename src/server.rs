@@ -8,6 +8,7 @@
 use crate::editor::SessionRequest;
 use crate::frame::{Frame, Input, Segment, Viewport};
 use crate::session::Session;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -46,6 +47,26 @@ pub trait Host {
         None
     }
     fn clipboard(&mut self, _text: String) {}
+    /// Sessions on the window's other machines, named as this one should
+    /// list them ("devbox:notes", "local:main"), and what its sessions asked
+    /// of the window (to switch to one of those, to connect).
+    fn set_foreign(&mut self, _names: Vec<String>) {}
+    fn take_window_requests(&mut self) -> Vec<WindowRequest> {
+        Vec::new()
+    }
+    /// This server's sessions, and makes `name` the active one (made if
+    /// there's none such, or a project's when it's a folder).
+    fn sessions(&self) -> Vec<String>;
+    fn switch_to(&mut self, name: &str);
+}
+
+/// What a session asks of the window it's shown in.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum WindowRequest {
+    /// Show this session of another of the window's machines.
+    Switch(String),
+    /// Connect to another machine (`HOST [TARGET]`).
+    Connect { host: String, target: String },
 }
 
 impl Host for Server {
@@ -66,6 +87,19 @@ impl Host for Server {
     }
     fn pump_servers(&mut self) -> bool {
         Server::pump_servers(self)
+    }
+    fn set_foreign(&mut self, names: Vec<String>) {
+        Server::set_foreign(self, names)
+    }
+    fn take_window_requests(&mut self) -> Vec<WindowRequest> {
+        std::mem::take(&mut self.window_requests)
+    }
+    fn sessions(&self) -> Vec<String> {
+        self.names().1
+    }
+    fn switch_to(&mut self, name: &str) {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        self.attach(Some(name), &home);
     }
 }
 
@@ -93,6 +127,10 @@ pub struct Server {
     /// Keep the process's working folder at the active session's, for
     /// plugins that run programs without saying where (the app; not tests).
     follow_cwd: bool,
+    /// Sessions on the window's other machines (listed after these), and
+    /// what sessions asked of the window.
+    foreign: Vec<String>,
+    window_requests: Vec<WindowRequest>,
 }
 
 impl Server {
@@ -105,6 +143,8 @@ impl Server {
             make,
             client: Vec::new(),
             follow_cwd: false,
+            foreign: Vec::new(),
+            window_requests: Vec::new(),
         };
         let name = {
             let st = first.editor().lock();
@@ -170,7 +210,7 @@ impl Server {
     /// Tells every session the sessions' names, and moves the process's
     /// working folder to the active one's.
     fn sync(&mut self) {
-        let names: Vec<String> = self.list.iter().map(|e| e.name.clone()).collect();
+        let names: Vec<String> = self.list.iter().map(|e| e.name.clone()).chain(self.foreign.iter().cloned()).collect();
         for e in &self.list {
             let mut st = e.session.editor().lock();
             st.session_names = names.clone();
@@ -182,6 +222,19 @@ impl Server {
                 let _ = std::env::set_current_dir(&cwd);
             }
         }
+    }
+
+    /// Sessions on the window's other machines.
+    pub fn set_foreign(&mut self, names: Vec<String>) {
+        if names != self.foreign {
+            self.foreign = names;
+            self.sync();
+        }
+    }
+
+    /// What sessions asked of the window.
+    pub fn take_window_requests(&mut self) -> Vec<WindowRequest> {
+        std::mem::take(&mut self.window_requests)
     }
 
     fn switch(&mut self, id: SessionId) {
@@ -241,8 +294,10 @@ impl Server {
         match request {
             SessionRequest::Switch(name) => match self.by_name(&name) {
                 Some(id) => self.switch(id),
+                None if self.foreign.contains(&name) => self.window_requests.push(WindowRequest::Switch(name)),
                 None => self.message(format!("No session {name}")),
             },
+            SessionRequest::Connect { host, target } => self.window_requests.push(WindowRequest::Connect { host, target }),
             SessionRequest::Last => match self.last.filter(|id| self.list.iter().any(|e| e.id == *id)) {
                 Some(id) => self.switch(id),
                 None => self.message("No other session".into()),
@@ -297,6 +352,9 @@ impl Server {
     }
 
     fn kill(&mut self, name: &str, force: bool) {
+        if self.foreign.iter().any(|f| f == name) {
+            return self.message(format!("{name} is on another machine: kill it from one of its sessions"));
+        }
         let Some(id) = self.by_name(name) else { return self.message(format!("No session {name}")) };
         if self.list.len() == 1 {
             return self.message("That's the only session".into());
@@ -324,9 +382,11 @@ impl Server {
     /// The active session's frame; with several sessions, its name leads
     /// the selected window's modeline.
     pub fn frame(&mut self, viewport: Viewport) -> Frame {
-        let several = self.list.len() > 1;
-        let (name, _) = self.names();
+        let several = self.list.len() + self.foreign.len() > 1;
+        let (name, all) = self.names();
         let mut frame = self.active_session().frame(viewport);
+        frame.sessions = all;
+        frame.session = name.clone();
         if several && let Some(w) = frame.windows.iter_mut().find(|w| w.selected) {
             w.modeline.insert(0, Segment { text: format!("[{name}]"), face: "accent".into() });
         }

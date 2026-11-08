@@ -415,6 +415,8 @@ pub enum SessionRequest {
     Rename(String),
     /// Open a project: its session, made if it has none.
     Project(PathBuf),
+    /// Add another machine's sessions to the window (`:connect`).
+    Connect { host: String, target: String },
 }
 
 /// A line of the review: its file, on the new (modified) or old side, 1-based.

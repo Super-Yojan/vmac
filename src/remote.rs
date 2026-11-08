@@ -154,7 +154,11 @@ pub fn install(host: &str) -> Result<(String, bool)> {
     let dir = path.trim_end_matches("/vmac");
     let status = Command::new("ssh")
         .args(["-o", "BatchMode=yes", "-C", host])
-        .arg(format!("mkdir -p {dir} && cat > {path}.part && chmod +x {path}.part && mv {path}.part {path}"))
+        // Then builds no server runs from go.
+        .arg(format!(
+            "mkdir -p {dir} && cat > {path}.part && chmod +x {path}.part && mv {path}.part {path} && \
+             for old in .vmac/server/*; do [ \"$old\" = {dir} ] || pgrep -f \"$old/vmac\" >/dev/null || rm -rf \"$old\"; done"
+        ))
         .stdin(std::fs::File::open(&binary)?)
         .status()?;
     if !status.success() {

@@ -43,6 +43,10 @@ pub enum ToServer {
     /// it last said on stderr).
     AgentOut { id: u64, line: String },
     AgentExit { id: u64, error: String },
+    /// Sessions on the window's other machines, and show this server's
+    /// session of that name (made if there's none, a project's for a folder).
+    Foreign(Vec<String>),
+    Switch(String),
     /// Ask for the sessions' names (and then the server hangs up).
     List,
     KillServer,
@@ -64,12 +68,14 @@ pub enum ToClient {
     SpawnAgent(crate::remote_agent::Spawn),
     AgentIn { id: u64, line: String },
     AgentStop { id: u64 },
+    /// What a session asked of the window.
+    Window(crate::server::WindowRequest),
 }
 
 /// Bumped when the messages change in a way older servers can't read: each
 /// version has its own socket, so a newer window never talks to an older
 /// server (stop that one with its own `vmac kill-server`).
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.
@@ -202,6 +208,8 @@ fn run(
     // The window that runs sessions' agents (one on another machine).
     let mut agent_window: Option<ClientId> = None;
     let mut agent_windows: Vec<ClientId> = Vec::new();
+    // The window typed into last: what sessions ask of a window goes there.
+    let mut last_input: Option<ClientId> = None;
     let (mut last_lsp, mut last_reload) = (Instant::now(), Instant::now());
     loop {
         // Wait for a message, or until terminals are due to be read.
@@ -245,6 +253,7 @@ fn run(
                 }
                 Some(ToServer::Input(input)) => {
                     client.acks += 1;
+                    last_input = Some(id);
                     server.handle(input);
                     changed = true;
                 }
@@ -256,6 +265,17 @@ fn run(
                 }
                 Some(ToServer::Clipboard(text)) => crate::clipboard::relay_from_window(text),
                 Some(ToServer::AgentOut { id: agent, line }) => crate::remote_agent::deliver(agent, &line),
+                Some(ToServer::Foreign(names)) => {
+                    server.set_foreign(names);
+                    changed = true;
+                }
+                Some(ToServer::Switch(name)) => {
+                    client.acks += 1;
+                    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                    server.attach(Some(&name), &home);
+                    last_input = Some(id);
+                    changed = true;
+                }
                 Some(ToServer::AgentExit { id: agent, error }) => crate::remote_agent::exited(agent, &error),
                 Some(ToServer::List) => {
                     let (active, all) = server.names();
@@ -290,6 +310,11 @@ fn run(
                 ToWindow::Line(id, line) => ToClient::AgentIn { id, line },
                 ToWindow::Stop(id) => ToClient::AgentStop { id },
             });
+        }
+        for request in server.take_window_requests() {
+            if let Some(window) = last_input.and_then(|w| clients.get(&w)).or_else(|| clients.values().last()) {
+                window.send(&ToClient::Window(request));
+            }
         }
         // What sessions copied, for windows on other machines.
         for text in crate::clipboard::relay_take_copied() {
@@ -344,6 +369,10 @@ pub struct Client {
     remote: bool,
     /// Text the server copied, for this machine's clipboard.
     copied: Option<String>,
+    /// What its sessions asked of the window, and the other machines'
+    /// sessions it was last told of.
+    window_requests: Vec<crate::server::WindowRequest>,
+    foreign: Vec<String>,
     frame: Option<Frame>,
     viewport: Option<Viewport>,
     /// Messages sent (Hello, inputs, sizes) and not answered yet: drawing
@@ -389,6 +418,8 @@ impl Client {
             carrier,
             remote,
             copied: None,
+            window_requests: Vec::new(),
+            foreign: Vec::new(),
             frame: None,
             viewport: Some(viewport),
             waiting: 0,
@@ -456,6 +487,7 @@ impl Client {
                     }
                 }
                 Some(ToClient::AgentStop { id }) => drop(self.agents.remove(&id)),
+                Some(ToClient::Window(request)) => self.window_requests.push(request),
                 // A server on this machine has the clipboard already.
                 Some(ToClient::Clipboard(text)) => {
                     if self.remote {
@@ -600,6 +632,27 @@ impl Host for Client {
 
     fn clipboard(&mut self, text: String) {
         self.send(&ToServer::Clipboard(text));
+    }
+
+    fn set_foreign(&mut self, names: Vec<String>) {
+        if names != self.foreign {
+            self.foreign = names.clone();
+            self.send(&ToServer::Foreign(names));
+        }
+    }
+
+    fn take_window_requests(&mut self) -> Vec<crate::server::WindowRequest> {
+        self.receive(Duration::ZERO);
+        std::mem::take(&mut self.window_requests)
+    }
+
+    fn sessions(&self) -> Vec<String> {
+        self.frame.as_ref().map(|f| f.sessions.clone()).unwrap_or_default()
+    }
+
+    fn switch_to(&mut self, name: &str) {
+        self.waiting += 1;
+        self.send(&ToServer::Switch(name.to_string()));
     }
 }
 

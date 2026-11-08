@@ -601,6 +601,8 @@ impl Session {
             picker,
             preview,
             buffers: st.buffer_ids(),
+            sessions: Vec::new(),
+            session: String::new(),
         };
         drop(st);
         self.custom = custom;

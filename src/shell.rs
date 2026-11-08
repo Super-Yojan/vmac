@@ -150,9 +150,7 @@ impl Shell {
         Self::watch_sources(cx);
         Self::drive_language_servers(cx);
         Self::drive_terminals(cx);
-        if session.wants_clipboard() {
-            Self::relay_clipboard(cx);
-        }
+        Self::relay_clipboard(cx);
         // Light or dark as the system is, and again whenever it changes.
         let appearance = cx.observe_window_appearance(window, |shell, _, cx| {
             shell.applied_mode = None;
@@ -181,6 +179,10 @@ impl Shell {
             loop {
                 cx.background_executor().timer(CLIPBOARD_POLL).await;
                 let alive = this.update(cx, |shell, cx| {
+                    // Only with a server on another machine (one may join later).
+                    if !shell.session.wants_clipboard() {
+                        return;
+                    }
                     if let Some(text) = shell.session.take_copied() {
                         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
                         shell.clipboard_told = Some(text);

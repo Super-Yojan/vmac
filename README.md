@@ -226,6 +226,11 @@ names it; with several, the modeline starts with `[name]`.
 - `SPC S s` switches session, `SPC S l` goes back to the last one.
 - `SPC S n` makes one (it asks a name), `SPC S r` renames this one.
 - `SPC S k` kills one (not with unsaved files: `SPC S K` kills it anyway).
+- `SPC S c` (or `:connect HOST [TARGET]`) adds another machine's sessions
+  to the window, over ssh (see below). The switcher then lists them all:
+  this machine's by name, the other's as `host:name`, and, while you're in
+  one of those, this machine's as `local:name`. `:q` there detaches from
+  that machine only.
 - `vmac.set_session_per_project(false)` opens projects in the session
   you're in instead.
 
@@ -269,7 +274,8 @@ the release's download. ssh needs to log in without asking (a key, or an agent).
 Closing the window detaches; the remote sessions keep running, and the
 next `connect` finds them. What you yank there lands on this machine's
 clipboard, and `p` there pastes what you copied here. From inside vmac,
-`SPC S c` or `:connect HOST [TARGET]` opens such a window. After updating
+`SPC S c` or `:connect HOST [TARGET]` adds the machine's sessions to the
+window you're in, beside yours. After updating
 vmac, `vmac connect --restart HOST` replaces the older server running there
 (closing its sessions).
 

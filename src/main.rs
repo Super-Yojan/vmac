@@ -15,6 +15,7 @@ mod markdown;
 mod packages;
 mod picker;
 mod frame;
+mod hosts;
 mod review;
 mod server;
 mod session;
@@ -170,7 +171,8 @@ fn open_window_with(host: impl FnOnce() -> Box<dyn server::Host> + 'static) {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, move |window, cx| {
-                let host = host();
+                // Its own sessions first; other machines' join with :connect.
+                let host: Box<dyn server::Host> = Box::new(hosts::Hosts::new(host()));
                 cx.new(|cx| Shell::new(host, window, cx))
             })
             .expect("failed to open window");

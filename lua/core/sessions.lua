@@ -6,8 +6,12 @@
 --   SPC S s   switch session                SPC S l   the last session
 --   SPC S n   new session (asks a name)     SPC S r   rename this session
 --   SPC S k   kill a session                SPC S K   kill it, unsaved files and all
---   SPC S c   connect to another machine (:connect HOST [TARGET]): a
---             window on its sessions, over ssh (`vmac connect`)
+--   SPC S c   connect to another machine (:connect HOST [TARGET]), over
+--             ssh: its sessions join this window's
+--
+-- The switcher lists every machine's sessions: this machine's by name,
+-- another's as host:name (and, from another machine, this one's as
+-- local:name). :q in another machine's session detaches from it.
 --
 -- The first project a session opens names it. To open projects in the
 -- session you're in instead: vmac.set_session_per_project(false)

@@ -89,6 +89,12 @@ pub struct Frame {
     pub preview: Option<PreviewPane>,
     /// The buffers that exist, so the window can drop what it kept for others.
     pub buffers: Vec<BufferId>,
+    /// The server's sessions, and the one shown (for a window that shows
+    /// several machines' sessions).
+    #[serde(default)]
+    pub sessions: Vec<String>,
+    #[serde(default)]
+    pub session: String,
 }
 
 /// The theme mode ("system", "light" or "dark") and the theme for each.

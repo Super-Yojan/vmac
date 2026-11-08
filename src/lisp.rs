@@ -1419,28 +1419,9 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "session-rename", |s, name: String| s.session_requests.push(SessionRequest::Rename(name)));
     prim!(reg, editor, "set-session-per-project", |s, on: bool| s.session_per_project = on);
-    // Opens a window on a server on another machine (`vmac connect`), a
-    // program of its own; what it says goes to connect.log.
+    // Adds another machine's sessions to the window (`vmac connect`'s).
     prim!(reg, editor, "connect", |s, host: String, target: String| {
-        let log = crate::projects::History::default_dir().map(|d| {
-            let _ = std::fs::create_dir_all(&d);
-            d.join("connect.log")
-        });
-        let out = || {
-            log.as_ref()
-                .and_then(|l| std::fs::OpenOptions::new().create(true).append(true).open(l).ok())
-                .map(std::process::Stdio::from)
-                .unwrap_or_else(std::process::Stdio::null)
-        };
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "vmac".into()));
-        command.arg("connect").arg(&host);
-        if !target.is_empty() {
-            command.arg(&target);
-        }
-        s.message = match command.stdin(std::process::Stdio::null()).stdout(out()).stderr(out()).spawn() {
-            Ok(_) => format!("connecting to {host} (a window opens; {})", log.map(|l| crate::projects::abbreviate(&l)).unwrap_or_default()),
-            Err(e) => format!("connect: {e}"),
-        };
+        s.session_requests.push(SessionRequest::Connect { host, target })
     });
 
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
