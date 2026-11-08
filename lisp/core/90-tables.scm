@@ -17,15 +17,18 @@
 
 ;;;; Viewing Markdown
 ;;
-;; Outside insert state, Markdown shows without its markup: headings
-;; without #, bold and italic without the stars, code without backticks,
-;; links as their text, bullets, rules and table lines drawn. In insert
-;; state it shows everything, as typed. SPC t m (or
-;; (set-markdown-conceal #f)) shows the markup all the time.
+;; Outside insert and visual state, a Markdown file is drawn like the
+;; preview, by gpui-kit: headings, code blocks, tables, images and HTML
+;; rendered. Motions still move the cursor through the text: the view
+;; scrolls to its line and marks it. i, a, o... (or v) show the text as
+;; typed, to edit. SPC t m cycles: rendered -> markup hidden in the text
+;; (headings without #, code without backticks, still the editor's own
+;; drawing) -> as typed. In init.scm: (set-markdown-view "hidden"), or
+;; "rendered" or "raw".
 ;;
-;; SPC m p opens a preview beside it instead, rendered like a web page (by
-;; gpui-kit), following the file you're in as you type; again closes it.
-;; (set-markdown-preview #t) opens it from the start.
+;; SPC m p opens a preview beside it instead, following the file you're in
+;; as you type; again closes it. (set-markdown-preview #t) opens it from
+;; the start.
 
 (defcommand (markdown-preview) (markdown-preview-toggle))
-(defcommand (markdown-conceal) (markdown-conceal-toggle))
+(defcommand (markdown-conceal) (markdown-view-cycle))

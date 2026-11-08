@@ -41,7 +41,16 @@ pub fn highlight(rope: &Rope, lines: Range<usize>) -> Vec<Vec<Span>> {
             let text = rope.line(i).to_string();
             let text = text.trim_end_matches(['\n', '\r']);
             let fence = FENCE.is_match(text);
-            let spans = if in_fence || fence {
+            let spans = if fence {
+                // The fence, then its language ("rust"): a label.
+                let end = FENCE.find(text).map_or(0, |m| text[..m.end()].chars().count());
+                let n = text.chars().count();
+                let mut v = vec![Span { start: 0, end, capture: "markup.raw.block".into() }];
+                if n > end {
+                    v.push(Span { start: end, end: n, capture: "markup.raw.block.info".into() });
+                }
+                v
+            } else if in_fence {
                 whole(text, "markup.raw.block")
             } else if is_table_row(text) {
                 let next = (i + 1 < rope.len_lines()).then(|| rope.line(i + 1).to_string());
@@ -74,8 +83,15 @@ pub fn conceal(rope: &Rope, lines: Range<usize>) -> Vec<Vec<(usize, Option<char>
             let text = rope.line(i).to_string();
             let chars: Vec<char> = text.trim_end_matches(['\n', '\r']).chars().collect();
             let mut out: Vec<(usize, Option<char>)> = Vec::new();
-            // In a table, hiding markup would undo the columns' alignment:
-            // only its borders are drawn.
+            // A code fence: its ``` go, its language stays as a label.
+            let line_text: String = chars.iter().collect();
+            if let Some(m) = FENCE.find(&line_text) {
+                let start = line_text[..m.start()].chars().count();
+                let end = line_text[..m.end()].chars().count();
+                out.extend((start..end).map(|c| (c, None)));
+                return out;
+            }
+            // In a table, hidden markup becomes spaces, so the columns stay aligned.
             let table = spans.iter().any(|sp| sp.capture == "markup.table.delimiter");
             let hide = |a: usize, b: usize, out: &mut Vec<(usize, Option<char>)>| out.extend((a..b).map(|c| (c, None)));
             for sp in &spans {
@@ -84,9 +100,6 @@ pub fn conceal(rope: &Rope, lines: Range<usize>) -> Vec<Vec<(usize, Option<char>
                     continue;
                 }
                 let c = sp.capture.as_str();
-                if table && c != "markup.table.delimiter" {
-                    continue;
-                }
                 let heading_marker = c.starts_with("markup.heading.") && c.ends_with(".marker");
                 // The first and last character: [text], *italic*, `code`.
                 let wrapped = (c == "markup.link.text" && chars[a] == '[' && chars[b - 1] == ']')
@@ -120,6 +133,11 @@ pub fn conceal(rope: &Rope, lines: Range<usize>) -> Vec<Vec<(usize, Option<char>
             }
             out.sort_by_key(|o| o.0);
             out.dedup_by_key(|o| o.0);
+            if table {
+                for o in out.iter_mut().filter(|o| o.1.is_none()) {
+                    o.1 = Some(' ');
+                }
+            }
             out
         })
         .collect()
@@ -304,10 +322,12 @@ mod tests {
         assert_eq!(concealed("> said\n"), "▎ said");
         assert_eq!(concealed("---\n"), "───");
         assert_eq!(concealed("| a | b |\n"), "│ a │ b │");
-        assert_eq!(concealed("| `a` | **b** |\n"), "│ `a` │ **b** │", "cells keep their width");
+        assert_eq!(concealed("| `a` | **b** |\n"), "│  a  │   b   │", "cells keep their width, markup as spaces");
         assert_eq!(concealed("`**raw**`\n"), "**raw**", "inside code, only the backticks go");
-        let rope = Rope::from_str("```\n**kept**\n```\n");
+        let rope = Rope::from_str("```sh\n**kept**\n```\n");
         assert!(conceal(&rope, 1..2)[0].is_empty(), "code blocks are left alone");
+        assert_eq!(conceal(&rope, 0..1)[0], vec![(0, None), (1, None), (2, None)], "the fence goes, its language stays");
+        assert_eq!(conceal(&rope, 2..3)[0].len(), 3, "the closing fence goes");
     }
 
     #[test]

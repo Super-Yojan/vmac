@@ -42,6 +42,16 @@ pub struct Shell {
     /// the system's appearance change.
     applied_mode: Option<(gpui_kit::component::ThemeMode, String)>,
     _appearance: gpui_kit::Subscription,
+    /// Markdown buffers shown rendered (in normal state): their gpui-kit
+    /// view, the text it last got and the cursor line it last revealed.
+    md_views: std::collections::HashMap<crate::editor::BufferId, MdView>,
+}
+
+struct MdView {
+    state: gpui_kit::Entity<gpui_kit::base::text::TextViewState>,
+    revision: u64,
+    revealed: Option<usize>,
+    _changed: gpui_kit::Subscription,
 }
 
 impl Shell {
@@ -90,6 +100,7 @@ impl Shell {
             syntax: Syntax::default(),
             applied_mode: None,
             _appearance: appearance,
+            md_views: Default::default(),
         };
         shell.apply_theme(window, cx);
         shell
@@ -282,6 +293,8 @@ fn face_color(face: &str, cx: &App) -> Hsla {
     }
     match face {
         "muted" => t.muted,
+        // A tint of the text color: shows on any theme (code's background).
+        "subtle" => t.foreground.opacity(0.09),
         "strong" => t.foreground,
         "dim" => t.muted_foreground,
         "accent" => t.primary,
@@ -450,6 +463,52 @@ fn line_element(view: LineView, bar: bool, cx: &App) -> impl IntoElement {
             (true, false) => run.bg(t.caret).text_color(t.background),
         }
     }))
+}
+
+/// The which-key popup: a panel just above the echo area listing available keys.
+fn whichkey_element(entries: &[(String, String)], width: f32, cx: &App) -> gpui_kit::AnyElement {
+    let t = cx.theme();
+    let col_width: f32 = 220.0;
+    let cols = ((width - 16.) / col_width).floor().max(1.) as usize;
+    let rows = entries.len().div_ceil(cols);
+    let max_rows = 8;
+    let panel_rows = rows.min(max_rows);
+    let panel_height = panel_rows as f32 * ROW_HEIGHT + 12.;
+
+    div()
+        .absolute()
+        .bottom(px(ROW_HEIGHT + 4.))
+        .left(px(0.))
+        .right(px(0.))
+        .mx(px(8.))
+        .h(px(panel_height))
+        .overflow_hidden()
+        .bg(t.popover)
+        .text_color(t.popover_foreground)
+        .border_1()
+        .border_color(t.border)
+        .rounded(t.radius)
+        .shadow_lg()
+        .px(px(10.))
+        .py(px(6.))
+        .child(
+            h_flex()
+                .flex_wrap()
+                .children(entries.iter().map(|(key, label)| {
+                    let is_group = label.starts_with('+');
+                    h_flex()
+                        .w(px(col_width))
+                        .h(px(ROW_HEIGHT))
+                        .gap(px(4.))
+                        .child(div().text_color(t.primary).min_w(px(24.)).child(key.clone()))
+                        .child(
+                            div()
+                                .text_color(if is_group { t.primary } else { t.muted_foreground })
+                                .child(label.clone()),
+                        )
+                })),
+        )
+        .into_any_element()
 }
 
 /// A picker item, its matched letters in the accent color.
@@ -686,6 +745,63 @@ impl Render for Shell {
         let minibuffer_open = st.minibuffer_prompt.is_some();
         let selected = st.selected_window();
         let font = st.font.clone().map(gpui_kit::SharedString::from);
+        // Markdown files shown rendered, like the preview: in every window on
+        // one, except the window you're typing or selecting in.
+        let mut rendered: std::collections::HashMap<crate::editor::WindowId, gpui_kit::Entity<gpui_kit::base::text::TextViewState>> =
+            Default::default();
+        let selected_now = st.selected_window();
+        if st.markdown_rendered {
+            // The line you are on, in the theme's selection color: plain to see.
+            let highlight = cx.theme().selection;
+            for (id, _) in &rects {
+                let Some(w) = st.window_by_id(*id).cloned() else { continue };
+                if st.is_sidebar(*id) || (*id == selected_now && markdown_raw) {
+                    continue;
+                }
+                let Some(buffer) = st.buffer_by_id(w.buffer) else { continue };
+                let is_md = buffer.file().and_then(|f| language_for_path(f)) == Some("markdown");
+                if !is_md {
+                    continue;
+                }
+                let source = buffer.text().to_string();
+                let revision = buffer.revision();
+                let cursor_line = buffer.text().char_to_line(st.window_point(*id).min(buffer.len()));
+                let view = self.md_views.entry(w.buffer).or_insert_with(|| {
+                    let state = gpui_kit::AppContext::new(cx, |cx| gpui_kit::base::text::TextViewState::markdown(&source, cx));
+                    // Its parse lands later: draw again then.
+                    let changed = cx.observe(&state, |_, _, cx| cx.notify());
+                    MdView { state, revision, revealed: None, _changed: changed }
+                });
+                if view.revision != revision {
+                    view.revision = revision;
+                    view.revealed = None;
+                    view.state.update(cx, |s, cx| s.set_text(&source, cx));
+                }
+                // The cursor's line: scrolled to and marked, once the parse matches the text.
+                if view.revealed != Some(cursor_line) {
+                    let text = view.state.read(cx).rendered_text();
+                    if text.source() == source {
+                        let rope = buffer.text();
+                        let found = (cursor_line..rope.len_lines().min(cursor_line + 40)).find_map(|l| {
+                            let a = rope.line_to_byte(l);
+                            let b = rope.line_to_byte((l + 1).min(rope.len_lines()));
+                            text.range_for_source(a..b)
+                        });
+                        if let Some(range) = found {
+                            view.state.update(cx, |s, cx| {
+                                let _ = s.reveal_range(range.clone(), cx);
+                                let _ = s.set_range_highlights([gpui_kit::base::text::RangeHighlight::new(range, highlight)], cx);
+                            });
+                        }
+                        view.revealed = Some(cursor_line);
+                    }
+                }
+                rendered.insert(*id, view.state.clone());
+            }
+        }
+        let live: std::collections::HashSet<crate::editor::BufferId> = st.buffer_ids().into_iter().collect();
+        self.md_views.retain(|id, _| live.contains(id));
+
         let syntax_theme = self.lisp.syntax_theme();
         let syntax = &mut self.syntax;
         let theme = cx.theme();
@@ -832,8 +948,12 @@ impl Render for Shell {
                         let current = is_sidebar && i == cur_line;
                         let marks = review_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
                         let added = marks.contains(&(i, true));
+                        // Markdown code blocks: a band across the window.
+                        let code_block = language == Some("markdown")
+                            && spans.get(i.wrapping_sub(lo)).is_some_and(|l| l.iter().any(|sp| sp.capture == "markup.raw.block"));
                         let deleted_above = marks.contains(&(i, false));
                         div().relative()
+                        .when(code_block, |d| d.bg(theme.foreground.opacity(0.06)))
                         .when(current, |d| {
                             d.bg(if is_selected { theme.list_active } else { theme.list_hover })
                         })
@@ -862,7 +982,31 @@ impl Render for Shell {
                         .h(px(r.h * area))
                         .when(r.x > 0., |d| d.border_l_1().border_color(theme.border))
                         .when(is_sidebar, |d| d.bg(theme.sidebar))
-                        .child(v_flex().flex_1().overflow_hidden().px(px(8.)).children(lines))
+                        .child(match rendered.get(id) {
+                            // Rendered Markdown: images, code blocks, tables, HTML.
+                            Some(state) => {
+                                let folder = buffer.file().and_then(|f| f.parent()).map(|d| d.to_path_buf()).unwrap_or_default();
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .px(px(20.))
+                                    .py(px(10.))
+                                    .font_family(theme.font_family.clone())
+                                    .text_size(px(15.))
+                                    .line_height(px(22.))
+                                    .child(
+                                        gpui_kit::base::text::TextView::new(state)
+                                            .scrollable(true)
+                                            .selectable(false)
+                                            .image_source(move |uri| match local_image(&folder, uri.as_ref()) {
+                                                Some(path) => path.into(),
+                                                None => uri.clone().into(),
+                                            }),
+                                    )
+                                    .into_any_element()
+                            }
+                            None => v_flex().flex_1().overflow_hidden().px(px(8.)).children(lines).into_any_element(),
+                        })
                         .child(
                             h_flex()
                                 .h(px(ROW_HEIGHT))
@@ -954,6 +1098,8 @@ impl Render for Shell {
                         .child(div().flex_none().text_color(theme.primary).child(item.kind))
                 }))
         });
+        // Which-key popup, just above the echo area when a prefix key is pending.
+        let whichkey = st.whichkey.as_ref().map(|wk| whichkey_element(wk, width, cx));
         // The picker draws its own query line; the echo area keeps the message.
         let overlay = st.picker.as_ref().map(|p| picker_element(p, &st.minibuffer, bar, height, cx));
         let echo = match &st.minibuffer_prompt {
@@ -1037,6 +1183,7 @@ impl Render for Shell {
             .line_height(px(ROW_HEIGHT))
             .child(div().relative().w_full().h(px(area)).children(windows).children(preview))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
+            .children(whichkey)
             .children(hover)
             .children(completion)
             .children(overlay)

@@ -300,6 +300,8 @@ pub struct EditorState {
     pub lsp: Lsp,
     /// Documentation shown by K, until the next key.
     pub hover: Option<String>,
+    /// Which-key popup: (key, label) pairs shown when a prefix is pending.
+    pub whichkey: Option<Vec<(String, String)>>,
     /// Where gd and other jumps came from, for C-o: (buffer, point).
     jumps: Vec<(BufferId, usize)>,
     /// The completion popup while typing, if open.
@@ -327,6 +329,9 @@ pub struct EditorState {
     /// Markdown: markup hidden outside insert state (headings without #,
     /// bold without **...), and the preview pane, with the last buffer it showed.
     pub markdown_conceal: bool,
+    /// Markdown files drawn like the preview (rendered) outside insert and
+    /// visual state; when off, `markdown_conceal` hides the markup instead.
+    pub markdown_rendered: bool,
     pub markdown_preview: bool,
     pub preview_last: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
@@ -464,6 +469,7 @@ impl EditorState {
             picker: None,
             lsp: Lsp::default(),
             hover: None,
+            whichkey: None,
             jumps: Vec::new(),
             completion: None,
             code_actions: Vec::new(),
@@ -478,6 +484,7 @@ impl EditorState {
             theme_names: Vec::new(),
             system_dark: false,
             markdown_conceal: true,
+            markdown_rendered: true,
             markdown_preview: false,
             preview_last: None,
             terminals_to_kill: Vec::new(),
@@ -553,6 +560,10 @@ impl EditorState {
             Some(id) => id,
             None => self.add_buffer(Buffer::new(name)),
         }
+    }
+
+    pub fn buffer_ids(&self) -> Vec<BufferId> {
+        self.buffers.iter().map(|(id, _)| *id).collect()
     }
 
     pub fn buffer_names(&self) -> Vec<String> {

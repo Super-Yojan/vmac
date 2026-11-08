@@ -29,6 +29,37 @@
           ((string-prefix? p (car (car keymap))) #t)
           (else (keymap-prefix? (cdr keymap) seq)))))
 
+;; All next keys after a prefix, as ((next-key label) ...).
+;; A sub-prefix gets "+key", a leaf binding gets its command name.
+(define (keymap-next-keys keymap prefix)
+  (let ((p (string-append prefix " "))
+        (plen (+ (string-length prefix) 1))
+        (seen (hash)))
+    (let loop ((km keymap) (result '()))
+      (if (null? km)
+          (reverse result)
+          (let* ((entry (car km))
+                 (key (car entry))
+                 (binding (second entry)))
+            (if (string-prefix? p key)
+                (let* ((rest (substring key plen (string-length key)))
+                       (sp (space-index rest))
+                       (next (if sp (substring rest 0 sp) rest)))
+                  (if (hash-contains? seen next)
+                      (loop (cdr km) result)
+                      (begin
+                        (set! seen (hash-insert seen next #t))
+                        (let ((full (string-append prefix " " next)))
+                          (loop (cdr km)
+                                (cons (list next
+                                            (if (keymap-prefix? keymap full)
+                                                (string-append "+" next)
+                                                (if (symbol? binding)
+                                                    (symbol->string binding)
+                                                    "...")))
+                                      result))))))
+                (loop (cdr km) result)))))))
+
 ;; (define-key normal-map "Q" 'some-command). The keymap variables are
 ;; replaced, not mutated, so define-key is a macro that set!s the variable.
 (define-syntax define-key

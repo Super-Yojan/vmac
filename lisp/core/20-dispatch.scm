@@ -120,7 +120,8 @@
                (if (procedure? binding) (binding) (repeat current-count binding)))
               ((keymap-prefix? keymap seq)
                (set! pending-keys seq)
-               (message (string-append seq "-")))
+               (message (string-append seq "-"))
+               (whichkey-open seq))
               ;; Typing into a terminal: every other key goes to its program.
               ((and (equal? pending-keys "") (terminal-insert?))
                (terminal-send key text))

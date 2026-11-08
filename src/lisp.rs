@@ -39,6 +39,7 @@ const CORE_FILES: &[(&str, &str)] = &[
     ("78-dashboard.scm", include_str!("../lisp/core/78-dashboard.scm")),
     ("80-lsp.scm", include_str!("../lisp/core/80-lsp.scm")),
     ("82-agent.scm", include_str!("../lisp/core/82-agent.scm")),
+    ("84-whichkey.scm", include_str!("../lisp/core/84-whichkey.scm")),
     ("85-bindings.scm", include_str!("../lisp/core/85-bindings.scm")),
     ("90-tables.scm", include_str!("../lisp/core/90-tables.scm")),
     ("92-syntax.scm", include_str!("../lisp/core/92-syntax.scm")),
@@ -488,8 +489,9 @@ impl Lisp {
     /// Hands a keystroke to Scheme's `dispatch-key`. `key` is Emacs notation
     /// (`"C-x"`, `"M-:"`, `"RET"`); `text` is what it would type, or "".
     pub fn dispatch_key(&mut self, key: &str, text: &str) {
-        // Any key closes the documentation K showed.
+        // Any key closes the documentation K showed and the which-key popup.
         self.editor.lock().hover = None;
+        self.editor.lock().whichkey = None;
         let args = vec![SteelVal::from(key.to_string()), SteelVal::from(text.to_string())];
         if let Err(e) = self.engine.call_function_by_name_with_args("dispatch-key", args) {
             self.editor.lock().message = format!("{key}: {e}");
@@ -1133,6 +1135,14 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         .as_ref()
         .and_then(|p| p.selection().map(str::to_string))
         .unwrap_or_default());
+    // Which-key: show available keys when a prefix is pending.
+    prim!(reg, editor, "whichkey-show", |s, entries: Vec<String>| {
+        let pairs = entries.chunks(2)
+            .filter_map(|c| Some((c.first()?.clone(), c.get(1)?.clone())))
+            .collect();
+        s.whichkey = Some(pairs);
+    });
+    prim!(reg, editor, "whichkey-hide", |s| s.whichkey = None);
     prim!(reg, editor, "undo-boundary", |s| s.current().undo_boundary());
     prim!(reg, editor, "undo", |s| s.current().undo());
     prim!(reg, editor, "redo", |s| s.current().redo());
@@ -1562,9 +1572,24 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "set-markdown-preview", |s, on: bool| s.markdown_preview = on);
     prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
-    prim!(reg, editor, "markdown-conceal-toggle", |s| {
-        s.markdown_conceal = !s.markdown_conceal;
-        s.message = if s.markdown_conceal { "Markdown: markup hidden (shown while typing)".into() } else { "Markdown: as typed".into() };
+    // SPC t m: rendered (like the preview) -> markup hidden -> as typed.
+    prim!(reg, editor, "markdown-view-cycle", |s| {
+        let (rendered, conceal, name) = match (s.markdown_rendered, s.markdown_conceal) {
+            (true, _) => (false, true, "markup hidden"),
+            (false, true) => (false, false, "as typed"),
+            (false, false) => (true, true, "rendered, like the preview"),
+        };
+        s.markdown_rendered = rendered;
+        s.markdown_conceal = conceal;
+        s.message = format!("Markdown: {name} (as typed while you type)");
+    });
+    prim!(reg, editor, "set-markdown-view", |s, view: String| {
+        match view.as_str() {
+            "rendered" => (s.markdown_rendered, s.markdown_conceal) = (true, true),
+            "hidden" => (s.markdown_rendered, s.markdown_conceal) = (false, true),
+            "raw" => (s.markdown_rendered, s.markdown_conceal) = (false, false),
+            other => s.message = format!("{other}: the Markdown view is rendered, hidden or raw"),
+        }
     });
     // The coding agent (ACP): prompts, permission answers, how to start it.
     prim!(reg, editor, "agent-prompt", |s, text: String| s.agent_prompt(&text));
@@ -3411,8 +3436,20 @@ mod tests {
         typed(&mut lisp, "i");
         assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#true");
         lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "v");
+        assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#true", "selecting shows the text too");
+        lisp.dispatch_key("ESC", "");
+        // SPC t m: rendered -> markup hidden -> as typed -> rendered.
+        assert!(editor.lock().markdown_rendered, "rendered by default");
         typed(&mut lisp, " tm");
-        assert!(!editor.lock().markdown_conceal);
+        let view = || { let st = editor.lock(); (st.markdown_rendered, st.markdown_conceal) };
+        assert_eq!(view(), (false, true));
+        typed(&mut lisp, " tm");
+        assert_eq!(view(), (false, false));
+        typed(&mut lisp, " tm");
+        assert_eq!(view(), (true, true));
+        lisp.eval(r#"(set-markdown-view "raw")"#).unwrap();
+        assert_eq!(view(), (false, false));
 
         // The preview takes the right of the editor while a Markdown file shows.
         let notes = dir.join("notes.md");

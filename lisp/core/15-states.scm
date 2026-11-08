@@ -43,9 +43,10 @@
         ((equal? evil-state 'operator) operator-map)
         (else normal-map)))
 
-;; Rust asks this for Markdown: as typed while you type into the buffer,
-;; with its markup hidden otherwise.
-(define (markdown-raw?) (and (equal? evil-state 'insert) (not (minibuffer-active?))))
+;; Rust asks this for Markdown: as typed while you type or select in it,
+;; rendered (or its markup hidden) otherwise.
+(define (markdown-raw?)
+  (and (or (equal? evil-state 'insert) (visual?)) (not (minibuffer-active?))))
 
 ;; Rust asks this for the cursor: a block, or a bar when typing.
 (define (cursor-shape) (if (inserting?) 'bar 'box))
