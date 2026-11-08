@@ -373,6 +373,7 @@ impl Shell {
         buffer: crate::frame::BufferId,
         path: &std::path::Path,
         themed: bool,
+        scroll: &[(u64, crate::frame::PdfScroll)],
         cx: &mut Context<Self>,
     ) -> gpui_kit::Entity<crate::media::PdfView> {
         let colors = themed.then(|| {
@@ -386,9 +387,16 @@ impl Shell {
         let view = self
             .pdf_views
             .entry(buffer)
-            .or_insert_with(|| gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf())))
+            .or_insert_with(|| {
+                // Scrolls asked for before this view existed are done with.
+                let seen = scroll.last().map_or(0, |(n, _)| *n);
+                gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf(), seen))
+            })
             .clone();
-        view.update(cx, |v, cx| v.refresh(colors, cx));
+        view.update(cx, |v, cx| {
+            v.refresh(colors, cx);
+            v.scroll(scroll);
+        });
         view
     }
 
@@ -1017,8 +1025,8 @@ impl Render for Shell {
                             .into_any_element()
                     }
                     Content::Media { path, kind: MediaKind::Image, .. } => crate::media::image_element(path, cx),
-                    Content::Media { path, kind: MediaKind::Pdf, themed } => {
-                        let view = self.pdf_view(w.buffer, path, *themed, cx);
+                    Content::Media { path, kind: MediaKind::Pdf, themed, scroll } => {
+                        let view = self.pdf_view(w.buffer, path, *themed, scroll, cx);
                         div().flex_1().overflow_hidden().child(view).into_any_element()
                     }
                     Content::Text(lines) => v_flex()

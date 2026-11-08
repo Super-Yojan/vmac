@@ -1265,6 +1265,33 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // PDFs in the theme's colors (the default), or black on white.
     prim!(reg, editor, "set-pdf-themed", |s, on: bool| s.pdf_themed = on);
     prim!(reg, editor, "pdf-themed", |s| s.pdf_themed);
+    // Keys in a PDF: whether this is one, and moving through it
+    // ("lines", "screens", "pages", "page" (from 1), or "end").
+    prim!(reg, editor, "pdf-here?", |s| {
+        s.buffer().file().and_then(|f| crate::frame::media_kind(f)) == Some(crate::frame::MediaKind::Pdf)
+    });
+    prim!(reg, editor, "pdf-scroll", |s, how: String, n: f64| {
+        use crate::frame::PdfScroll;
+        let scroll = match how.as_str() {
+            "lines" => PdfScroll::Lines(n as i32),
+            "screens" => PdfScroll::Screens(n as f32),
+            "pages" => PdfScroll::Pages(n as i32),
+            "page" => PdfScroll::Page((n as usize).saturating_sub(1)),
+            "end" => PdfScroll::End,
+            _ => {
+                s.message = format!("{how}: PDFs scroll by lines, screens, pages, to a page or the end");
+                return;
+            }
+        };
+        let id = s.window().buffer;
+        let queue = s.pdf_scroll.entry(id).or_default();
+        let n = queue.last().map_or(0, |(n, _)| *n) + 1;
+        queue.push((n, scroll));
+        // Plenty for the keys typed between two frames.
+        if queue.len() > 64 {
+            queue.remove(0);
+        }
+    });
     prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
     // SPC t m: markup hidden (the default) -> as typed -> rendered, like the preview.
     prim!(reg, editor, "markdown-view-cycle", |s| {
@@ -3577,6 +3604,28 @@ for line in sys.stdin:
         assert!(!editor.lock().pdf_themed);
         lisp.eval_lua("vmac.set_pdf_themed(not vmac.pdf_themed())").unwrap();
         assert!(editor.lock().pdf_themed);
+    }
+
+    #[test]
+    fn keys_in_a_pdf_scroll_it() {
+        use crate::frame::PdfScroll::*;
+        let (mut lisp, editor) = lisp_with("one\ntwo\n");
+        let path = std::env::temp_dir().join(format!("vmac-keys-{}.pdf", std::process::id()));
+        std::fs::write(&path, b"%PDF-1.4").unwrap();
+        editor.lock().open_file(&path).unwrap();
+        typed(&mut lisp, "jk3j");
+        lisp.dispatch_key("C-d", "");
+        typed(&mut lisp, "JK5Ggg");
+        typed(&mut lisp, "G");
+        let id = editor.lock().window().buffer;
+        let asked: Vec<_> = editor.lock().pdf_scroll[&id].iter().map(|(_, how)| *how).collect();
+        assert_eq!(
+            asked,
+            [Lines(1), Lines(-1), Lines(1), Lines(1), Lines(1), Screens(0.5), Pages(1), Pages(-1), Page(4), Page(0), End]
+        );
+        let numbers: Vec<u64> = editor.lock().pdf_scroll[&id].iter().map(|(n, _)| *n).collect();
+        assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "numbered in order: {numbers:?}");
+        std::fs::remove_file(path).ok();
     }
 
     /// vmac on a file served by the fake language server (lsp.rs's tests).

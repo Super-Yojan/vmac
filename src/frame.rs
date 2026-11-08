@@ -156,7 +156,25 @@ pub enum Content {
         kind: MediaKind,
         #[serde(default)]
         themed: bool,
+        /// The latest scrolls asked for by keys, numbered so the window
+        /// does each once (several may come between two frames).
+        #[serde(default)]
+        scroll: Vec<(u64, PdfScroll)>,
     },
+}
+
+/// A move through a PDF, asked for by keys (j, C-d, G...).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum PdfScroll {
+    /// Steps of a couple of rows (negative: up).
+    Lines(i32),
+    /// Window heights.
+    Screens(f32),
+    /// Pages from the one at the top.
+    Pages(i32),
+    /// To a page (from 0), or the end.
+    Page(usize),
+    End,
 }
 
 /// Files shown as what they are rather than as text.

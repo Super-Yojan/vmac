@@ -401,7 +401,7 @@ impl Session {
                 let content = if let Some(review) = review.as_ref().filter(|_| Some(w.buffer) == review_id) {
                     Content::Review(review.clone())
                 } else if let Some((path, kind)) = media {
-                    Content::Media { path, kind, themed: st.pdf_themed }
+                    Content::Media { path, kind, themed: st.pdf_themed, scroll: st.pdf_scroll.get(&w.buffer).cloned().unwrap_or_default() }
                 } else if rendered.contains(id) {
                     Content::Markdown {
                         source: text.to_string(),

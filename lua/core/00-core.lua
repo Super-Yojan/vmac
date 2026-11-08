@@ -68,7 +68,7 @@ function V.run(name) core.call_binding(name) end
 core.keymaps = {
   normal = {}, visual = {}, operator = {}, insert = {}, minibuffer = {},
   picker_normal = {}, tree = {}, agent = {}, agent_insert = {}, review = {},
-  dashboard = {}, terminal = {}, terminal_normal = {},
+  dashboard = {}, terminal = {}, terminal_normal = {}, pdf = {},
 }
 
 -- core.define_key("normal", "Q", "some-command") or a keymap table.
@@ -180,6 +180,7 @@ function core.current_keymaps()
   if normal and V.buffer_name() == core.tree_buffer then return { k.tree, k.normal } end
   if normal and V.dashboard_here() then return { k.dashboard, k.normal } end
   if normal and V.review_here() then return { k.review, k.normal } end
+  if normal and V.pdf_here() then return { k.pdf, k.normal } end
   if normal and V.agent_here() then return { k.agent, k.normal } end
   if core.state == "insert" and plain and V.agent_here() then return { k.agent_insert, k.insert } end
   if core.picker_normal() then

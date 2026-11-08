@@ -456,8 +456,9 @@ its folder in a git repository.
 
 Opening an image (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.ico`)
 shows it, as large as the window allows and never larger than it is. A PDF
-shows its pages one under the other, to scroll through with the trackpad or
-wheel; pages are drawn as they come into view, and a PDF that changes on disk
+shows its pages one under the other, to scroll through with the trackpad,
+the wheel or keys: `j`/`k` a little, `C-d`/`C-u` half a window, `C-f`/`C-b` a
+window, `J`/`K` a page, `gg`/`G` the first and last page (`5G` page 5); pages are drawn as they come into view, and a PDF that changes on disk
 (rebuilt by LaTeX, say) reloads where you were. Pages take the theme's
 colors, paper as its background and ink as its text; `SPC t p` (or
 `vmac.set_pdf_themed(false)`) shows them black on white, as printed, for

@@ -3,8 +3,9 @@
 //! through, each drawn (off the main thread) when it first comes into view.
 
 use gpui_kit::component::ActiveTheme as _;
+use crate::frame::PdfScroll;
 use gpui_kit::{
-    AnyElement, Context, IntoElement, ListAlignment, ListState, ObjectFit, ParentElement as _, Render, RenderImage,
+    AnyElement, Context, IntoElement, ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _, Render, RenderImage,
     Styled as _, StyledImage as _, Window, div, img, list, prelude::FluentBuilder as _, px,
 };
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,8 @@ const PAGE_PIXELS_PER_POINT: f32 = 2.;
 /// Pages kept drawn either side of the first one in view; further ones are
 /// dropped and drawn again if you come back.
 const KEEP_AROUND: usize = 4;
+/// How far j and k scroll, in points.
+const LINE_STEP: f32 = 48.;
 
 /// An image file, as large as fits (never larger than it is).
 pub fn image_element(path: &Path, cx: &gpui_kit::App) -> AnyElement {
@@ -61,6 +64,8 @@ pub struct PdfView {
     /// Bumped whenever drawn pages go stale (the file or the colors
     /// changed), so pages still being drawn from before are thrown away.
     generation: u64,
+    /// The number of the last scroll done (`Content::Media`'s `scroll`).
+    scrolled: u64,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -68,7 +73,7 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 impl PdfView {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, scrolled: u64) -> Self {
         let sizes = crate::pdf::page_sizes(&path);
         let count = sizes.as_ref().map_or(0, Vec::len);
         Self {
@@ -81,6 +86,7 @@ impl PdfView {
             list: ListState::new(count, ListAlignment::Top, px(1200.)),
             colors: None,
             generation: 0,
+            scrolled,
         }
     }
 
@@ -107,6 +113,31 @@ impl PdfView {
         self.list.reset(self.sizes.as_ref().map_or(0, Vec::len));
         self.list.scroll_to(top);
         cx.notify();
+    }
+
+    /// Does the scrolls asked for since the last one done.
+    pub fn scroll(&mut self, asked: &[(u64, PdfScroll)]) {
+        let done = self.scrolled;
+        for &(n, how) in asked.iter().filter(|(n, _)| *n > done) {
+            self.scrolled = n;
+            let count = self.list.item_count();
+            let top = self.list.logical_scroll_top();
+            let page = |item_ix: usize| ListOffset { item_ix: item_ix.min(count.saturating_sub(1)), offset_in_item: px(0.) };
+            match how {
+                PdfScroll::Lines(lines) => self.list.scroll_by(px(lines as f32 * LINE_STEP)),
+                PdfScroll::Screens(screens) => {
+                    let height: f32 = self.list.viewport_bounds().size.height.into();
+                    self.list.scroll_by(px(screens * height.max(LINE_STEP)));
+                }
+                // Back from partway down a page: that page's top first.
+                PdfScroll::Pages(n) if n < 0 && top.offset_in_item > px(1.) => {
+                    self.list.scroll_to(page((top.item_ix + 1).saturating_sub(n.unsigned_abs() as usize)))
+                }
+                PdfScroll::Pages(n) => self.list.scroll_to(page(top.item_ix.saturating_add_signed(n as isize))),
+                PdfScroll::Page(ix) => self.list.scroll_to(page(ix)),
+                PdfScroll::End => self.list.scroll_to_end(),
+            }
+        }
     }
 
     fn forget_pages(&mut self) {
