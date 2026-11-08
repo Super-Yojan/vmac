@@ -35,6 +35,14 @@ Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.scm`,
 `init.lua`, `plugins/`). From a checkout, `cargo run -- FILE` runs it with
 live reload of `lisp/core/`.
 
+**As a Mac app.** From a checkout, `scripts/make-app.sh` builds `vmac.app`
+into `/Applications` (or the folder you name), with its icon, so it opens
+from Spotlight, Launchpad and the Dock. Opened that way it starts on the
+dashboard, in your home folder, with your login shell's `PATH` (so it finds
+language servers, fish, `npx` and the agents). It needs `rsvg-convert` and
+ImageMagick (`brew install librsvg imagemagick`). Run it again after
+updating to rebuild the app.
+
 ## How it is split
 
 | Layer | Where | What |
