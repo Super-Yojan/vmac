@@ -67,6 +67,8 @@
           ((equal? name "dashboard") (call-binding 'dashboard))
           ((equal? name "agent")
            (if (equal? arg "") (call-binding 'agent-ask) (begin (agent-show) (agent-prompt arg))))
+          ((equal? name "agent-use")
+           (if (equal? arg "") (call-binding 'agent-choose) (agent-use arg)))
           ((equal? name "agent-command")
            (if (equal? arg "")
                (message (string-append "the agent runs: " (agent-command)))

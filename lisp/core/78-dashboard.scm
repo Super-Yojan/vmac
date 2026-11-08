@@ -38,7 +38,8 @@
 (define (dashboard-items) (default-dashboard-items))
 
 (defcommand (dashboard)
-  (let ((items (dashboard-items)))
+  ;; Looked up when called (eval), so your redefinitions are the ones used.
+  (let ((items ((eval 'dashboard-items))))
     ;; Each item's key runs it here; 1-9 open the projects listed.
     (set! dashboard-map '())
     (for-each (lambda (item)
@@ -50,7 +51,7 @@
                   (lambda () (dashboard-open-project (dashboard-project n)))))
               (list 1 2 3 4 5 6 7 8 9))
     (define-key dashboard-map "RET" 'dashboard-run)
-    (dashboard-show (dashboard-banner)
+    (dashboard-show ((eval 'dashboard-banner))
                     (map (lambda (i) (list (car i) (second i) (symbol->string (third i)))) items))))
 
 (define (dashboard-open-project path)

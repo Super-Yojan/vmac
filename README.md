@@ -249,15 +249,40 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   conversation, `SPC a k` stops the agent, `SPC a o` shows `*agent*`.
   `:agent PROMPT` asks from the command line.
 
-The default is Claude Code through
-[claude-code-acp](https://www.npmjs.com/package/@zed-industries/claude-code-acp)
-(installed, or run with `npx`), using your `claude` login. Another agent:
+**Which agent.** `claude` (Claude Code through
+[claude-code-acp](https://www.npmjs.com/package/@zed-industries/claude-code-acp),
+installed or run with `npx`, using your `claude` login) is the default;
+`codex` (codex-acp) and `gemini` (Gemini CLI) are built in too. `SPC a b` or
+`:agent-use NAME` picks one; `SPC a n` restarts with it. Add your own:
 
 ```lua
-vmac.set_agent_command("npx -y @zed-industries/codex-acp")
+vmac.agent_backend("my-agent", { command = "my-agent --acp" })
+vmac.agent_use("my-agent")
 ```
 
-or `(set-agent-command ...)` in init.scm, or `:agent-command CMD`.
+or `(agent-define "my-agent" "my-agent --acp")` in init.scm.
+`:agent-command CMD` runs a one-off command line.
+
+**Rules and hooks.** Before asking you for permission, vmac asks a rule,
+with the tool call's title and kind (`read`, `edit`, `delete`, `move`,
+`search`, `execute`, `fetch`, ...). It returns `"allow"` (this once),
+`"always"`, `"reject"` or `"ask"`:
+
+```lua
+-- Let it read and search freely; never delete.
+vmac.hooks.agent_permission = function(title, kind)
+  if kind == "read" or kind == "search" then return "allow" end
+  if kind == "delete" then return "reject" end
+end -- nil: leave it to Scheme, which asks
+vmac.hooks.agent_tool_call = function(title, kind, status) end
+vmac.hooks.agent_turn_end = function(reason)   -- end_turn, cancelled, error...
+  vmac.exec("osascript", { "-e", 'display notification "Agent done" with title "vmac"' })
+end
+```
+
+In Scheme, redefine `(agent-permission-rule title kind)`,
+`(agent-on-tool-call title kind status)` and `(agent-on-turn-end reason)`.
+
 `VMAC_AGENT_LOG=/tmp/agent.log` logs the traffic. Claude Code won't start
 from a vmac launched inside a Claude Code session (it refuses to nest); start
 vmac from a plain terminal.

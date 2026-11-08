@@ -112,8 +112,59 @@
         (pick (string-append "Allow " (agent-permission-title) "?") options ""
               agent-choose-permission))))
 
-;; Raised when the agent asks; asks at once unless you're mid-prompt.
+;;;; Choosing the agent, rules and hooks
+;;
+;; Agents by name: claude (the default), codex and gemini are built in; add
+;; your own with (agent-define "name" "command args"), or in Lua
+;; vmac.agent_backend("name", { command = "..." }). SPC a b or :agent-use
+;; NAME picks one (from the next start; SPC a n restarts).
+;;
+;; Permission rules: before asking you, vmac asks (agent-permission-rule
+;; title kind), kind being read, edit, delete, move, search, execute,
+;; fetch, think or other. Return "allow" (this once), "always", "reject" or
+;; "ask". The default asks; e.g. to let it read and search freely:
+;;   (define (agent-permission-rule title kind)
+;;     (if (contains? '("read" "search") kind) "allow" "ask"))
+;; In Lua, vmac.hooks.agent_permission = function(title, kind) ... end
+;; decides first (return nil to leave it to Scheme).
+;;
+;; Hooks: (agent-on-tool-call title kind status) when a tool call starts or
+;; changes status (pending, in_progress, completed, failed), and
+;; (agent-on-turn-end reason) when the agent finishes (end_turn, cancelled,
+;; max_tokens, refusal, error). Lua: vmac.hooks.agent_tool_call and
+;; vmac.hooks.agent_turn_end, with the same arguments.
+
+(define (agent-permission-rule title kind) "ask")
+(define (agent-on-tool-call title kind status) #t)
+(define (agent-on-turn-end reason) #t)
+
+(defcommand (agent-choose)
+  (pick "Agent" (agent-backends) "" (lambda (name) (agent-use name))))
+
+;; The rule for a permission: Lua's hook, else Scheme's.
+(define (agent-rule title kind)
+  (let ((lua (lua-hook "agent_permission" (list title kind))))
+    ;; Looked up when called (eval), so your redefinition is the one used.
+    (if (equal? lua "") ((eval 'agent-permission-rule) title kind) lua)))
+
+;; Raised when the agent asks: a rule answers, or you do (at once, unless
+;; you're mid-prompt).
 (define (agent-ask-permission args)
-  (if (minibuffer-active?)
-      (message (string-append "The agent asks to " (car args) ": SPC a p to answer"))
-      (call-binding 'agent-permission)))
+  (let* ((title (car args))
+         (kind (second args))
+         (rule (agent-rule title kind)))
+    (cond ((and (equal? rule "allow") (agent-permit-kind "allow_once")) #t)
+          ((and (equal? rule "always") (agent-permit-kind "allow_always")) #t)
+          ((and (equal? rule "reject") (agent-permit-kind "reject_once")) #t)
+          ((minibuffer-active?)
+           (message (string-append "The agent asks to " title ": SPC a p to answer")))
+          (else (call-binding 'agent-permission)))))
+
+(define (agent-tool-event args)
+  (let ((title (second args)) (kind (third args)) (status (list-ref args 3)))
+    (lua-hook "agent_tool_call" (list title kind status))
+    ((eval 'agent-on-tool-call) title kind status)))
+
+(define (agent-done-event args)
+  (lua-hook "agent_turn_end" args)
+  ((eval 'agent-on-turn-end) (car args)))

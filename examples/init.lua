@@ -30,3 +30,11 @@ end
 -- vmac.hooks.lsp_servers = function()
 --   return { {"python", "pylsp"}, {"rust", "rust-analyzer"} }
 -- end
+
+-- The coding agent: pick one (claude, codex, gemini, or your own), and let
+-- it read and search without asking.
+-- vmac.agent_use("codex")
+-- vmac.agent_backend("my-agent", { command = "my-agent --acp" })
+-- vmac.hooks.agent_permission = function(title, kind)
+--   if kind == "read" or kind == "search" then return "allow" end
+-- end

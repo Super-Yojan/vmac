@@ -317,6 +317,8 @@ pub struct EditorState {
     /// conversation revision that buffer shows.
     pub agent: Option<crate::agent::Agent>,
     pub agent_config: crate::agent::AgentConfig,
+    /// Agents to choose from by name (SPC a b): built in, and defined in config.
+    pub agent_backends: Vec<crate::agent::AgentConfig>,
     agent_buffer: Option<BufferId>,
     agent_shown: u64,
     agent_shown_width: usize,
@@ -437,6 +439,7 @@ impl EditorState {
             terminals_to_kill: Vec::new(),
             agent: None,
             agent_config: crate::agent::AgentConfig::claude(),
+            agent_backends: crate::agent::AgentConfig::built_in(),
             agent_buffer: None,
             agent_shown: 0,
             agent_shown_width: 0,
@@ -1214,6 +1217,59 @@ impl EditorState {
         self.agent.as_ref().and_then(|a| a.permissions.first()).map(|p| p.title.clone()).unwrap_or_default()
     }
 
+    /// Answers the waiting permission with its first option of a kind
+    /// (allow_once, allow_always, reject_once, reject_always), falling back
+    /// to the other option of the same verdict. False when there's none.
+    pub fn agent_permit_kind(&mut self, kind: &str) -> bool {
+        let Some(p) = self.agent.as_ref().and_then(|a| a.permissions.first()) else { return false };
+        let verdict = kind.split('_').next().unwrap_or("");
+        let index = p
+            .options
+            .iter()
+            .position(|(_, _, k)| k == kind)
+            .or_else(|| p.options.iter().position(|(_, _, k)| k.starts_with(verdict)));
+        match index {
+            Some(i) => {
+                self.agent_permit(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Uses the agent backend called `name` from the next start.
+    pub fn agent_use(&mut self, name: &str) -> bool {
+        match self.agent_backends.iter().find(|b| b.name == name).cloned() {
+            Some(config) => {
+                let running = self.agent.as_ref().is_some_and(|a| a.state != crate::agent::State::Exited);
+                self.message = if running {
+                    format!("agent: {name} (SPC a n restarts with it)")
+                } else {
+                    format!("agent: {name}")
+                };
+                self.agent_config = config;
+                true
+            }
+            None => {
+                self.message = format!("No agent called {name}");
+                false
+            }
+        }
+    }
+
+    /// Adds (or replaces) an agent backend: a name and its command line.
+    pub fn agent_define(&mut self, name: &str, command: &str) -> bool {
+        let Some(config) = crate::agent::AgentConfig::parse(name, command) else { return false };
+        if self.agent_config.name == name {
+            self.agent_config = config.clone();
+        }
+        match self.agent_backends.iter_mut().find(|b| b.name == name) {
+            Some(b) => *b = config,
+            None => self.agent_backends.push(config),
+        }
+        true
+    }
+
     pub fn agent_permit(&mut self, index: usize) {
         if let Some(agent) = self.agent.as_mut() {
             agent.permit(index);
@@ -1232,11 +1288,21 @@ impl EditorState {
             changed = true;
         }
         self.agent_terminals_pump();
+        // Hooks: tool calls and finished turns, for Scheme (and Lua) to hear.
+        let events = self.agent.as_mut().map(|a| a.take_events()).unwrap_or_default();
+        for event in events {
+            changed = true;
+            self.events.push(match event {
+                crate::agent::Event::Tool(id, title, kind, status) => ("agent-tool-event".into(), vec![id, title, kind, status]),
+                crate::agent::Event::Done(why) => ("agent-done-event".into(), vec![why]),
+            });
+        }
         // Put each new permission to the person once.
         let waiting = self.agent.as_ref().map_or(0, |a| a.permissions.len());
         if waiting > self.agent_asked {
             self.agent_asked = waiting;
-            self.events.push(("agent-ask-permission".into(), vec![self.agent_permission_title()]));
+            let kind = self.agent.as_ref().and_then(|a| a.permissions.get(waiting - 1)).map(|p| p.kind.clone()).unwrap_or_default();
+            self.events.push(("agent-ask-permission".into(), vec![self.agent_permission_title(), kind]));
         } else if waiting < self.agent_asked {
             self.agent_asked = waiting;
         }

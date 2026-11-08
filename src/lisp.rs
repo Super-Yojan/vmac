@@ -874,6 +874,32 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
             }
         }
     });
+    // Calls Lua's vmac.hooks[name](args...): its result as a string ("" when
+    // there's no such hook, or it returned nothing).
+    let (ed, l) = (editor.clone(), lua.clone());
+    engine.register_fn("lua-hook", move |name: String, args: Vec<String>| -> String {
+        let result = {
+            let lua = l.lock().unwrap_or_else(|e| e.into_inner());
+            let hook = lua
+                .globals()
+                .get::<mlua::Table>("vmac")
+                .and_then(|g| g.get::<mlua::Table>("hooks"))
+                .and_then(|h| h.get::<mlua::Function>(name.as_str()));
+            match hook {
+                Ok(f) => f.call::<Option<String>>(mlua::MultiValue::from_iter(
+                    args.into_iter().filter_map(|a| lua.create_string(&a).ok()).map(mlua::Value::String),
+                )),
+                Err(_) => Ok(None),
+            }
+        };
+        match result {
+            Ok(v) => v.unwrap_or_default(),
+            Err(e) => {
+                ed.lock().message = format!("lua hook {name}: {}", first_line(&e.to_string()));
+                String::new()
+            }
+        }
+    });
     let (ed, l) = (editor.clone(), lua.clone());
     engine.register_fn("lua-eval", move |code: String| {
         let result = {
@@ -946,6 +972,13 @@ end
 --   read(handle) -> the screen as text
 --   alive(handle) -> bool     (optional)
 --   kill(handle)              (optional; also called for attached terminals)
+-- Agent backends: vmac.agent_backend("codex", { command = "codex-acp" })
+-- (or just the command line), then vmac.agent_use("codex") or SPC a b.
+function vmac.agent_backend(name, spec)
+  local command = type(spec) == "table" and spec.command or spec
+  vmac.agent_define(name, command)
+end
+
 vmac.terminal_backends = {}
 function vmac.terminal_backend(name, backend)
   vmac.terminal_backends[name] = backend
@@ -1563,17 +1596,24 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "agent-permission-title", |s| s.agent_permission_title());
     prim!(reg, editor, "agent-permit", |s, index: isize| s.agent_permit(index.max(0) as usize));
     prim!(reg, editor, "set-agent-command", |s, line: String| {
-        match crate::agent::AgentConfig::parse("agent", &line) {
-            Some(config) => {
-                s.message = format!("agent: {line} (from the next start)");
-                s.agent_config = config;
-            }
-            None => s.message = "set-agent-command needs a command".into(),
+        if s.agent_define("custom", &line) {
+            s.agent_use("custom");
+            s.message = format!("agent: {line} (from the next start)");
+        } else {
+            s.message = "set-agent-command needs a command".into();
         }
     });
-    prim!(reg, editor, "agent-command", |s| {
-        std::iter::once(s.agent_config.command.clone()).chain(s.agent_config.args.iter().cloned()).collect::<Vec<_>>().join(" ")
+    // Agent backends by name: (agent-define "codex" "codex-acp"), (agent-use "codex").
+    prim!(reg, editor, "agent-define", |s, name: String, line: String| {
+        if !s.agent_define(&name, &line) {
+            s.message = format!("agent-define {name}: needs a command");
+        }
     });
+    prim!(reg, editor, "agent-use", |s, name: String| s.agent_use(&name));
+    prim!(reg, editor, "agent-backends", |s| s.agent_backends.iter().map(|b| b.name.clone()).collect::<Vec<_>>());
+    prim!(reg, editor, "agent-backend", |s| s.agent_config.name.clone());
+    prim!(reg, editor, "agent-permit-kind", |s, kind: String| s.agent_permit_kind(&kind));
+    prim!(reg, editor, "agent-command", |s| s.agent_config.line());
     prim!(reg, editor, "font-list", |s| s.fonts.clone());
     prim!(reg, editor, "terminal-shell", |s| s.terminal_shell.clone());
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
@@ -3187,6 +3227,69 @@ mod tests {
         editor.lock().agent.as_mut().unwrap().toggle(&id);
         let t = editor.lock().agent.as_ref().unwrap().transcript();
         assert!(t.contains(&format!("    ⌁ {term}  (RET opens it)\n    hi there\n    second")), "{t}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agents_are_chosen_by_name_and_rules_and_hooks_answer() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-hooks-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "quiet\n").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&file).unwrap();
+
+        // Backends by name, from Scheme and Lua.
+        let names = lisp.eval("(agent-backends)").unwrap();
+        assert!(names.contains("claude") && names.contains("codex") && names.contains("gemini"), "{names}");
+        lisp.eval(&format!("(agent-define \"fake\" \"{}\")", config.line())).unwrap();
+        lisp.eval_lua("vmac.agent_backend('other', { command = 'other-acp --flag' })").unwrap();
+        assert!(lisp.eval("(agent-backends)").unwrap().contains("other"));
+        typed(&mut lisp, ":agent-use fake");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().agent_config, config);
+        assert_eq!(lisp.eval("(agent-backend)").unwrap(), "\"fake\"");
+
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
+            for _ in 0..250 {
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&mut editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let idle = |s: &mut EditorState| s.agent.as_ref().is_some_and(|a| a.state == crate::agent::State::Idle && a.transcript().contains("✓ Edit") || a.transcript().contains("✗ Edit"));
+
+        // A Scheme rule allows edits: no one is asked; hooks hear it all.
+        lisp.eval(r#"
+            (define (agent-permission-rule title kind) (if (equal? kind "edit") "allow" "ask"))
+            (define heard '())
+            (define (agent-on-tool-call title kind status) (set! heard (cons (string-append kind ":" status) heard)))
+            (define (agent-on-turn-end reason) (set! heard (cons (string-append "done:" reason) heard)))
+        "#).unwrap();
+        editor.lock().agent_prompt(&format!("edit {}", file.display()));
+        assert!(pump(&mut lisp, &|s| idle(s) && s.agent_status() == "ready"), "{:?}", editor.lock().agent.as_ref().map(|a| a.transcript()));
+        assert!(editor.lock().picker.is_none(), "nobody was asked");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "QUIET\n");
+        let heard = lisp.eval("heard").unwrap();
+        assert!(heard.contains("done:end_turn") && heard.contains("edit:completed") && heard.contains("edit:pending"), "{heard}");
+
+        // Lua's rule comes first: it rejects.
+        lisp.eval_lua("vmac.hooks.agent_permission = function(title, kind) return 'reject' end").unwrap();
+        lisp.eval_lua("ended = nil; vmac.hooks.agent_turn_end = function(reason) ended = reason end").unwrap();
+        lisp.eval("(call-binding 'agent-new)").unwrap();
+        editor.lock().agent_prompt(&format!("edit {}", file.display()));
+        assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("✗ Edit")) && s.agent_status() == "ready"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "QUIET\n", "rejected: unchanged");
+        assert_eq!(lisp.eval_lua("return ended").unwrap(), "end_turn");
+
+        // The dashboard's items can be redefined too.
+        lisp.eval(r#"(define (dashboard-items) (list (list "z" "Zebra" 'quit)))"#).unwrap();
+        lisp.eval("(call-binding 'dashboard)").unwrap();
+        assert!(text(&editor).contains("z   Zebra"), "{}", text(&editor));
         std::fs::remove_dir_all(&dir).ok();
     }
 

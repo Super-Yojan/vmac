@@ -36,6 +36,21 @@ impl AgentConfig {
         Some(Self { name: name.to_string(), command, args: words.collect() })
     }
 
+    /// The agents vmac knows: Claude Code, Codex and Gemini CLI.
+    pub fn built_in() -> Vec<Self> {
+        let codex = if on_path("codex-acp") { "codex-acp" } else { "npx -y @zed-industries/codex-acp" };
+        vec![
+            Self::claude(),
+            Self::parse("codex", codex).expect("a command"),
+            Self::parse("gemini", "gemini --experimental-acp").expect("a command"),
+        ]
+    }
+
+    /// The command line, as typed.
+    pub fn line(&self) -> String {
+        std::iter::once(self.command.as_str()).chain(self.args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ")
+    }
+
     /// Claude Code: the adapter when it's installed, else through npx.
     pub fn claude() -> Self {
         if on_path("claude-code-acp") {
@@ -156,6 +171,15 @@ pub fn error_text(error: &Value) -> String {
     if detail.is_empty() { message } else { format!("{message}: {detail}") }
 }
 
+/// Something hooks hear about.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Event {
+    /// A tool call appeared or changed status: id, title, kind, status.
+    Tool(String, String, String, String),
+    /// A prompt finished: why (end_turn, cancelled, max_tokens, refusal, error).
+    Done(String),
+}
+
 /// A prompt's text and the files attached to it (path, text).
 type Prompt = (String, Vec<(PathBuf, String)>);
 
@@ -173,6 +197,8 @@ pub struct Request {
 pub struct Permission {
     pub id: Value,
     pub title: String,
+    /// The tool's kind: read, edit, delete, move, search, execute, fetch...
+    pub kind: String,
     pub options: Vec<(String, String, String)>,
 }
 
@@ -219,6 +245,8 @@ pub struct Agent {
     expanded: std::collections::HashSet<String>,
     /// Whether it takes files' text in prompts (else links to them).
     pub embedded_context: bool,
+    /// What happened, for hooks: taken by the editor.
+    events: Vec<Event>,
     /// Terminals the editor runs for it: id -> (buffer name, last lines).
     pub terminals: HashMap<String, (String, String)>,
 }
@@ -290,6 +318,7 @@ impl Agent {
             revision: 0,
             expanded: Default::default(),
             embedded_context: false,
+            events: Vec::new(),
             terminals: HashMap::new(),
         };
         agent.call(
@@ -420,6 +449,10 @@ impl Agent {
         true
     }
 
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
     pub fn take_requests(&mut self) -> Vec<Request> {
         std::mem::take(&mut self.requests)
     }
@@ -476,7 +509,20 @@ impl Agent {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    self.permissions.push(Permission { id: id.clone(), title, options });
+                    let mut kind = params["toolCall"]["kind"].as_str().unwrap_or("").to_string();
+                    // The tool call it's about, when the request doesn't say.
+                    if kind.is_empty() {
+                        let tool = params["toolCall"]["toolCallId"].as_str().unwrap_or("");
+                        kind = self
+                            .entries
+                            .iter()
+                            .find_map(|e| match e {
+                                Entry::Tool(t) if t.id == tool => Some(t.kind.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                    }
+                    self.permissions.push(Permission { id: id.clone(), title, kind, options });
                     self.revision += 1;
                 }
                 self.requests.push(Request { id, method, params });
@@ -511,6 +557,7 @@ impl Agent {
             Pending::Prompt => {
                 self.state = State::Idle;
                 let why = result["stopReason"].as_str().unwrap_or("end_turn");
+                self.events.push(Event::Done(why.to_string()));
                 match why {
                     "end_turn" => self.revision += 1,
                     "cancelled" => self.note("Cancelled".into()),
@@ -539,6 +586,7 @@ impl Agent {
             }
             Pending::Prompt => {
                 self.state = State::Idle;
+                self.events.push(Event::Done("error".into()));
                 self.note(format!("Error: {text}"));
             }
         }
@@ -561,6 +609,7 @@ impl Agent {
                 let mut call = ToolCall { id: update["toolCallId"].as_str().unwrap_or("").to_string(), ..Default::default() };
                 call.status = "pending".into();
                 call.update(update);
+                self.events.push(Event::Tool(call.id.clone(), call.title.clone(), call.kind.clone(), call.status.clone()));
                 self.entries.push(Entry::Tool(call));
             }
             "tool_call_update" => {
@@ -569,8 +618,16 @@ impl Agent {
                     Entry::Tool(t) if t.id == id => Some(t),
                     _ => None,
                 });
+                let event = |t: &ToolCall| Event::Tool(t.id.clone(), t.title.clone(), t.kind.clone(), t.status.clone());
                 match found {
-                    Some(t) => t.update(update),
+                    Some(t) => {
+                        let before = t.status.clone();
+                        t.update(update);
+                        if t.status != before {
+                            let e = event(t);
+                            self.events.push(e);
+                        }
+                    }
                     None => {
                         let mut call = ToolCall { id: id.to_string(), ..Default::default() };
                         call.update(update);

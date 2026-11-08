@@ -83,7 +83,7 @@
         ;; The coding agent
         (list "SPC a a" 'agent-ask) (list "SPC a o" 'agent-open)
         (list "SPC a c" 'agent-cancel-run) (list "SPC a p" 'agent-permission)
-        (list "SPC a e" 'agent-fix-problems) (list "SPC a r" 'review-open) (list "SPC a A" 'review-accept-all)
+        (list "SPC a e" 'agent-fix-problems) (list "SPC a b" 'agent-choose) (list "SPC a r" 'review-open) (list "SPC a A" 'review-accept-all)
         (list "SPC a X" 'review-reject-all)
         (list "] h" 'review-next) (list "[ h" 'review-previous)
         (list "g a" 'review-accept) (list "g x" 'review-reject)
