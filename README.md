@@ -1,7 +1,11 @@
-# gmacs
+# vmac
 
 A modal (evil-style) editor on GPUI whose behavior is written in Steel Scheme
 and can be redefined while it runs.
+
+vmac was called gmacs. Plugins that use `gmacs.*` in Lua still work (it's an
+alias of `vmac`), and `~/.config/gmacs/` is read while `~/.config/vmac/`
+doesn't exist; move it there when you like.
 
 ```sh
 cargo run -- path/to/file
@@ -16,8 +20,8 @@ cargo run -- path/to/file
 | Primitives | `src/lisp.rs` | `insert`, `char-at`, `delete-region`, `find-file`, ... in both Scheme and Lua |
 | Window | `src/shell.rs` | draws windows, modelines, popups; sends every key to Scheme |
 | The editor | `lisp/core/*.scm` | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
-| Plugins | `~/.config/gmacs/plugins/` | Scheme and Lua, loaded after the core |
-| Your config | `~/.config/gmacs/init.scm`, `~/.config/gmacs/init.lua` | loaded last |
+| Plugins | `~/.config/vmac/plugins/` | Scheme and Lua, loaded after the core |
+| Your config | `~/.config/vmac/init.scm`, `~/.config/vmac/init.lua` | loaded last |
 
 The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
 `75-file-tree.scm`, ...), loaded as one program in name order.
@@ -105,7 +109,7 @@ what's under the cursor everywhere (starting from its current name), and
 `SPC c a` lists fixes and refactorings for the cursor or a visual selection,
 and `SPC c f` formats the file (or, in visual state, the selected lines).
 Edits to other files open them unsaved, so you can review before `:w`. A server that fails
-to start or stops says why in the echo area. Set `GMACS_LSP_LOG=/tmp/lsp.log`
+to start or stops says why in the echo area. Set `VMAC_LSP_LOG=/tmp/lsp.log`
 to log every message to and from the servers.
 
 ```scheme
@@ -120,7 +124,7 @@ to log every message to and from the servers.
 running one is reused), `SPC o T` one in this window, `:term CMD` runs a
 command. Terminals run fish (as a login shell) when it's installed, else
 `$SHELL`; `:terminal-shell /bin/zsh`, or `(set-terminal-shell ...)` /
-`gmacs.set_terminal_shell(...)` in your config, changes it. It's a buffer: in insert state every key goes to the program
+`vmac.set_terminal_shell(...)` in your config, changes it. It's a buffer: in insert state every key goes to the program
 (`ESC` returns to normal state, `C-\` sends the program an `ESC`); in normal
 state its screen is text, so motions, search and yank work, and `p` pastes
 into the program. Local terminals run on Ghostty's terminal engine
@@ -132,7 +136,7 @@ Where the program runs is a **backend**. The built-in one is `local` (a
 PTY). Plugins add others in Lua:
 
 ```lua
-gmacs.terminal_backend("name", {
+vmac.terminal_backend("name", {
   -- "" = a shell. Return a handle (then send/read are polled), or attach:
   -- { handle = h, command = "tool attach h" } runs that command on a local
   -- PTY, which carries keys, screen and size (tmux, ssh, docker exec, hc...).
@@ -144,16 +148,16 @@ gmacs.terminal_backend("name", {
 })
 ```
 
-`:terminal-backend NAME` (or `gmacs.set_terminal_backend`) picks the
+`:terminal-backend NAME` (or `vmac.set_terminal_backend`) picks the
 default. `examples/plugins/herdr-terminal` runs terminals in herdr-core
 (`hc run`) and attaches with herdr's own client (`hc attach`), so they
-outlive gmacs while keys, size and colors work as in a local terminal.
-`gmacs.exec(cmd, args)` runs a program and returns its output, for backends
+outlive vmac while keys, size and colors work as in a local terminal.
+`vmac.exec(cmd, args)` runs a program and returns its output, for backends
 built on a command line tool.
 
 ## Plugins
 
-Plugins live in `~/.config/gmacs/plugins/`: a folder with an `init.scm`
+Plugins live in `~/.config/vmac/plugins/`: a folder with an `init.scm`
 and/or `init.lua` (Lua can `require` modules from the folder or its `lua/`),
 or a single `name.scm` / `name.lua`. They load after the core and before
 your init files, so your config can change anything a plugin sets. A plugin
@@ -167,10 +171,10 @@ Editing a plugin's files reloads it.
 
 `examples/plugins/` has `word-count` (Lua, `SPC t w`), `zen` (Scheme,
 `SPC t z`) and `herdr-terminal` (a terminal backend). To try them:
-`cp -r examples/plugins/* ~/.config/gmacs/plugins/`
+`cp -r examples/plugins/* ~/.config/vmac/plugins/`
 
 A plugin is just config that can be shared: in Scheme, `defcommand` and
-`define-key`; in Lua, `gmacs.command` and `gmacs.map`. To publish one, put
+`define-key`; in Lua, `vmac.command` and `vmac.map`. To publish one, put
 its folder in a git repository.
 
 ## Markdown
@@ -196,20 +200,20 @@ The styles are faces, defined in Scheme with attributes:
 
 ## Font
 
-gmacs starts with an installed Nerd Font (JetBrains Mono, FiraCode, Hack,
+vmac starts with an installed Nerd Font (JetBrains Mono, FiraCode, Hack,
 Iosevka, ...), so icons from eza, starship and the like show; without one
 it uses the theme's monospace font. `:font NAME` changes it, `:fonts` or
 `SPC h F` picks from the fonts installed, and `(set-font "...")` or
-`gmacs.set_font("...")` sets it from your config.
+`vmac.set_font("...")` sets it from your config.
 
 ## Customizing
 
-The core, init.scm and init.lua are watched: save any of them and gmacs
-reloads, keeping your buffers. If a save doesn't load, gmacs shows the error and keeps running
+The core, init.scm and init.lua are watched: save any of them and vmac
+reloads, keeping your buffers. If a save doesn't load, vmac shows the error and keeps running
 the last version that did. Or evaluate code live with `SPC ;`.
 
 ```scheme
-;; ~/.config/gmacs/init.scm
+;; ~/.config/vmac/init.scm
 (defcommand (insert-date) (insert "2026-11-07"))
 (define-key normal-map "SPC i d" 'insert-date)
 
@@ -231,20 +235,20 @@ the last version that did. Or evaluate code live with `SPC ;`.
 ### In Lua
 
 Lua sits beside the Scheme, not instead of it: write either, or both.
-`~/.config/gmacs/init.lua` gets the same primitives in the `gmacs` table
-(Scheme's names with `-` as `_`: `gmacs.buffer_name()`, `gmacs.pos_to_line(p)`),
+`~/.config/vmac/init.lua` gets the same primitives in the `vmac` table
+(Scheme's names with `-` as `_`: `vmac.buffer_name()`, `vmac.pos_to_line(p)`),
 and its commands and keys mix with Scheme's. See `examples/init.lua`:
 
 ```lua
-gmacs.command("insert-date", function() gmacs.insert(os.date("%Y-%m-%d")) end)
-gmacs.map("normal", "SPC i d", "insert-date")       -- or a function
-gmacs.hooks.modeline = function()                   -- replaces Scheme's
-  return { { gmacs.buffer_name(), "strong" }, { gmacs.buffer_language(), "dim" } }
+vmac.command("insert-date", function() vmac.insert(os.date("%Y-%m-%d")) end)
+vmac.map("normal", "SPC i d", "insert-date")       -- or a function
+vmac.hooks.modeline = function()                   -- replaces Scheme's
+  return { { vmac.buffer_name(), "strong" }, { vmac.buffer_language(), "dim" } }
 end
 ```
 
-`gmacs.hooks` can replace `modeline`, `lsp_servers` and `syntax_theme`.
-`gmacs.run("name")` runs any command and `gmacs.scheme(code)` any Scheme; both
+`vmac.hooks` can replace `modeline`, `lsp_servers` and `syntax_theme`.
+`vmac.run("name")` runs any command and `vmac.scheme(code)` any Scheme; both
 happen right after the current command (Lua can't call into Scheme midway
 through one). `:lua 1 + 2` evaluates Lua; `print` shows in the echo area.
 

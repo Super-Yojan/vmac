@@ -280,7 +280,7 @@ pub struct EditorState {
     /// Scheme source queued by `eval-string` (the primitive can't re-enter the
     /// engine that is calling it), run by the host after the current command.
     pub pending_eval: Vec<String>,
-    /// Scheme queued by Lua (gmacs.scheme): run silently after the current
+    /// Scheme queued by Lua (vmac.scheme): run silently after the current
     /// command, or after init.lua loads.
     pub pending_scheme: Vec<String>,
     /// Where plugins live, the plugins found at the last load and how each

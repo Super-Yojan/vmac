@@ -133,11 +133,11 @@ impl Shell {
     }
 }
 
-gpui_kit::actions!(gmacs, [TabKey, ShiftTabKey]);
+gpui_kit::actions!(vmac, [TabKey, ShiftTabKey]);
 
-/// The key context of gmacs's window. Bindings here win over gpui-kit's
+/// The key context of vmac's window. Bindings here win over gpui-kit's
 /// Root, which is further out.
-const KEY_CONTEXT: &str = "Gmacs";
+const KEY_CONTEXT: &str = "Vmac";
 
 /// Keys gpui-kit's Root binds for itself (TAB and shift-TAB move focus
 /// between controls) and the editor needs instead. GPUI matches bindings
@@ -830,7 +830,7 @@ impl Render for Shell {
 
         v_flex()
             .relative()
-            .id("gmacs")
+            .id("vmac")
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))

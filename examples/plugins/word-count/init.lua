@@ -2,8 +2,8 @@
 -- A Lua plugin; it can require modules from its folder or its lua/.
 local count = require("count")
 
-gmacs.command("word-count", function()
-  local text = gmacs.buffer_string()
-  gmacs.message(count.words(text) .. " words, " .. count.lines(text) .. " lines")
+vmac.command("word-count", function()
+  local text = vmac.buffer_string()
+  vmac.message(count.words(text) .. " words, " .. count.lines(text) .. " lines")
 end)
-gmacs.map("normal", "SPC t w", "word-count")
+vmac.map("normal", "SPC t w", "word-count")

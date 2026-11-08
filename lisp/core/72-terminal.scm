@@ -6,7 +6,7 @@
 ;; sends the program an ESC. p pastes the yanked text into it.
 ;;
 ;; Where it runs is a backend: "local" (built in) or one a plugin adds with
-;; gmacs.terminal_backend (herdr's hc, ...). SPC o t opens one below (or
+;; vmac.terminal_backend (herdr's hc, ...). SPC o t opens one below (or
 ;; closes it), SPC o T in this window; :term CMD runs CMD; :terminal-backend
 ;; NAME picks the default. With no command a terminal runs the shell: fish
 ;; when installed, else $SHELL; :terminal-shell PATH (or set-terminal-shell)

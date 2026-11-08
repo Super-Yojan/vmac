@@ -1,5 +1,5 @@
 //! Plugins: Scheme and Lua that load after the core and before the user's
-//! init files, from `~/.config/gmacs/plugins/`.
+//! init files, from `~/.config/vmac/plugins/`.
 //!
 //! A plugin is a folder with an `init.scm` and/or `init.lua` (a Lua plugin
 //! can `require` modules next to it or in its `lua/`), or a single
@@ -112,7 +112,7 @@ pub fn signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
     out
 }
 
-/// A plugin's name from its git URL: `https://x/y/gmacs-zen.git` -> `gmacs-zen`.
+/// A plugin's name from its git URL: `https://x/y/vmac-zen.git` -> `vmac-zen`.
 pub fn name_from_url(url: &str) -> Option<String> {
     let last = url.trim_end_matches('/').rsplit(['/', ':']).next()?;
     let name = last.strip_suffix(".git").unwrap_or(last);
@@ -174,7 +174,7 @@ mod tests {
     use super::*;
 
     fn plugins_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gmacs-plugins-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-plugins-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn names_from_urls() {
-        assert_eq!(name_from_url("https://github.com/someone/gmacs-zen.git").as_deref(), Some("gmacs-zen"));
+        assert_eq!(name_from_url("https://github.com/someone/vmac-zen.git").as_deref(), Some("vmac-zen"));
         assert_eq!(name_from_url("git@github.com:someone/tool").as_deref(), Some("tool"));
         assert_eq!(name_from_url("file:///tmp/x/plug/").as_deref(), Some("plug"));
     }

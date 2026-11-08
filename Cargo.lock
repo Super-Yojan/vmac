@@ -2154,33 +2154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gmacs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fuzzy-matcher",
- "gpui-kit",
- "ignore",
- "mlua",
- "portable-pty",
- "qwertty-term-vt",
- "regex",
- "ropey 1.6.1",
- "serde_json",
- "steel-core",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-go",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
-]
-
-[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7456,6 +7429,33 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vmac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fuzzy-matcher",
+ "gpui-kit",
+ "ignore",
+ "mlua",
+ "portable-pty",
+ "qwertty-term-vt",
+ "regex",
+ "ropey 1.6.1",
+ "serde_json",
+ "steel-core",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+]
 
 [[package]]
 name = "vswhom"

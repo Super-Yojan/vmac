@@ -1,4 +1,4 @@
-;;; gmacs's core, in Scheme. Modal, evil-style.
+;;; vmac's core, in Scheme. Modal, evil-style.
 ;;;
 ;;; The files in lisp/core/ load as one program, in name order (so a function
 ;;; may call one defined in a later file), one file per area: keymaps, the
@@ -6,9 +6,9 @@
 ;;;
 ;;; Rust provides primitives (insert, char-at, char-class, delete-region,
 ;;; undo, find-file, message, minibuffer-open, ...). Everything here can be
-;;; redefined while gmacs runs: edit these files or ~/.config/gmacs/init.scm
+;;; redefined while vmac runs: edit these files or ~/.config/vmac/init.scm
 ;;; and save, or evaluate code with SPC ; or :eval. Lua can extend it too
-;;; (~/.config/gmacs/init.lua, :lua).
+;;; (~/.config/vmac/init.lua, :lua).
 
 ;;;; Small helpers
 

@@ -1,6 +1,6 @@
 ;;;; Plugins
 ;;
-;; Plugins live in ~/.config/gmacs/plugins: a folder with init.scm and/or
+;; Plugins live in ~/.config/vmac/plugins: a folder with init.scm and/or
 ;; init.lua, or a single name.scm / name.lua. They load after the core and
 ;; before your init files, so your config can change what they set. A plugin
 ;; that fails to load is skipped (its error shows in the list); the others

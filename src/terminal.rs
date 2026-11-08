@@ -4,7 +4,7 @@
 //! Where the program runs is a backend. The built-in one is a local PTY
 //! (`portable-pty`) whose output Ghostty's terminal engine (`qwertty-term-vt`)
 //! turns into a screen with scrollback, answering the program's queries. Plugins
-//! add others in Lua (`gmacs.terminal_backend(name, {start, send, read, ...})`),
+//! add others in Lua (`vmac.terminal_backend(name, {start, send, read, ...})`),
 //! like herdr-core, where terminals outlive the editor; the Lisp side drives
 //! those, since they run Lua.
 
@@ -46,7 +46,7 @@ impl Screen {
 }
 
 /// The bytes a key sends to a program, in xterm's encoding. `key` is
-/// gmacs's notation (`RET`, `C-c`, `<up>`); `text` is what it types.
+/// vmac's notation (`RET`, `C-c`, `<up>`); `text` is what it types.
 pub fn key_bytes(key: &str, text: &str) -> Vec<u8> {
     let named: Option<&[u8]> = match key {
         "RET" => Some(b"\r"),
@@ -158,7 +158,7 @@ fn color_face(color: SnapshotColor) -> Option<String> {
     }
 }
 
-/// A snapshot (history and screen) as gmacs shows it: one line per row,
+/// A snapshot (history and screen) as vmac shows it: one line per row,
 /// colored runs, and the cursor counted from the top of the history.
 fn read_screen(snap: &Snapshot) -> Screen {
     let mut lines = Vec::with_capacity(snap.all_rows.len());
@@ -398,18 +398,18 @@ mod tests {
     fn a_shell_runs_on_a_pty() {
         let dir = std::env::temp_dir();
         let mut pty = LocalPty::start("sh", &dir, 10, 40).unwrap();
-        pty.send(b"echo gmacs-$((40 + 2))\r");
+        pty.send(b"echo vmac-$((40 + 2))\r");
         let mut seen = String::new();
         for _ in 0..100 {
             if let Some(screen) = pty.screen() {
                 seen = screen.lines.join("\n");
-                if seen.contains("gmacs-42") {
+                if seen.contains("vmac-42") {
                     break;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(seen.contains("gmacs-42"), "{seen}");
+        assert!(seen.contains("vmac-42"), "{seen}");
         assert!(pty.alive());
         pty.send(b"exit\r");
         for _ in 0..100 {

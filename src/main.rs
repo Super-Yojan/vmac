@@ -1,4 +1,4 @@
-//! gmacs: a modal (evil-style) editor whose behavior is written in Steel
+//! vmac: a modal (evil-style) editor whose behavior is written in Steel
 //! Scheme and can be redefined while it runs. See README.md.
 
 mod buffer;
@@ -21,7 +21,7 @@ use shell::Shell;
 fn main() {
     let buffer = match std::env::args().nth(1) {
         Some(path) => Buffer::from_file(path.into()).unwrap_or_else(|e| {
-            eprintln!("gmacs: {e}");
+            eprintln!("vmac: {e}");
             std::process::exit(1);
         }),
         None => Buffer::new("*scratch*"),

@@ -386,10 +386,10 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(out).ok()?))
 }
 
-/// Appends a message to the file named by `GMACS_LSP_LOG`, when set: every
+/// Appends a message to the file named by `VMAC_LSP_LOG`, when set: every
 /// message to and from servers, for debugging a server that misbehaves.
 fn log_traffic(direction: &str, command: &str, message: &Value) {
-    if let Some(path) = std::env::var_os("GMACS_LSP_LOG")
+    if let Some(path) = std::env::var_os("VMAC_LSP_LOG").or_else(|| std::env::var_os("GMACS_LSP_LOG"))
         && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
     {
         let _ = writeln!(file, "{direction} {command} {message}");
@@ -1000,7 +1000,7 @@ while True:
 
     #[test]
     fn talks_to_a_server_and_keeps_its_diagnostics() {
-        let dir = std::env::temp_dir().join(format!("gmacs-lsp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-lsp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let server = dir.join("server.py");
         std::fs::write(&server, FAKE_SERVER).unwrap();
@@ -1038,7 +1038,7 @@ while True:
     #[test]
     #[ignore]
     fn pyright_reports_an_undefined_name() {
-        let dir = std::env::temp_dir().join(format!("gmacs-pyright-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-pyright-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.py");
         let text = "x = undefined_name\n";
@@ -1067,7 +1067,7 @@ while True:
     #[test]
     #[ignore]
     fn pyright_answers_definition_and_hover() {
-        let dir = std::env::temp_dir().join(format!("gmacs-pyright-nav-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-pyright-nav-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.py");
         let text = "def greet(name):\n    \"\"\"Say hello.\"\"\"\n    return name\n\ngreet('x')\n";
@@ -1103,7 +1103,7 @@ while True:
     #[test]
     #[ignore]
     fn pyright_answers_references_and_completion() {
-        let dir = std::env::temp_dir().join(format!("gmacs-pyright-refs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-pyright-refs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.py");
         let text = "def greeting():\n    pass\n\ngreeting()\ngreeting()\ngree\n";
@@ -1139,7 +1139,7 @@ while True:
     #[test]
     #[ignore]
     fn pyright_renames_across_uses() {
-        let dir = std::env::temp_dir().join(format!("gmacs-pyright-rename-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-pyright-rename-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.py");
         let text = "def greeting():\n    pass\n\ngreeting()\n";
@@ -1175,7 +1175,7 @@ while True:
     #[test]
     #[ignore]
     fn typescript_server_formats() {
-        let dir = std::env::temp_dir().join(format!("gmacs-ts-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-ts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.ts");
         let text = "let  x=1\n";
@@ -1210,7 +1210,7 @@ while True:
     #[test]
     #[ignore]
     fn rust_analyzer_reports_a_syntax_error() {
-        let dir = std::env::temp_dir().join(format!("gmacs-ra-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-ra-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
         let file = dir.join("src/main.rs");

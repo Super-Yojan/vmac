@@ -2,7 +2,7 @@
 //!
 //! Rust exposes small, fast primitives (`insert`, `forward-char`, ...). Every
 //! command, keymap and the modeline are defined in Scheme (`lisp/core/*.scm`,
-//! then the user's `~/.config/gmacs/init.scm`) and can be redefined while the
+//! then the user's `~/.config/vmac/init.scm`) and can be redefined while the
 //! editor runs.
 
 use crate::buffer::Buffer;
@@ -164,7 +164,7 @@ pub struct Lisp {
     /// Lua files loaded after the Scheme (init.lua), and when they last changed.
     lua_sources: Vec<PathBuf>,
     lua_stamps: Vec<Option<SystemTime>>,
-    /// Where plugins live (~/.config/gmacs/plugins), and their files' state.
+    /// Where plugins live (~/.config/vmac/plugins), and their files' state.
     plugin_dir: Option<PathBuf>,
     plugin_signature: Vec<(PathBuf, Option<SystemTime>)>,
     /// Each source's last text that loaded, by label, to fall back on.
@@ -211,16 +211,14 @@ impl Lisp {
         lisp
     }
 
-    /// ~/.config/gmacs/plugins.
+    /// ~/.config/vmac/plugins.
     pub fn default_plugin_dir() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/gmacs/plugins"))
+        config_dir().map(|dir| dir.join("plugins"))
     }
 
-    /// The user's Lua: ~/.config/gmacs/init.lua.
+    /// The user's Lua: ~/.config/vmac/init.lua.
     pub fn default_lua_sources() -> Vec<PathBuf> {
-        std::env::var_os("HOME")
-            .map(|home| vec![PathBuf::from(home).join(".config/gmacs/init.lua")])
-            .unwrap_or_default()
+        config_dir().map(|dir| vec![dir.join("init.lua")]).unwrap_or_default()
     }
 
     /// Loads Lua into a fresh Lua (so a reload starts clean, like Scheme's):
@@ -262,7 +260,7 @@ impl Lisp {
         (loaded, errors)
     }
 
-    /// Runs the Scheme Lua queued (gmacs.scheme), quietly unless it fails.
+    /// Runs the Scheme Lua queued (vmac.scheme), quietly unless it fails.
     fn run_pending_scheme(&mut self) {
         let pending = std::mem::take(&mut self.editor.lock().pending_scheme);
         for code in pending {
@@ -283,12 +281,12 @@ impl Lisp {
         result
     }
 
-    /// A function Lua put in `gmacs.hooks` to replace Scheme's, if any.
+    /// A function Lua put in `vmac.hooks` to replace Scheme's, if any.
     fn lua_hook<R: mlua::FromLuaMulti>(&self, name: &str) -> Option<mlua::Result<R>> {
         let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
         let hook = lua
             .globals()
-            .get::<mlua::Table>("gmacs")
+            .get::<mlua::Table>("vmac")
             .and_then(|g| g.get::<mlua::Table>("hooks"))
             .and_then(|h| h.get::<mlua::Function>(name))
             .ok()?;
@@ -305,11 +303,8 @@ impl Lisp {
             path: dev.is_dir().then_some(dev),
         };
         let mut out = vec![core];
-        if let Some(home) = std::env::var_os("HOME") {
-            out.push(Source {
-                label: "init.scm".into(),
-                path: Some(PathBuf::from(home).join(".config/gmacs/init.scm")),
-            });
+        if let Some(dir) = config_dir() {
+            out.push(Source { label: "init.scm".into(), path: Some(dir.join("init.scm")) });
         }
         out
     }
@@ -591,7 +586,7 @@ impl Lisp {
     }
 
     /// Calls Scheme's `(syntax-theme)`: (capture face) pairs saying how
-    /// tree-sitter captures look. A Lua `gmacs.hooks.syntax_theme` replaces it.
+    /// tree-sitter captures look. A Lua `vmac.hooks.syntax_theme` replaces it.
     pub fn syntax_theme(&mut self) -> Vec<(String, String)> {
         if let Some(Ok(rows)) = self.lua_hook_rows("syntax_theme") {
             return rows.into_iter().filter_map(|r| Some((r.first()?.clone(), r.get(1)?.clone()))).collect();
@@ -603,7 +598,7 @@ impl Lisp {
     }
 
     /// Calls Scheme's `(lsp-servers)`: `(language command arg ...)` lists. A
-    /// Lua `gmacs.hooks.lsp_servers` replaces it.
+    /// Lua `vmac.hooks.lsp_servers` replaces it.
     pub fn lsp_servers(&mut self) -> Vec<crate::lsp::ServerConfig> {
         if let Some(Ok(rows)) = self.lua_hook_rows("lsp_servers") {
             return rows
@@ -640,7 +635,7 @@ impl Lisp {
     }
 
     /// Calls Scheme's `(modeline)`: a list of `(text face)` pairs. A Lua
-    /// `gmacs.hooks.modeline` returning `{{text, face}, ...}` replaces it.
+    /// `vmac.hooks.modeline` returning `{{text, face}, ...}` replaces it.
     pub fn modeline(&mut self) -> Vec<Segment> {
         match self.lua_hook_rows("modeline") {
             Some(Ok(rows)) => {
@@ -686,7 +681,15 @@ fn parse_segments(v: &SteelVal) -> Vec<Segment> {
 
 /// Registers a primitive that gets the editor. `$args` are the Scheme
 /// arguments with their Rust types.
-/// Where primitives get registered: Steel, Lua's `gmacs` table, or both.
+/// The user's config folder: ~/.config/vmac, or ~/.config/gmacs (the
+/// editor's old name) while only that one exists.
+pub fn config_dir() -> Option<PathBuf> {
+    let config = PathBuf::from(std::env::var_os("HOME")?).join(".config");
+    let (new, old) = (config.join("vmac"), config.join("gmacs"));
+    Some(if !new.exists() && old.exists() { old } else { new })
+}
+
+/// Where primitives get registered: Steel, Lua's `vmac` table, or both.
 struct Registry<'a> {
     engine: Option<&'a mut Engine>,
     lua: Option<(&'a Lua, mlua::Table)>,
@@ -710,7 +713,7 @@ macro_rules! prim {
                 $body
             });
         }
-        if let Some((lua, gmacs)) = $reg.lua.as_ref() {
+        if let Some((lua, vmac)) = $reg.lua.as_ref() {
             let ed = $editor.clone();
             #[allow(unused_parens)]
             let f = lua
@@ -723,7 +726,7 @@ macro_rules! prim {
                     Ok(value)
                 })
                 .expect("a Lua function");
-            gmacs.set(lua_name($name), f).expect("set in gmacs");
+            vmac.set(lua_name($name), f).expect("set in vmac");
         }
     }};
 }
@@ -734,9 +737,9 @@ macro_rules! pure {
         if let Some(engine) = $reg.engine.as_mut() {
             engine.register_fn($name, move |$($a: $t),*| $body);
         }
-        if let Some((lua, gmacs)) = $reg.lua.as_ref() {
+        if let Some((lua, vmac)) = $reg.lua.as_ref() {
             let f = lua.create_function(move |_, ($($a,)*): ($($t,)*)| Ok($body)).expect("a Lua function");
-            gmacs.set(lua_name($name), f).expect("set in gmacs");
+            vmac.set(lua_name($name), f).expect("set in vmac");
         }
     }};
 }
@@ -886,79 +889,81 @@ fn fresh_engine(editor: &Editor, lua: &Arc<Mutex<Lua>>) -> Engine {
     engine
 }
 
-/// A Lua state with the primitives in `gmacs`, and the Lua side of the
-/// bridge (`gmacs.command`, `gmacs.map`, `gmacs.hooks`, ...).
+/// A Lua state with the primitives in `vmac`, and the Lua side of the
+/// bridge (`vmac.command`, `vmac.map`, `vmac.hooks`, ...).
 fn fresh_lua(editor: &Editor) -> Lua {
     let lua = Lua::new();
-    let gmacs = lua.create_table().expect("a table");
+    let vmac = lua.create_table().expect("a table");
     {
-        let mut reg = Registry { engine: None, lua: Some((&lua, gmacs.clone())) };
+        let mut reg = Registry { engine: None, lua: Some((&lua, vmac.clone())) };
         register_primitives(&mut reg, editor);
     }
-    lua.globals().set("gmacs", gmacs).expect("set gmacs");
+    lua.globals().set("vmac", vmac.clone()).expect("set vmac");
+    // The editor's old name, so plugins written for it still load.
+    lua.globals().set("gmacs", vmac).expect("set gmacs");
     lua.load(LUA_PRELUDE).set_name("prelude.lua").exec().expect("the Lua prelude runs");
     lua
 }
 
 /// The Lua side of the bridge to Scheme.
 const LUA_PRELUDE: &str = r##"
-gmacs.commands = {}
+vmac.commands = {}
 -- Functions that replace Scheme's: modeline, lsp_servers, syntax_theme.
-gmacs.hooks = {}
+vmac.hooks = {}
 
 local function quote(s)
   return '"' .. (s:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
 end
 
 -- A command callable by name from anywhere (keys, SPC :, Scheme).
-function gmacs.command(name, fn)
-  gmacs.commands[name] = fn
-  gmacs.scheme("(register-lua-command! '" .. name .. ")")
+function vmac.command(name, fn)
+  vmac.commands[name] = fn
+  vmac.scheme("(register-lua-command! '" .. name .. ")")
 end
 
 -- Binds keys ("SPC i d") in a state (normal, insert, visual, operator)
 -- to a command name or a function.
 local anonymous = 0
-function gmacs.map(state, keys, command)
+function vmac.map(state, keys, command)
   if type(command) == "function" then
     anonymous = anonymous + 1
     local name = "lua-command-" .. anonymous
-    gmacs.command(name, command)
+    vmac.command(name, command)
     command = name
   end
-  gmacs.scheme("(lua-define-key '" .. state .. " " .. quote(keys) .. " '" .. command .. ")")
+  vmac.scheme("(lua-define-key '" .. state .. " " .. quote(keys) .. " '" .. command .. ")")
 end
 
 -- Terminal backends: where a terminal's program runs, beside the built-in
 -- "local" PTY. A backend is a table of functions:
 --   start(command, cwd, rows, cols)   (command "" means a shell) returns
---     a handle, then gmacs polls send and read; or
---     { handle = h, command = "tool attach h" }: gmacs runs that command on
+--     a handle, then vmac polls send and read; or
+--     { handle = h, command = "tool attach h" }: vmac runs that command on
 --     a local PTY, which carries keys, screen and size (tmux, ssh, hc...)
 --   send(handle, text, key)   text it types, or a key name (enter, ctrl+c, up)
 --   read(handle) -> the screen as text
 --   alive(handle) -> bool     (optional)
 --   kill(handle)              (optional; also called for attached terminals)
-gmacs.terminal_backends = {}
-function gmacs.terminal_backend(name, backend)
-  gmacs.terminal_backends[name] = backend
+vmac.terminal_backends = {}
+function vmac.terminal_backend(name, backend)
+  vmac.terminal_backends[name] = backend
 end
 
 -- Runs a command (Scheme's or Lua's) right after this one.
-function gmacs.run(name)
-  gmacs.scheme("(call-binding '" .. name .. ")")
+function vmac.run(name)
+  vmac.scheme("(call-binding '" .. name .. ")")
 end
 
 -- print shows in the echo area.
 function print(...)
   local parts = {}
   for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-  gmacs.message(table.concat(parts, " "))
+  vmac.message(table.concat(parts, " "))
 end
 "##;
 
 /// Calls a function of a plugin's terminal backend
-/// (`gmacs.terminal_backends[backend][name]`); None when it has no such function.
+/// (`vmac.terminal_backends[backend][name]`); None when it has no such function.
 fn call_backend<R: mlua::FromLuaMulti>(
     lua: &Lua,
     backend: &str,
@@ -967,7 +972,7 @@ fn call_backend<R: mlua::FromLuaMulti>(
 ) -> Option<mlua::Result<R>> {
     let f = lua
         .globals()
-        .get::<mlua::Table>("gmacs")
+        .get::<mlua::Table>("vmac")
         .and_then(|g| g.get::<mlua::Table>("terminal_backends"))
         .and_then(|b| b.get::<mlua::Table>(backend))
         .and_then(|b| b.get::<mlua::Function>(name))
@@ -979,10 +984,10 @@ fn first_line(e: &impl std::fmt::Display) -> String {
     e.to_string().lines().next().unwrap_or("").to_string()
 }
 
-/// Runs a Lua command registered with gmacs.command.
+/// Runs a Lua command registered with vmac.command.
 fn lua_command(lua: &Lua, name: &str) -> mlua::Result<()> {
-    let gmacs: mlua::Table = lua.globals().get("gmacs")?;
-    let commands: mlua::Table = gmacs.get("commands")?;
+    let vmac: mlua::Table = lua.globals().get("vmac")?;
+    let commands: mlua::Table = vmac.get("commands")?;
     let f: mlua::Function = commands.get(name)?;
     f.call::<()>(())
 }
@@ -1410,12 +1415,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         if let Some(engine) = reg.engine.as_mut() {
             engine.register_fn("plugin-install", install.clone());
         }
-        if let Some((lua, gmacs)) = reg.lua.as_ref() {
+        if let Some((lua, vmac)) = reg.lua.as_ref() {
             let f = lua.create_function(move |_, url: String| {
                 install(url);
                 Ok(())
             });
-            gmacs.set("plugin_install", f.expect("a Lua function")).expect("set in gmacs");
+            vmac.set("plugin_install", f.expect("a Lua function")).expect("set in vmac");
         }
     }
     {
@@ -1440,12 +1445,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         if let Some(engine) = reg.engine.as_mut() {
             engine.register_fn("plugin-update", update.clone());
         }
-        if let Some((lua, gmacs)) = reg.lua.as_ref() {
+        if let Some((lua, vmac)) = reg.lua.as_ref() {
             let f = lua.create_function(move |_, ()| {
                 update();
                 Ok(())
             });
-            gmacs.set("plugin_update", f.expect("a Lua function")).expect("set in gmacs");
+            vmac.set("plugin_update", f.expect("a Lua function")).expect("set in vmac");
         }
     }
 
@@ -1482,7 +1487,7 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             .unwrap_or_default()
     });
 
-    // Scheme for Lua to run (gmacs.scheme), silently, after the current command.
+    // Scheme for Lua to run (vmac.scheme), silently, after the current command.
     prim!(reg, editor, "scheme", |s, code: String| s.pending_scheme.push(code));
     // Runs Scheme source after the current command (see `pending_eval`).
     prim!(reg, editor, "eval-string", |s, code: String| s.pending_eval.push(code));
@@ -2045,7 +2050,7 @@ mod tests {
 
     #[test]
     fn a_broken_reload_keeps_the_last_good_version() {
-        let dir = std::env::temp_dir().join(format!("gmacs-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let init = dir.join("init.scm");
         std::fs::write(&init, "(defcommand (hi) (insert \"hi\"))").unwrap();
@@ -2413,9 +2418,9 @@ mod tests {
     }
 
     /// A throwaway project: src/main.rs, src/util/, README.md, an ignored
-    /// target/, and gmacs opened on src/main.rs.
+    /// target/, and vmac opened on src/main.rs.
     fn tree_project(tag: &str) -> (Lisp, Editor, PathBuf) {
-        let root = std::env::temp_dir().join(format!("gmacs-tree-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("vmac-tree-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src/util")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
@@ -2572,7 +2577,7 @@ mod tests {
 
     fn markdown_buffer(text: &str) -> (Lisp, Editor) {
         let (lisp, editor) = lisp_with("");
-        let path = std::env::temp_dir().join(format!("gmacs-table-{}-{}.md", std::process::id(), text.len()));
+        let path = std::env::temp_dir().join(format!("vmac-table-{}-{}.md", std::process::id(), text.len()));
         std::fs::write(&path, text).unwrap();
         editor.lock().open_file(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -2635,7 +2640,7 @@ mod tests {
 
     fn with_diagnostics(text: &str) -> (Lisp, Editor) {
         let (lisp, editor) = lisp_with("");
-        let path = std::env::temp_dir().join(format!("gmacs-diag-{}.rs", std::process::id()));
+        let path = std::env::temp_dir().join(format!("vmac-diag-{}.rs", std::process::id()));
         std::fs::write(&path, text).unwrap();
         editor.lock().open_file(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -2702,7 +2707,7 @@ mod tests {
 
     #[test]
     fn diagnostics_jump_list_and_count_from_scheme() {
-        let dir = std::env::temp_dir().join(format!("gmacs-lsp-scheme-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-lsp-scheme-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let server = dir.join("server.py");
         std::fs::write(&server, crate::lsp::tests::FAKE_SERVER).unwrap();
@@ -2737,9 +2742,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// gmacs on a file served by the fake language server (lsp.rs's tests).
+    /// vmac on a file served by the fake language server (lsp.rs's tests).
     fn with_fake_server(tag: &str, text: &str) -> (Lisp, Editor, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("gmacs-lsp-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-lsp-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let server = dir.join("server.py");
         std::fs::write(&server, crate::lsp::tests::FAKE_SERVER).unwrap();
@@ -2944,6 +2949,14 @@ mod tests {
     }
 
     #[test]
+    fn plugins_using_the_old_name_still_work() {
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval_lua(r#"gmacs.command("old", function() gmacs.insert("still works") end)"#).unwrap();
+        typed(&mut lisp, " :old\n");
+        assert_eq!(text(&editor), "still works");
+    }
+
+    #[test]
     fn lua_names_follow_scheme_names() {
         assert_eq!(lua_name("buffer-name"), "buffer_name");
         assert_eq!(lua_name("minibuffer-active?"), "minibuffer_active");
@@ -2954,21 +2967,21 @@ mod tests {
     #[test]
     fn lua_has_the_same_primitives() {
         let (mut lisp, editor) = lisp_with("hello");
-        assert_eq!(lisp.eval_lua("gmacs.buffer_name()").unwrap(), "test");
-        assert_eq!(lisp.eval_lua("gmacs.char_at(1)").unwrap(), "e");
-        lisp.eval_lua("gmacs.goto_char(5); gmacs.insert(' world')").unwrap();
+        assert_eq!(lisp.eval_lua("vmac.buffer_name()").unwrap(), "test");
+        assert_eq!(lisp.eval_lua("vmac.char_at(1)").unwrap(), "e");
+        lisp.eval_lua("vmac.goto_char(5); vmac.insert(' world')").unwrap();
         assert_eq!(text(&editor), "hello world");
-        assert_eq!(lisp.eval_lua("gmacs.pos_to_line(3)").unwrap(), "0");
-        assert_eq!(lisp.eval_lua("#gmacs.buffer_list()").unwrap(), "1", "lists become tables");
+        assert_eq!(lisp.eval_lua("vmac.pos_to_line(3)").unwrap(), "0");
+        assert_eq!(lisp.eval_lua("#vmac.buffer_list()").unwrap(), "1", "lists become tables");
     }
 
     #[test]
     fn lua_commands_and_keys_work_beside_scheme() {
         let (mut lisp, editor) = lisp_with("");
         lisp.eval_lua(r#"
-            gmacs.command("insert-greeting", function() gmacs.insert("hi from lua") end)
-            gmacs.map("normal", "SPC i g", "insert-greeting")
-            gmacs.map("normal", "Q", function() gmacs.insert("Q!") end)
+            vmac.command("insert-greeting", function() vmac.insert("hi from lua") end)
+            vmac.map("normal", "SPC i g", "insert-greeting")
+            vmac.map("normal", "Q", function() vmac.insert("Q!") end)
         "#)
         .unwrap();
         typed(&mut lisp, " ig");
@@ -2980,7 +2993,7 @@ mod tests {
         assert_eq!(text(&editor).matches("hi from lua").count(), 2, "Lua commands run from M-x too: {:?}", text(&editor));
         // Scheme binds a Lua command by name, and Lua runs a Scheme command.
         lisp.eval(r#"(define-key normal-map "Z" 'insert-greeting)"#).unwrap();
-        lisp.eval_lua(r#"gmacs.map("normal", "W", function() gmacs.run("delete-char-under") end)"#).unwrap();
+        lisp.eval_lua(r#"vmac.map("normal", "W", function() vmac.run("delete-char-under") end)"#).unwrap();
         let before = text(&editor).len();
         typed(&mut lisp, "0W");
         assert_eq!(text(&editor).len(), before - 1);
@@ -2995,7 +3008,7 @@ mod tests {
         assert_eq!(editor.lock().message, "a 1", "print shows in the echo area");
         typed(&mut lisp, ":lua nope(\n");
         assert!(editor.lock().message.starts_with("lua:"), "{}", editor.lock().message.clone());
-        lisp.eval_lua(r#"gmacs.command("broken", function() error("oops") end)"#).unwrap();
+        lisp.eval_lua(r#"vmac.command("broken", function() error("oops") end)"#).unwrap();
         typed(&mut lisp, " :broken\n");
         { let m = editor.lock().message.clone(); assert!(m.contains("oops"), "{m}"); }
         typed(&mut lisp, "ix");
@@ -3006,9 +3019,9 @@ mod tests {
     fn lua_hooks_replace_the_modeline_servers_and_theme() {
         let (mut lisp, _editor) = lisp_with("");
         lisp.eval_lua(r#"
-            gmacs.hooks.modeline = function() return { {gmacs.buffer_name(), "accent"}, {"lua!", "dim"} } end
-            gmacs.hooks.lsp_servers = function() return { {"python", "pylsp"}, {"rust", "ra", "--flag"} } end
-            gmacs.hooks.syntax_theme = function() return { {"keyword", "red"} } end
+            vmac.hooks.modeline = function() return { {vmac.buffer_name(), "accent"}, {"lua!", "dim"} } end
+            vmac.hooks.lsp_servers = function() return { {"python", "pylsp"}, {"rust", "ra", "--flag"} } end
+            vmac.hooks.syntax_theme = function() return { {"keyword", "red"} } end
         "#)
         .unwrap();
         assert_eq!(
@@ -3019,16 +3032,16 @@ mod tests {
         assert_eq!(servers[1].command, "ra");
         assert_eq!(servers[1].args, vec!["--flag"]);
         assert_eq!(lisp.syntax_theme(), vec![("keyword".to_string(), "red".to_string())]);
-        lisp.eval_lua("gmacs.hooks.modeline = function() error('bad') end").unwrap();
+        lisp.eval_lua("vmac.hooks.modeline = function() error('bad') end").unwrap();
         assert!(lisp.modeline()[0].text.contains("bad"), "a broken hook shows its error");
     }
 
     #[test]
     fn init_lua_loads_after_scheme_and_reloads() {
-        let dir = std::env::temp_dir().join(format!("gmacs-init-lua-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vmac-init-lua-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let init = dir.join("init.lua");
-        std::fs::write(&init, r#"gmacs.map("normal", "Q", function() gmacs.insert("one") end)"#).unwrap();
+        std::fs::write(&init, r#"vmac.map("normal", "Q", function() vmac.insert("one") end)"#).unwrap();
         let editor = Editor::new(Buffer::new("t"));
         let core = Source { label: "core".into(), path: None };
         let mut lisp = Lisp::with_lua(editor.clone(), vec![core], vec![init.clone()]);
@@ -3036,7 +3049,7 @@ mod tests {
         typed(&mut lisp, "Q");
         assert_eq!(text(&editor), "one");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&init, r#"gmacs.map("normal", "Q", function() gmacs.insert("two") end)"#).unwrap();
+        std::fs::write(&init, r#"vmac.map("normal", "Q", function() vmac.insert("two") end)"#).unwrap();
         assert!(lisp.reload_if_changed());
         typed(&mut lisp, "0Q");
         assert_eq!(text(&editor), "twoone");
@@ -3067,7 +3080,7 @@ mod tests {
     /// A plugins folder with: `zen` (Scheme), `wc` (Lua, requiring a module
     /// of its own), `broken` (bad Scheme), `off` (disabled), and `stamp.lua`.
     fn plugin_setup(tag: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!("gmacs-plugin-load-{tag}-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("vmac-plugin-load-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("plugins");
         let write = |rel: &str, text: &str| {
@@ -3077,12 +3090,12 @@ mod tests {
         };
         write("zen/init.scm", r#"(defcommand (zen-insert) (insert "zen")) (define-key normal-map "Z" 'zen-insert)"#);
         write("wc/init.lua", r#"local util = require("wc_util")
-gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_string()) .. " words") end)"#);
+vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string()) .. " words") end)"#);
         write("wc/lua/wc_util.lua", "return { count = function(s) local n = 0 for _ in s:gmatch('%S+') do n = n + 1 end return n end }");
         write("broken/init.scm", "(define (oops) (no-such-function))");
         write("off/init.scm", r#"(defcommand (off-insert) (insert "off"))"#);
         write("off/disabled", "");
-        write("stamp.lua", r#"gmacs.command("stamp", function() gmacs.insert("stamped") end)"#);
+        write("stamp.lua", r#"vmac.command("stamp", function() vmac.insert("stamped") end)"#);
         (base, dir)
     }
 
@@ -3233,9 +3246,9 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         typed(&mut lisp, ":term sh\n");
         assert!(editor.lock().terminal_here().is_some(), "{}", editor.lock().message.clone());
         assert_eq!(lisp.cursor_shape(), "bar", "typing into it");
-        typed(&mut lisp, "echo gmacs-$((40 + 2))\n");
+        typed(&mut lisp, "echo vmac-$((40 + 2))\n");
         assert!(
-            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("gmacs-42")),
+            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("vmac-42")),
             "{}",
             editor.lock().buffer().text()
         );
@@ -3245,7 +3258,7 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         assert_eq!(editor.lock().buffer().point(), 0, "motions work on the screen");
         assert!(lisp.modeline().iter().any(|s| s.text == "terminal (local)"));
         typed(&mut lisp, "x");
-        assert!(editor.lock().buffer().text().to_string().contains("gmacs-42"), "read-only: x does nothing");
+        assert!(editor.lock().buffer().text().to_string().contains("vmac-42"), "read-only: x does nothing");
         typed(&mut lisp, "i");
         typed(&mut lisp, "exit\n");
         assert!(
@@ -3274,7 +3287,7 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         lisp.eval_lua(r#"
             local screens = {}
             killed = {}
-            gmacs.terminal_backend("fake", {
+            vmac.terminal_backend("fake", {
               start = function(command, cwd, rows, cols)
                 screens.h1 = "fake$ " .. command
                 return "h1"
@@ -3285,7 +3298,7 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
               read = function(h) return screens[h] end,
               kill = function(h) killed[#killed + 1] = h end,
             })
-            gmacs.set_terminal_backend("fake")
+            vmac.set_terminal_backend("fake")
         "#)
         .unwrap();
         typed(&mut lisp, ":term top\n");
@@ -3307,12 +3320,12 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         let (mut lisp, editor) = lisp_with("");
         lisp.eval_lua(r#"
             killed = {}
-            gmacs.terminal_backend("attaching", {
+            vmac.terminal_backend("attaching", {
               -- A stand-in for `hc attach t7`: the "attach" command is a shell.
               start = function(command, cwd, rows, cols) return { handle = "t7", command = "sh" } end,
               kill = function(h) killed[#killed + 1] = h end,
             })
-            gmacs.set_terminal_backend("attaching")
+            vmac.set_terminal_backend("attaching")
         "#)
         .unwrap();
         typed(&mut lisp, ":term\n");
@@ -3353,9 +3366,9 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
             assert!(shell.ends_with("/fish"), "{shell}");
         }
         let (mut lisp, editor) = lisp_with("");
-        assert_eq!(lisp.eval_lua("gmacs.terminal_shell()").unwrap(), shell);
+        assert_eq!(lisp.eval_lua("vmac.terminal_shell()").unwrap(), shell);
         // A shell with no config to load, so the test doesn't depend on yours.
-        lisp.eval_lua(r#"gmacs.set_terminal_shell("/bin/sh")"#).unwrap();
+        lisp.eval_lua(r#"vmac.set_terminal_shell("/bin/sh")"#).unwrap();
         typed(&mut lisp, ":term\n");
         typed(&mut lisp, "echo $0\n");
         assert!(
@@ -3374,7 +3387,7 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
         typed(&mut lisp, ":font Nope\n");
         assert_eq!(editor.lock().font.as_deref(), Some("Hack Nerd Font Mono"));
         assert_eq!(editor.lock().message, "no font named Nope (:fonts lists them)");
-        lisp.eval_lua(r#"gmacs.set_font("Menlo")"#).unwrap();
+        lisp.eval_lua(r#"vmac.set_font("Menlo")"#).unwrap();
         assert_eq!(lisp.eval("(font)").unwrap(), "\"Menlo\"");
         typed(&mut lisp, ":fonts\n");
         assert!(editor.lock().picker.is_some());
@@ -3398,7 +3411,7 @@ gmacs.command("word-count", function() gmacs.message(util.count(gmacs.buffer_str
     fn the_herdr_backend_runs_terminals_in_herdr_core() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/plugins");
         let (mut lisp, editor) = with_plugins(&dir, None);
-        lisp.eval_lua(r#"gmacs.set_terminal_backend("herdr")"#).unwrap();
+        lisp.eval_lua(r#"vmac.set_terminal_backend("herdr")"#).unwrap();
         typed(&mut lisp, ":term sh\n");
         assert!(editor.lock().terminal_here().is_some(), "{}", editor.lock().message.clone());
         typed(&mut lisp, "echo herdr-$((40 + 2))\n");

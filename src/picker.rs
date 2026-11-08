@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn a_relative_start_finds_the_project() {
-        // Tests run in the crate's folder, like launching `gmacs src/main.rs` there.
+        // Tests run in the crate's folder, like launching `vmac src/main.rs` there.
         let root = project_root(Path::new("src/main.rs"));
         assert_eq!(root, PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         assert!(!project_files(&root).is_empty());
