@@ -75,6 +75,8 @@ pub fn utf16_to_char(rope: &Rope, (line, col): (usize, usize)) -> usize {
 pub enum RequestKind {
     Definition,
     Hover,
+    References,
+    Completion,
 }
 
 /// A place in a file, as (line, UTF-16 column).
@@ -91,6 +93,133 @@ pub enum Reply {
     Definition(Vec<Location>),
     /// Documentation for what's under the cursor, as Markdown.
     Hover(Option<String>),
+    /// Everywhere the thing under the cursor is used.
+    References(Vec<Location>),
+    /// What could be typed at the cursor.
+    Completion(Vec<CompletionItem>),
+}
+
+/// One completion candidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionItem {
+    pub label: String,
+    /// What to type: the server's insert text (snippet placeholders removed), else the label.
+    pub text: String,
+    /// What to match the typed prefix against.
+    pub filter: String,
+    /// What kind of thing it is: fn, var, struct, ...
+    pub kind: &'static str,
+    pub detail: String,
+    sort: String,
+}
+
+/// LSP's CompletionItemKind numbers as short names.
+fn completion_kind(n: u64) -> &'static str {
+    match n {
+        2 => "method",
+        3 => "fn",
+        4 => "new",
+        5 => "field",
+        6 => "var",
+        7 => "class",
+        8 => "trait",
+        9 => "mod",
+        10 => "prop",
+        12 => "value",
+        13 => "enum",
+        14 => "keyword",
+        15 => "snippet",
+        17 => "file",
+        19 => "folder",
+        20 => "variant",
+        21 => "const",
+        22 => "struct",
+        23 => "event",
+        24 => "op",
+        25 => "type",
+        _ => "",
+    }
+}
+
+/// A snippet (`foo(${1:x}, $2)$0`) as the plain text it would type (`foo(x, )`).
+pub fn strip_snippet(snippet: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = snippet.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                out.push(chars[i + 1]);
+                i += 2;
+            }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                // ${1:default} or ${1|a,b|}: keep the default (or first choice).
+                let mut depth = 1;
+                let mut j = i + 2;
+                let mut inner = String::new();
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        inner.push(chars[j]);
+                    }
+                    j += 1;
+                }
+                let body = inner.split_once(':').map(|(_, d)| d.to_string()).unwrap_or_else(|| {
+                    inner.split_once('|').map(|(_, c)| c.split([',', '|']).next().unwrap_or("").to_string()).unwrap_or_default()
+                });
+                out.push_str(&strip_snippet(&body));
+                i = j;
+            }
+            '$' if chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Most items kept from one answer (rust-analyzer can send thousands).
+const MAX_COMPLETIONS: usize = 400;
+
+fn parse_completions(result: &Value) -> Vec<CompletionItem> {
+    let items = match result {
+        Value::Array(items) => items,
+        Value::Object(o) => match o.get("items") {
+            Some(Value::Array(items)) => items,
+            _ => return vec![],
+        },
+        _ => return vec![],
+    };
+    let mut out: Vec<CompletionItem> = items
+        .iter()
+        .filter_map(|it| {
+            let label = it["label"].as_str()?.to_string();
+            let raw = it["textEdit"]["newText"].as_str().or(it["insertText"].as_str()).unwrap_or(&label).to_string();
+            let text = if it["insertTextFormat"].as_u64() == Some(2) { strip_snippet(&raw) } else { raw };
+            Some(CompletionItem {
+                filter: it["filterText"].as_str().unwrap_or(&label).to_string(),
+                kind: completion_kind(it["kind"].as_u64().unwrap_or(0)),
+                detail: it["detail"].as_str().unwrap_or_default().to_string(),
+                sort: it["sortText"].as_str().unwrap_or(&label).to_string(),
+                label,
+                text,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.sort.cmp(&b.sort));
+    out.truncate(MAX_COMPLETIONS);
+    out
 }
 
 /// A (line, UTF-16 column) for a character offset.
@@ -331,10 +460,18 @@ impl Client {
         let method = match kind {
             RequestKind::Definition => "textDocument/definition",
             RequestKind::Hover => "textDocument/hover",
+            RequestKind::References => "textDocument/references",
+            RequestKind::Completion => "textDocument/completion",
         };
-        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {
+        let mut params = json!({
             "textDocument": { "uri": path_to_uri(path) },
-            "position": { "line": position.0, "character": position.1 } } });
+            "position": { "line": position.0, "character": position.1 } });
+        match kind {
+            RequestKind::References => params["context"] = json!({ "includeDeclaration": true }),
+            RequestKind::Completion => params["context"] = json!({ "triggerKind": 1 }),
+            _ => {}
+        }
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.pending.insert(id, kind);
         if self.ready {
             self.write(&message);
@@ -550,6 +687,8 @@ fn handle(
         replies.push(match kind {
             RequestKind::Definition => Reply::Definition(parse_locations(result)),
             RequestKind::Hover => Reply::Hover(if result.is_null() { None } else { parse_hover(result) }),
+            RequestKind::References => Reply::References(parse_locations(result)),
+            RequestKind::Completion => Reply::Completion(parse_completions(result)),
         });
         return true;
     }
@@ -678,6 +817,16 @@ while True:
         uri = m["params"]["textDocument"]["uri"]
         send({"jsonrpc": "2.0", "id": m["id"], "result": [{"uri": uri,
               "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 5}}}]})
+    elif method == "textDocument/references":
+        uri = m["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": m["id"], "result": [
+            {"uri": uri, "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 5}}},
+            {"uri": uri, "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}}]})
+    elif method == "textDocument/completion":
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"isIncomplete": False, "items": [
+            {"label": "greeting", "kind": 6, "detail": "str", "sortText": "1"},
+            {"label": "great()", "kind": 3, "insertText": "great(${1:n})$0", "insertTextFormat": 2, "sortText": "2"},
+            {"label": "other", "kind": 6, "sortText": "3"}]}})
     elif method == "textDocument/hover":
         line = m["params"]["position"]["line"]
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown",
@@ -803,6 +952,42 @@ while True:
         assert!(replies.iter().any(|r| matches!(r, Reply::Hover(Some(t)) if t.contains("Say hello"))), "{replies:?}");
     }
 
+    /// Against the real pyright: `cargo test -- --ignored pyright`.
+    #[test]
+    #[ignore]
+    fn pyright_answers_references_and_completion() {
+        let dir = std::env::temp_dir().join(format!("gmacs-pyright-refs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.py");
+        let text = "def greeting():\n    pass\n\ngreeting()\ngreeting()\ngree\n";
+        std::fs::write(&file, text).unwrap();
+        let mut lsp = Lsp::default();
+        lsp.set_configs(vec![ServerConfig {
+            language: "python".into(),
+            command: "pyright-langserver".into(),
+            args: vec!["--stdio".into()],
+        }]);
+        let docs = vec![Doc { path: file.clone(), language: "python", revision: 0, saves: 0, text: Rope::from_str(text) }];
+        lsp.pump(&docs, |_| dir.clone());
+        lsp.request(RequestKind::References, &file, (0, 5)).unwrap();
+        lsp.request(RequestKind::Completion, &file, (5, 4)).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..200 {
+            lsp.pump(&docs, |_| dir.clone());
+            replies.extend(lsp.take_replies());
+            if replies.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(replies.iter().any(|r| matches!(r, Reply::References(l) if l.len() == 3)), "{replies:?}");
+        assert!(
+            replies.iter().any(|r| matches!(r, Reply::Completion(items) if items.iter().any(|i| i.label == "greeting"))),
+            "no greeting in the completions"
+        );
+    }
+
     /// Against the real rust-analyzer: `cargo test -- --ignored rust_analyzer`.
     #[test]
     #[ignore]
@@ -848,6 +1033,29 @@ while True:
         let rope = Rope::from_str("a😀b\nxyz");
         assert_eq!(char_to_utf16(&rope, 2), (0, 3), "b comes after two UTF-16 units of emoji");
         assert_eq!(char_to_utf16(&rope, 5), (1, 1));
+    }
+
+    #[test]
+    fn snippets_become_plain_text() {
+        assert_eq!(strip_snippet("great(${1:n}, $2)$0"), "great(n, )");
+        assert_eq!(strip_snippet("${1|a,b|}x"), "ax");
+        assert_eq!(strip_snippet("a\\$b ${1:outer ${2:inner}}"), "a$b outer inner");
+    }
+
+    #[test]
+    fn completions_parse_sort_and_strip() {
+        let list = json!({ "isIncomplete": false, "items": [
+            { "label": "b", "sortText": "2", "kind": 3 },
+            { "label": "a()", "sortText": "1", "insertText": "a($1)", "insertTextFormat": 2, "detail": "fn a()" },
+            { "label": "c", "textEdit": { "newText": "c_edit", "range": {} }, "filterText": "cc" } ] });
+        let items = parse_completions(&list);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["a()", "b", "c"], "by sortText");
+        assert_eq!(items[0].text, "a()");
+        assert_eq!(items[1].kind, "fn");
+        assert_eq!(items[2].text, "c_edit");
+        assert_eq!(items[2].filter, "cc");
+        assert_eq!(parse_completions(&json!([{ "label": "x" }])).len(), 1, "a bare array works too");
     }
 
     #[test]

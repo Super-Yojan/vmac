@@ -27,6 +27,9 @@ const CHAR_WIDTH: f32 = 0.6;
 /// The documentation popup K shows.
 const HOVER_WIDTH: f32 = 560.;
 const HOVER_MAX_HEIGHT: f32 = 320.;
+/// The completion popup.
+const COMPLETION_WIDTH: f32 = 460.;
+const COMPLETION_ROWS: usize = 10;
 
 pub struct Shell {
     editor: Editor,
@@ -69,7 +72,9 @@ impl Shell {
                 cx.background_executor().timer(LSP_POLL).await;
                 let alive = this.update(cx, |shell, cx| {
                     let configs = shell.lisp.lsp_servers();
-                    if shell.editor.lock().lsp_pump(configs) {
+                    let changed = shell.editor.lock().lsp_pump(configs);
+                    // Replies that Scheme handles (the references picker).
+                    if shell.lisp.run_events() || changed {
                         cx.notify();
                     }
                 });
@@ -404,7 +409,7 @@ fn picker_element(
                                 d.child(div().px(px(10.)).text_color(t.muted_foreground).child("No matches"))
                             }),
                     )
-                    .when_some(preview, |d, lines| {
+                    .when_some(preview, |d, (lines, mark)| {
                         d.child(
                             v_flex()
                                 .flex_1()
@@ -414,8 +419,14 @@ fn picker_element(
                                 .border_color(t.border)
                                 .text_color(t.muted_foreground)
                                 .overflow_hidden()
-                                .children(lines.into_iter().take(rows).map(|l| {
-                                    div().h(px(ROW_HEIGHT)).whitespace_nowrap().child(l)
+                                .children(lines.into_iter().take(rows).enumerate().map(|(i, l)| {
+                                    // The line a reference points at stands out.
+                                    let marked = mark == Some(i);
+                                    div()
+                                        .h(px(ROW_HEIGHT))
+                                        .whitespace_nowrap()
+                                        .when(marked, |d| d.bg(t.list_active).text_color(t.foreground))
+                                        .child(l)
                                 })),
                         )
                     }),
@@ -690,6 +701,38 @@ impl Render for Shell {
                 .line_height(px(19.))
                 .child(gpui_kit::component::text::TextView::markdown("hover-doc", doc))
         });
+        // Completions, under the word being typed.
+        let completion = st.completion.as_ref().zip(cursor_at).map(|(c, (x, y, line_height))| {
+            let rows = COMPLETION_ROWS.min(c.len());
+            let first = c.selected().saturating_sub(rows - 1).min(c.len() - rows);
+            let w = COMPLETION_WIDTH.min(width - 16.);
+            let left = x.min(width - w - 8.).max(8.);
+            let below = y + line_height + rows as f32 * ROW_HEIGHT + 8. < area;
+            div()
+                .absolute()
+                .left(px(left))
+                .when(below, |d| d.top(px(y + line_height + 2.)))
+                .when(!below, |d| d.bottom(px(height - y + 2.)))
+                .w(px(w))
+                .py(px(4.))
+                .bg(theme.popover)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius)
+                .shadow_lg()
+                .children(c.items().enumerate().skip(first).take(rows).map(|(i, item)| {
+                    h_flex()
+                        .h(px(ROW_HEIGHT))
+                        .px(px(8.))
+                        .gap(px(10.))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .when(i == c.selected(), |d| d.bg(theme.list_active))
+                        .child(div().flex_none().text_color(theme.foreground).child(item.label.clone()))
+                        .child(div().flex_1().overflow_hidden().text_color(theme.muted_foreground).child(item.detail.clone()))
+                        .child(div().flex_none().text_color(theme.primary).child(item.kind))
+                }))
+        });
         // The picker draws its own query line; the echo area keeps the message.
         let overlay = st.picker.as_ref().map(|p| picker_element(p, &st.minibuffer, bar, height, cx));
         let echo = match &st.minibuffer_prompt {
@@ -731,6 +774,7 @@ impl Render for Shell {
             .child(div().relative().w_full().h(px(area)).children(windows))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
             .children(hover)
+            .children(completion)
             .children(overlay)
     }
 }

@@ -6,7 +6,9 @@
 //! is never contended; it is only there to satisfy the bounds.
 
 use crate::buffer::Buffer;
-use crate::lsp::{Diagnostic, Doc, Lsp, Reply, RequestKind, ServerConfig};
+use crate::lsp::{CompletionItem, Diagnostic, Doc, Location, Lsp, Reply, RequestKind, ServerConfig};
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use crate::picker::Picker;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,53 @@ pub fn compile_search(pattern: &str) -> Option<Regex> {
 
 pub type BufferId = u64;
 pub type WindowId = u64;
+
+/// The completion popup: the server's candidates, those matching what's
+/// been typed since `start`, and the selected one.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    all: Vec<CompletionItem>,
+    /// Indices into `all`, best match first.
+    shown: Vec<usize>,
+    selected: usize,
+    /// Where the word being completed starts.
+    start: usize,
+}
+
+impl Completion {
+    pub fn items(&self) -> impl Iterator<Item = &CompletionItem> {
+        self.shown.iter().map(|&i| &self.all[i])
+    }
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+    pub fn len(&self) -> usize {
+        self.shown.len()
+    }
+
+    /// Keeps the candidates matching `prefix`, best first (all, in the
+    /// server's order, for an empty prefix).
+    fn filter(&mut self, prefix: &str) {
+        self.selected = 0;
+        if prefix.is_empty() {
+            self.shown = (0..self.all.len()).collect();
+            return;
+        }
+        let matcher = SkimMatcherV2::default().smart_case();
+        let mut scored: Vec<(i64, usize)> = self
+            .all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| matcher.fuzzy_match(&item.filter, prefix).map(|score| (score, i)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        self.shown = scored.into_iter().map(|(_, i)| i).collect();
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
 
 /// A view onto a buffer. Like Emacs, each window has its own point: the
 /// selected window's point lives in its buffer while it is selected, and is
@@ -150,6 +199,11 @@ pub struct EditorState {
     pub hover: Option<String>,
     /// Where gd and other jumps came from, for C-o: (buffer, point).
     jumps: Vec<(BufferId, usize)>,
+    /// The completion popup while typing, if open.
+    pub completion: Option<Completion>,
+    /// Things for Scheme to handle (a function name and its arguments),
+    /// raised where Rust can't call Scheme (server replies).
+    events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
 }
 
@@ -175,6 +229,8 @@ impl EditorState {
             lsp: Lsp::default(),
             hover: None,
             jumps: Vec::new(),
+            completion: None,
+            events: Vec::new(),
             search_cache: None,
         }
     }
@@ -584,8 +640,8 @@ impl EditorState {
         changed
     }
 
-    /// Asks the selected buffer's server about the point (gd, K). The answer
-    /// comes back later, through `lsp_pump`.
+    /// Asks the selected buffer's server about the point (gd, K, gr). The
+    /// answer comes back later, through `lsp_pump`.
     pub fn lsp_request(&mut self, kind: RequestKind) {
         let Some(path) = self.buffer().file().cloned() else {
             self.message = "This buffer has no file".into();
@@ -595,6 +651,110 @@ impl EditorState {
         let position = crate::lsp::char_to_utf16(self.buffer().text(), self.buffer().point());
         if let Err(e) = self.lsp.request(kind, &path, position) {
             self.message = e;
+        }
+    }
+
+    /// Asks for completions at the point, saying nothing when there's no
+    /// server (it happens on every word character typed).
+    pub fn lsp_complete(&mut self) {
+        let Some(path) = self.buffer().file().cloned() else { return };
+        self.lsp_sync();
+        let position = crate::lsp::char_to_utf16(self.buffer().text(), self.buffer().point());
+        let _ = self.lsp.request(RequestKind::Completion, &path, position);
+    }
+
+    #[cfg(test)]
+    pub fn take_events_peek(&self) -> &[(String, Vec<String>)] {
+        &self.events
+    }
+
+    pub fn take_events(&mut self) -> Vec<(String, Vec<String>)> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Where the word before the point starts.
+    fn word_start(&self) -> usize {
+        let b = self.buffer();
+        let mut p = b.point();
+        while p > 0 && b.char_at(p - 1).chars().next().is_some_and(is_word_char) {
+            p -= 1;
+        }
+        p
+    }
+
+    /// Filters the popup by what's been typed; closes it when nothing matches
+    /// or the cursor left the word.
+    pub fn completion_refresh(&mut self) {
+        let point = self.buffer().point();
+        let prefix = match &self.completion {
+            Some(c) if point >= c.start && self.buffer().line_of(point) == self.buffer().line_of(c.start) => {
+                self.buffer().substring(c.start, point)
+            }
+            _ => {
+                self.completion = None;
+                return;
+            }
+        };
+        if let Some(c) = self.completion.as_mut() {
+            c.filter(&prefix);
+            if c.shown.is_empty() {
+                self.completion = None;
+            }
+        }
+    }
+
+    pub fn completion_move(&mut self, n: isize) {
+        if let Some(c) = self.completion.as_mut()
+            && !c.shown.is_empty()
+        {
+            c.selected = (c.selected as isize + n).rem_euclid(c.shown.len() as isize) as usize;
+        }
+    }
+
+    /// Replaces the word being completed with the selected candidate.
+    pub fn completion_accept(&mut self) -> bool {
+        let Some(c) = self.completion.take() else { return false };
+        let Some(&i) = c.shown.get(c.selected) else { return false };
+        let text = c.all[i].text.clone();
+        let point = self.buffer().point();
+        let b = self.buffer_mut();
+        b.delete_range(c.start, point);
+        b.goto_char(c.start);
+        b.insert(&text);
+        true
+    }
+
+    /// A reference as the picker shows it: `path:line:col  code`, the path
+    /// relative to the project.
+    fn location_item(&self, loc: &Location, root: &Path) -> String {
+        let text = std::fs::read_to_string(&loc.path).unwrap_or_default();
+        let rope = ropey::Rope::from_str(&text);
+        let line_text = if loc.position.0 < rope.len_lines() { rope.line(loc.position.0).to_string() } else { String::new() };
+        let col = crate::lsp::utf16_to_char(&rope, loc.position) - rope.line_to_char(loc.position.0.min(rope.len_lines().saturating_sub(1)));
+        let shown = loc.path.strip_prefix(root).unwrap_or(&loc.path);
+        format!("{}:{}:{}  {}", shown.display(), loc.position.0 + 1, col + 1, line_text.trim())
+    }
+
+    /// Opens a `path:line:col` item (relative to the project, or absolute)
+    /// at its place, remembering where it came from for C-o.
+    pub fn goto_location(&mut self, item: &str) -> bool {
+        let Some((path, line, col)) = crate::picker::parse_location(item) else { return false };
+        let root = crate::picker::project_root(self.buffer().file().map(PathBuf::as_path).unwrap_or(Path::new(".")));
+        let path = if Path::new(&path).is_absolute() { PathBuf::from(&path) } else { root.join(&path) };
+        let from = (self.window().buffer, self.buffer().point());
+        match self.open_file(&path) {
+            Ok(()) => {
+                self.jumps.push(from);
+                let b = self.buffer_mut();
+                let start = b.line_to_pos(line.saturating_sub(1));
+                let end = b.line_end(start);
+                b.goto_char((start + col.saturating_sub(1)).min(end));
+                true
+            }
+            Err(e) => {
+                self.message = format!("{}: {e}", path.display());
+                false
+            }
         }
     }
 
@@ -619,6 +779,26 @@ impl EditorState {
             },
             Reply::Hover(Some(text)) => self.hover = Some(text),
             Reply::Hover(None) => self.message = "No documentation here".into(),
+            Reply::References(locations) => {
+                let root = crate::picker::project_root(self.buffer().file().map(PathBuf::as_path).unwrap_or(Path::new(".")));
+                let items: Vec<String> = locations.iter().map(|l| self.location_item(l, &root)).collect();
+                match items.len() {
+                    0 => self.message = "No references found".into(),
+                    1 => {
+                        self.goto_location(&items[0]);
+                    }
+                    _ => self.events.push(("lsp-show-references".into(), items)),
+                }
+            }
+            Reply::Completion(items) => {
+                if items.is_empty() {
+                    self.completion = None;
+                } else {
+                    let start = self.word_start();
+                    self.completion = Some(Completion { all: items, shown: Vec::new(), selected: 0, start });
+                    self.completion_refresh();
+                }
+            }
         }
     }
 

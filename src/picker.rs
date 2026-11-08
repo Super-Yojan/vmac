@@ -101,16 +101,34 @@ impl Picker {
         self.matches.get(self.selected).map(|m| m.item.as_str())
     }
 
-    /// The first lines of the selected file, when this picker previews files.
-    pub fn preview(&self) -> Option<Vec<String>> {
-        let path = self.preview_root.as_ref()?.join(self.selection()?);
+    /// The selected file's lines, when this picker previews files, and which
+    /// of them to mark. An item like `path:12:5  code` previews around line
+    /// 12 and marks it.
+    pub fn preview(&self) -> Option<(Vec<String>, Option<usize>)> {
+        let item = self.selection()?;
+        let (file, line) = match parse_location(item) {
+            Some((path, line, _)) => (path, Some(line)),
+            None => (item.to_string(), None),
+        };
+        let path = self.preview_root.as_ref()?.join(file);
         let bytes = std::fs::read(path).ok()?;
         if bytes.iter().take(8000).any(|&b| b == 0) {
-            return Some(vec!["(binary file)".into()]);
+            return Some((vec!["(binary file)".into()], None));
         }
         let text = String::from_utf8_lossy(&bytes);
-        Some(text.lines().take(PREVIEW_LINES).map(|l| l.replace('\t', "    ")).collect())
+        let first = line.map_or(0, |l| l.saturating_sub(6));
+        let lines = text.lines().skip(first).take(PREVIEW_LINES).map(|l| l.replace('\t', "    ")).collect();
+        Some((lines, line.map(|l| l - 1 - first)))
     }
+}
+
+/// `path:line:col` at the start of an item (`src/a.rs:12:5  code`).
+pub fn parse_location(item: &str) -> Option<(String, usize, usize)> {
+    let head = item.split("  ").next()?;
+    let mut parts = head.rsplitn(3, ':');
+    let col = parts.next()?.parse().ok()?;
+    let line = parts.next()?.parse().ok()?;
+    Some((parts.next()?.to_string(), line, col))
 }
 
 /// The project a file belongs to: the nearest folder above it with `.git`,
@@ -175,6 +193,13 @@ mod tests {
     }
 
     #[test]
+    fn locations_parse_from_items() {
+        assert_eq!(parse_location("src/a.rs:12:5  let x"), Some(("src/a.rs".into(), 12, 5)));
+        assert_eq!(parse_location("/abs/b.rs:1:1"), Some(("/abs/b.rs".into(), 1, 1)));
+        assert_eq!(parse_location("README.md"), None);
+    }
+
+    #[test]
     fn selection_wraps() {
         let mut p = Picker::new("t".into(), items(&["a", "b", "c"]), None);
         p.move_selection(-1);
@@ -208,7 +233,12 @@ mod tests {
     fn previews_the_selected_file() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let p = Picker::new("t".into(), items(&["Cargo.toml"]), Some(root));
-        let lines = p.preview().unwrap();
+        let (lines, mark) = p.preview().unwrap();
         assert_eq!(lines[0], "[package]");
+        assert_eq!(mark, None);
+        let p = Picker::new("t".into(), items(&["Cargo.toml:8:1  [dependencies]"]), Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))));
+        let (lines, mark) = p.preview().unwrap();
+        assert_eq!(mark, Some(5), "line 8, shown from line 3");
+        assert_eq!(lines.len().min(1), 1);
     }
 }

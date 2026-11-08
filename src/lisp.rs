@@ -199,6 +199,21 @@ impl Lisp {
         self.run_pending_evals();
     }
 
+    /// Runs what Rust queued for Scheme (server replies that need Scheme,
+    /// like the references picker): each calls the Scheme function of that
+    /// name with a list of strings.
+    pub fn run_events(&mut self) -> bool {
+        let events = self.editor.lock().take_events();
+        let any = !events.is_empty();
+        for (name, args) in events {
+            let list = SteelVal::ListV(args.into_iter().map(SteelVal::from).collect());
+            if let Err(e) = self.engine.call_function_by_name_with_args(&name, vec![list]) {
+                self.editor.lock().message = format!("{name}: {e}");
+            }
+        }
+        any
+    }
+
     /// Evaluates source and returns its printed result.
     pub fn eval(&mut self, code: &str) -> Result<String, String> {
         self.engine
@@ -591,6 +606,18 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     prim!(engine, editor, "lsp-status", |s| s.lsp.status().to_string());
     prim!(engine, editor, "lsp-goto-definition", |s| s.lsp_request(crate::lsp::RequestKind::Definition));
     prim!(engine, editor, "lsp-hover", |s| s.lsp_request(crate::lsp::RequestKind::Hover));
+    prim!(engine, editor, "lsp-references", |s| s.lsp_request(crate::lsp::RequestKind::References));
+    prim!(engine, editor, "goto-location", |s, item: String| s.goto_location(&item));
+    // Completion while typing.
+    prim!(engine, editor, "lsp-complete", |s| s.lsp_complete());
+    prim!(engine, editor, "completion-active?", |s| s.completion.is_some());
+    prim!(engine, editor, "completion-refresh", |s| s.completion_refresh());
+    prim!(engine, editor, "completion-move", |s, n: isize| s.completion_move(n));
+    prim!(engine, editor, "completion-accept", |s| s.completion_accept());
+    prim!(engine, editor, "completion-close", |s| s.completion = None);
+    engine.register_fn("word-char?", |text: String| {
+        text.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_')
+    });
     prim!(engine, editor, "jump-back", |s| {
         if !s.jump_back() {
             s.message = "No earlier position".into();
@@ -1981,6 +2008,67 @@ mod tests {
         assert_eq!(editor.lock().message, "This buffer has no file");
         typed(&mut lisp, "K");
         assert_eq!(editor.lock().message, "This buffer has no file");
+    }
+
+    #[test]
+    fn gr_lists_references_in_the_picker() {
+        let (mut lisp, editor, dir) = with_fake_server("gr", "fn main() {}\nlet x = 1;\nx\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "gr");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.take_events_peek().is_empty()), "references came back");
+        lisp.run_events();
+        {
+            let st = editor.lock();
+            let p = st.picker.as_ref().expect("references picker");
+            assert_eq!(p.title(), "References");
+            assert_eq!(p.selection(), Some("main.rs:2:5  let x = 1;"));
+        }
+        lisp.dispatch_key("C-n", "");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().line(), 2, "went to the second reference");
+        lisp.dispatch_key("C-o", "");
+        assert_eq!(editor.lock().buffer().line(), 0, "and C-o comes back");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn completion_pops_up_filters_and_accepts() {
+        let (mut lisp, editor, dir) = with_fake_server("complete", "fn main() {}\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "Gi");
+        typed(&mut lisp, "g");
+        assert!(pump_until(&mut lisp, &editor, |st| st.completion.is_some()), "completions came back");
+        typed(&mut lisp, "re");
+        {
+            let st = editor.lock();
+            let labels: Vec<_> = st.completion.as_ref().unwrap().items().map(|i| i.label.clone()).collect();
+            assert_eq!(labels, vec!["greeting", "great()"], "filtered by \"gre\"");
+        }
+        lisp.dispatch_key("C-n", "");
+        lisp.dispatch_key("RET", "");
+        assert!(editor.lock().completion.is_none());
+        assert_eq!(editor.lock().buffer().text().to_string(), "fn main() {}\ngreat(n)", "the snippet, as text");
+        assert_eq!(lisp.cursor_shape(), "bar", "still typing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn completion_closes_on_escape_and_non_word_keys() {
+        let (mut lisp, editor, dir) = with_fake_server("complete-close", "fn main() {}\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "Gig");
+        assert!(pump_until(&mut lisp, &editor, |st| st.completion.is_some()));
+        typed(&mut lisp, " ");
+        assert!(editor.lock().completion.is_none(), "a space ends the word");
+        typed(&mut lisp, "o");
+        assert!(pump_until(&mut lisp, &editor, |st| st.completion.is_some()));
+        lisp.dispatch_key("ESC", "");
+        assert!(editor.lock().completion.is_none());
+        assert_eq!(lisp.cursor_shape(), "box", "ESC also leaves insert state");
+        typed(&mut lisp, "a");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().text().to_string(), "fn main() {}\ng o\n", "RET is a newline with no popup");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

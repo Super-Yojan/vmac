@@ -253,7 +253,9 @@
                (set! pending-keys seq)
                (message (string-append seq "-")))
               ((and (equal? pending-keys "") (inserting?) (not (equal? text "")))
-               (insert text))
+               (insert text)
+               (when (and (equal? evil-state 'insert) (not (minibuffer-active?)))
+                 (after-self-insert text)))
               (else
                (set! pending-keys "")
                (set! pending-count "")
@@ -894,6 +896,7 @@
 
 (defcommand (normal-state)
   (set! evil-state 'normal)
+  (completion-close)
   (when block-insert (finish-block-insert))
   (when (in-markdown-table?) (align-table 0))
   (when (> (point) (line-start)) (forward-char -1))
@@ -1352,7 +1355,32 @@
         (list "c" "clangd")
         (list "go" "gopls")))
 
+;; Completion: typing a word asks the server; the popup then narrows as you
+;; type. . and : ask afresh (foo. std::); other characters close it.
+(define (after-self-insert text)
+  (cond ((word-char? text) (if (completion-active?) (completion-refresh) (lsp-complete)))
+        ((contains? '("." ":") text) (completion-close) (lsp-complete))
+        (else (completion-close))))
+
+;; Insert-state keys that act on the popup while it's open, else as usual.
+(define (with-completion when-open otherwise)
+  (lambda () (if (completion-active?) (when-open) (call-binding otherwise))))
+
+(define completion-insert-keys
+  (list (list "C-n" (with-completion (lambda () (completion-move 1)) 'line-down-cmd))
+        (list "C-p" (with-completion (lambda () (completion-move -1)) 'line-up))
+        (list "<down>" (with-completion (lambda () (completion-move 1)) 'line-down-cmd))
+        (list "<up>" (with-completion (lambda () (completion-move -1)) 'line-up))
+        (list "RET" (with-completion (lambda () (completion-accept)) 'newline))
+        (list "TAB" (with-completion (lambda () (completion-accept)) 'table-next-cell))
+        (list "DEL" (lambda () (delete-backward-char 1) (completion-refresh)))))
+
+;; gr: everywhere it's used, in the picker (straight there if only one).
+(define (lsp-show-references items)
+  (pick "References" items (project-root) (lambda (item) (goto-location item))))
+
 (defcommand (goto-definition) (lsp-goto-definition))
+(defcommand (find-references) (lsp-references))
 (defcommand (hover-documentation) (lsp-hover))
 (defcommand (jump-back-command) (jump-back))
 
@@ -1443,7 +1471,8 @@
         (list "SPC m a" 'table-align)
         ;; Language servers
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
-        (list "g d" 'goto-definition) (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
+        (list "g d" 'goto-definition) (list "g r" 'find-references)
+        (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
         (list "SPC c x" 'diagnostic-list)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)
@@ -1517,6 +1546,8 @@
 (defcommand (table-previous-cell) (when (in-markdown-table?) (align-table -1)))
 (defcommand (table-align)
   (when (not (and (in-markdown-table?) (align-table 0))) (message "Not in a table")))
+
+(for-each-pair (lambda (k b) (define-key insert-map k b)) completion-insert-keys)
 
 ;;;; Syntax highlighting
 ;;
