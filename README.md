@@ -5,6 +5,8 @@ Scheme and Lua, and can be redefined while it runs.</p>
 
 <p align="center"><a href="https://super-yojan.dev/vmac/">Install and configure</a></p>
 
+<p align="center"><img src="assets/screenshot.png" alt="vmac with the file tree, a Rust file and the README side by side" width="900"></p>
+
 vmac was called gmacs. Plugins that use `gmacs.*` in Lua still work (it's an
 alias of `vmac`), and `~/.config/gmacs/` is read while `~/.config/vmac/`
 doesn't exist; move it there when you like.

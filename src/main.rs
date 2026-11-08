@@ -35,7 +35,7 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    Size { width: px(900.), height: px(640.) },
+                    Size { width: px(1320.), height: px(840.) },
                     cx,
                 ))),
                 ..Default::default()
