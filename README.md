@@ -225,7 +225,10 @@ names it; with several, the modeline starts with `[name]`.
 
 - `SPC S s` switches session, `SPC S l` goes back to the last one (on whichever machine it is).
 - `SPC S n` makes one (it asks a name), `SPC S r` renames this one.
-- `SPC S k` kills one (not with unsaved files: `SPC S K` kills it anyway).
+- `SPC S a` (or `:session-list`) lists every session, on every machine,
+  with its project and files (and how many are unsaved); `RET` goes to one.
+- `SPC S k` kills one, on any machine (not with unsaved files: `SPC S K`
+  kills it anyway).
 - `SPC S c` (or `:connect HOST [TARGET]`) adds another machine's sessions
   to the window, over ssh (see below). The switcher then lists them all:
   this machine's by name, the other's as `host:name`, and, while you're in
@@ -243,7 +246,8 @@ closes, the way tmux does:
 vmac attach            # a window on the server (started if none runs)
 vmac attach ~/git/app  # ... on that project's session (made the first time)
 vmac attach notes      # ... on the session named notes (made if none)
-vmac ls                # the server's sessions
+vmac ls                # the server's sessions, with their projects and files
+vmac ls me@devbox      # ... another machine's
 vmac kill-server       # stop it, and everything running in it
 ```
 

@@ -45,8 +45,10 @@ pub enum ToServer {
     AgentExit { id: u64, error: String },
     /// Sessions on the window's other machines, and show this server's
     /// session of that name (made if there's none, a project's for a folder).
-    Foreign(Vec<String>),
+    Foreign(Vec<crate::frame::SessionInfo>),
     Switch(String),
+    /// Kill this server's session (asked from another machine's switcher).
+    Kill { name: String, force: bool },
     /// A patch didn't fit the frame the window has: send it whole.
     Resync,
     /// Ask for the sessions' names (and then the server hangs up).
@@ -62,8 +64,16 @@ pub enum ToClient {
     /// What changed since the last frame sent (see patch.rs).
     Patch { patch: crate::patch::Patch, acks: usize },
     Unchanged { acks: usize },
-    /// The active session first, then all of them in order.
-    Sessions { active: String, all: Vec<String> },
+    /// The active session first, then all of them in order, and each
+    /// one's project, buffers and unsaved files.
+    Sessions {
+        active: String,
+        all: Vec<String>,
+        #[serde(default)]
+        details: Vec<crate::frame::SessionInfo>,
+    },
+    /// What came of what this window asked (a kill).
+    Notice(String),
     /// Detached (`:q`), or the server is going away.
     Bye(String),
     /// Text a session copied, for the clipboard of a window far from the server.
@@ -79,7 +89,7 @@ pub enum ToClient {
 /// Bumped when the messages change in a way older servers can't read: each
 /// version has its own socket, so a newer window never talks to an older
 /// server (stop that one with its own `vmac kill-server`).
-const PROTOCOL: u32 = 6;
+const PROTOCOL: u32 = 7;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.
@@ -289,9 +299,16 @@ fn run(
                     changed = true;
                 }
                 Some(ToServer::AgentExit { id: agent, error }) => crate::remote_agent::exited(agent, &error),
+                Some(ToServer::Kill { name, force }) => {
+                    server.kill_session(&name, force);
+                    for notice in server.take_notices() {
+                        client.send(&ToClient::Notice(notice));
+                    }
+                    changed = true;
+                }
                 Some(ToServer::List) => {
                     let (active, all) = server.names();
-                    client.send(&ToClient::Sessions { active, all });
+                    client.send(&ToClient::Sessions { active, all, details: server.infos() });
                     clients.remove(&id);
                 }
                 Some(ToServer::KillServer) => {
@@ -392,7 +409,8 @@ pub struct Client {
     /// What its sessions asked of the window, and the other machines'
     /// sessions it was last told of.
     window_requests: Vec<crate::server::WindowRequest>,
-    foreign: Vec<String>,
+    foreign: Vec<crate::frame::SessionInfo>,
+    notices: Vec<String>,
     frame: Option<Frame>,
     /// The frame as JSON, for patches to apply to.
     frame_value: Option<serde_json::Value>,
@@ -459,6 +477,7 @@ impl Client {
             copied: None,
             window_requests: Vec::new(),
             foreign: Vec::new(),
+            notices: Vec::new(),
             frame: None,
             frame_value: None,
             viewport: Some(viewport),
@@ -616,6 +635,7 @@ impl Client {
                 }
                 Some(ToClient::AgentStop { id }) => drop(self.agents.remove(&id)),
                 Some(ToClient::Window(request)) => self.window_requests.push(request),
+                Some(ToClient::Notice(text)) => self.notices.push(text),
                 // A server on this machine has the clipboard already.
                 Some(ToClient::Clipboard(text)) => {
                     if self.remote {
@@ -780,11 +800,20 @@ impl Host for Client {
         self.send(&ToServer::Clipboard(text));
     }
 
-    fn set_foreign(&mut self, names: Vec<String>) {
-        if names != self.foreign {
-            self.foreign = names.clone();
-            self.send(&ToServer::Foreign(names));
+    fn set_foreign(&mut self, sessions: Vec<crate::frame::SessionInfo>) {
+        if sessions != self.foreign {
+            self.foreign = sessions.clone();
+            self.send(&ToServer::Foreign(sessions));
         }
+    }
+
+    fn kill_session(&mut self, name: &str, force: bool) {
+        self.send(&ToServer::Kill { name: name.to_string(), force });
+    }
+
+    fn take_notices(&mut self) -> Vec<String> {
+        self.receive(Duration::ZERO);
+        std::mem::take(&mut self.notices)
     }
 
     fn take_window_requests(&mut self) -> Vec<crate::server::WindowRequest> {
@@ -792,7 +821,7 @@ impl Host for Client {
         std::mem::take(&mut self.window_requests)
     }
 
-    fn sessions(&self) -> Vec<String> {
+    fn sessions(&self) -> Vec<crate::frame::SessionInfo> {
         self.frame.as_ref().map(|f| f.sessions.clone()).unwrap_or_default()
     }
 
@@ -834,13 +863,14 @@ fn pass(from: &mut impl std::io::Read, to: &mut impl Write) -> std::io::Result<(
     }
 }
 
-/// Asks the server on `socket` for its sessions.
-pub fn list(socket: &Path) -> std::io::Result<(String, Vec<String>)> {
+/// Asks the server on `socket` for its sessions: the active one's name, and
+/// each one.
+pub fn list(socket: &Path) -> std::io::Result<(String, Vec<crate::frame::SessionInfo>)> {
     let mut stream = UnixStream::connect(socket)?;
     send_line(&mut stream, &ToServer::List)?;
     for line in BufReader::new(stream).lines() {
-        if let Ok(ToClient::Sessions { active, all }) = serde_json::from_str(&line?) {
-            return Ok((active, all));
+        if let Ok(ToClient::Sessions { active, details, .. }) = serde_json::from_str(&line?) {
+            return Ok((active, details));
         }
     }
     Err(std::io::Error::other("the server didn't say"))
@@ -963,7 +993,8 @@ mod tests {
         assert!(typed.starts_with("hi"), "{typed:?}");
         assert_eq!(detached.as_deref(), Some("Detached"));
         assert!(kept.starts_with("hi"), "{kept:?}");
-        assert_eq!(sessions, ("beta".into(), vec!["main".into(), "beta".into()]));
+        let names: Vec<&str> = sessions.1.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!((sessions.0.as_str(), names), ("beta", vec!["main", "beta"]));
         assert!(!socket.exists(), "the socket goes with the server");
         std::fs::remove_dir_all(&dir).ok();
     }

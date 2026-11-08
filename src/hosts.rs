@@ -7,7 +7,7 @@
 //! `:q` in another machine's session detaches from that machine only.
 
 use crate::daemon::Client;
-use crate::frame::{Echo, Frame, Input, Viewport};
+use crate::frame::{Echo, Frame, Input, SessionInfo, Viewport};
 use crate::server::{Host, WindowRequest};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -70,13 +70,13 @@ impl Hosts {
 
     /// Tells each machine the others' sessions.
     fn tell_foreign(&mut self) {
-        let sessions: Vec<Vec<String>> = self.machines.iter().map(|m| m.host.sessions()).collect();
+        let sessions: Vec<Vec<SessionInfo>> = self.machines.iter().map(|m| m.host.sessions()).collect();
         for i in 0..self.machines.len() {
-            let mut names = Vec::new();
+            let mut foreign = Vec::new();
             for (j, list) in sessions.iter().enumerate().filter(|(j, _)| *j != i) {
-                names.extend(list.iter().map(|n| self.name_as_seen(j, n, i)));
+                foreign.extend(list.iter().map(|s| SessionInfo { name: self.name_as_seen(j, &s.name, i), ..s.clone() }));
             }
-            self.machines[i].host.set_foreign(names);
+            self.machines[i].host.set_foreign(foreign);
         }
     }
 
@@ -121,7 +121,18 @@ impl Hosts {
                     },
                     WindowRequest::Connect { host, target } => self.start_connect(host, target),
                     WindowRequest::Last => self.go_back(),
+                    WindowRequest::Kill { name, force } => match self.find(&name, i) {
+                        Some((machine, session)) => self.machines[machine].host.kill_session(&session, force),
+                        None => self.notice = Some(format!("No session {name}")),
+                    },
                 }
+            }
+        }
+        // What came of kills asked of other machines.
+        for i in 0..self.machines.len() {
+            if let Some(said) = self.machines[i].host.take_notices().pop() {
+                self.notice = Some(said);
+                changed = true;
             }
         }
         // Other machines that hung up (:q there, or the connection broke).
@@ -160,7 +171,7 @@ impl Hosts {
     fn go_back(&mut self) {
         let target = self.last.clone().and_then(|(label, session)| {
             let machine = self.machines.iter().position(|m| m.label == label)?;
-            self.machines[machine].host.sessions().contains(&session).then_some((machine, session))
+            self.machines[machine].host.sessions().iter().any(|s| s.name == session).then_some((machine, session))
         });
         match target {
             Some((machine, session)) => {
@@ -266,7 +277,7 @@ impl Host for Hosts {
         }
     }
 
-    fn sessions(&self) -> Vec<String> {
+    fn sessions(&self) -> Vec<SessionInfo> {
         self.machines[0].host.sessions()
     }
 
@@ -398,6 +409,14 @@ mod tests {
                 let _ = hosts.frame(VIEW);
                 let session = hosts.frame(VIEW).session;
                 seen.push(format!("{} {session}", hosts.active));
+                // Every machine's sessions, described.
+                ex(&mut hosts, "lua local t = {} for _, d in ipairs(vmac.session_details()) do t[#t+1] = d[1] .. ':' .. d[3] end print(table.concat(t, ' '))");
+                seen.push(said(&mut hosts));
+                // Killing the other machine's session from this one's switcher.
+                ex(&mut hosts, "lua vmac.session_kill('box:notes', false)");
+                seen.push(said(&mut hosts));
+                let names: Vec<String> = hosts.machines[1].host.sessions().into_iter().map(|s| s.name).collect();
+                seen.push(names.join(","));
                 drop(hosts);
                 crate::daemon::kill(&socket).unwrap();
                 seen
@@ -412,6 +431,9 @@ mod tests {
         assert_eq!(seen[4], "0", "back on this machine");
         assert_eq!(seen[5], "1 notes", "SPC S l goes back to the other machine's session");
         assert_eq!(seen[6], "0 main", "and back again");
+        assert_eq!(seen[7], "main:0 box:main:0 box:notes:0", "each with its files");
+        assert_eq!(seen[8], "Killed session notes", "the other machine says what came of it");
+        assert_eq!(seen[9], "main", "gone from there");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

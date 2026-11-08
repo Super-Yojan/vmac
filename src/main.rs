@@ -51,7 +51,9 @@ usage: vmac [FILE]              edit FILE (or show the dashboard) in this window
                                 folders are from your home folder there.
                                 --restart replaces a server running there (an
                                 older build), closing its sessions
-       vmac ls                  list the server's sessions
+       vmac ls [HOST]           list the server's sessions (HOST's, over ssh):
+                                the active one starred, each one's project,
+                                buffers and unsaved files
        vmac kill-server         stop the server and everything in it
        vmac --server            run the server here, without a window
 
@@ -98,13 +100,13 @@ fn main() {
             open_window(Box::new(client));
         }
         Some("proxy") => daemon::proxy(&socket).unwrap_or_else(|e| fail(&e)),
-        Some("ls" | "list") => match daemon::list(&socket) {
-            Ok((active, all)) => {
-                for name in all {
-                    println!("{name}{}", if name == active { " (active)" } else { "" });
-                }
-            }
-            Err(_) => fail(&"no server running"),
+        Some("ls" | "list") => match args.get(1) {
+            // Another machine's: its own vmac says.
+            Some(host) => print!("{}", remote::list(host).unwrap_or_else(|e| fail(&e))),
+            None => match daemon::list(&socket) {
+                Ok((active, details)) => print!("{}", describe_sessions(&active, &details)),
+                Err(_) => fail(&"no server running"),
+            },
         },
         Some("kill-server") => daemon::kill(&socket).unwrap_or_else(|_| fail(&"no server running")),
         Some(flag) if flag.starts_with('-') => fail(&format!("unknown option {flag}\n{USAGE}")),
@@ -124,6 +126,25 @@ fn main() {
             });
         }
     }
+}
+
+/// Sessions in columns: the active one starred, then each one's name,
+/// project, and buffers (and unsaved files).
+fn describe_sessions(active: &str, sessions: &[frame::SessionInfo]) -> String {
+    let name_width = sessions.iter().map(|s| s.name.chars().count()).max().unwrap_or(0);
+    let project_width = sessions.iter().map(|s| s.project.chars().count()).max().unwrap_or(0);
+    sessions
+        .iter()
+        .map(|s| {
+            let star = if s.name == active { "*" } else { " " };
+            let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+            let mut files = plural(s.buffers, "file");
+            if s.unsaved > 0 {
+                files.push_str(&format!(", {} unsaved", s.unsaved));
+            }
+            format!("{star} {:name_width$}  {:project_width$}  {files}\n", s.name, s.project)
+        })
+        .collect()
 }
 
 /// The sessions: the first showing `start` (a buffer, and whether to show

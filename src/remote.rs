@@ -167,6 +167,16 @@ pub fn install(host: &str) -> Result<(String, bool)> {
     Ok((path, true))
 }
 
+/// What `vmac ls` says on `host`: the server there (whichever installed
+/// build it runs) lists its sessions.
+pub fn list(host: &str) -> Result<String> {
+    let out = ssh(
+        host,
+        "for vmac in .vmac/server/*/vmac; do \"$vmac\" ls 2>/dev/null && exit 0; done; echo 'no vmac server running' >&2; exit 1",
+    )?;
+    Ok(out)
+}
+
 /// Installs the server on `host` if needed, and attaches to `target` there
 /// (a session's name or a folder, from the remote home folder). `restart`
 /// stops the server running there first (it may be an older build), and

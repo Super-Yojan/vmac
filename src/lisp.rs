@@ -1408,6 +1408,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // Sessions: the server acts on what these ask after the current command.
     prim!(reg, editor, "session-name", |s| s.session_name.clone());
     prim!(reg, editor, "session-list", |s| s.session_names.clone());
+    // {name, project, buffers, unsaved} for each, as strings.
+    prim!(reg, editor, "session-details", |s| s
+        .session_details
+        .iter()
+        .map(|d| vec![d.name.clone(), d.project.clone(), d.buffers.to_string(), d.unsaved.to_string()])
+        .collect::<Vec<Vec<String>>>());
     prim!(reg, editor, "session-switch", |s, name: String| s.session_requests.push(SessionRequest::Switch(name)));
     prim!(reg, editor, "session-last", |s| s.session_requests.push(SessionRequest::Last));
     prim!(reg, editor, "session-new", |s, name: String, root: String| {

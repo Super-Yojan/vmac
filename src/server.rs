@@ -6,7 +6,7 @@
 //! sessions.
 
 use crate::editor::SessionRequest;
-use crate::frame::{Frame, Input, Segment, Viewport};
+use crate::frame::{Frame, Input, Segment, SessionInfo, Viewport};
 use crate::session::Session;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -50,14 +50,20 @@ pub trait Host {
     /// Sessions on the window's other machines, named as this one should
     /// list them ("devbox:notes", "local:main"), and what its sessions asked
     /// of the window (to switch to one of those, to connect).
-    fn set_foreign(&mut self, _names: Vec<String>) {}
+    fn set_foreign(&mut self, _sessions: Vec<SessionInfo>) {}
     fn take_window_requests(&mut self) -> Vec<WindowRequest> {
         Vec::new()
     }
     /// This server's sessions, and makes `name` the active one (made if
     /// there's none such, or a project's when it's a folder).
-    fn sessions(&self) -> Vec<String>;
+    fn sessions(&self) -> Vec<SessionInfo>;
     fn switch_to(&mut self, name: &str);
+    /// Kills this server's session `name` (asked from another machine's
+    /// switcher); what came of it shows as a notice.
+    fn kill_session(&mut self, _name: &str, _force: bool) {}
+    fn take_notices(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// What a session asks of the window it's shown in.
@@ -69,6 +75,8 @@ pub enum WindowRequest {
     Connect { host: String, target: String },
     /// Back to the session shown before, whichever machine it's on.
     Last,
+    /// Kill another machine's session.
+    Kill { name: String, force: bool },
 }
 
 impl Host for Server {
@@ -90,14 +98,22 @@ impl Host for Server {
     fn pump_servers(&mut self) -> bool {
         Server::pump_servers(self)
     }
-    fn set_foreign(&mut self, names: Vec<String>) {
-        Server::set_foreign(self, names)
+    fn set_foreign(&mut self, sessions: Vec<SessionInfo>) {
+        Server::set_foreign(self, sessions)
     }
     fn take_window_requests(&mut self) -> Vec<WindowRequest> {
         std::mem::take(&mut self.window_requests)
     }
-    fn sessions(&self) -> Vec<String> {
-        self.names().1
+    fn sessions(&self) -> Vec<SessionInfo> {
+        self.infos()
+    }
+    fn kill_session(&mut self, name: &str, force: bool) {
+        let said = self.kill(name, force);
+        self.notices.push(said);
+        self.sync();
+    }
+    fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
     fn switch_to(&mut self, name: &str) {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
@@ -131,8 +147,10 @@ pub struct Server {
     follow_cwd: bool,
     /// Sessions on the window's other machines (listed after these), and
     /// what sessions asked of the window.
-    foreign: Vec<String>,
+    foreign: Vec<SessionInfo>,
     window_requests: Vec<WindowRequest>,
+    /// What came of what another machine asked (a kill).
+    notices: Vec<String>,
 }
 
 impl Server {
@@ -147,6 +165,7 @@ impl Server {
             follow_cwd: false,
             foreign: Vec::new(),
             window_requests: Vec::new(),
+            notices: Vec::new(),
         };
         let name = {
             let st = first.editor().lock();
@@ -212,10 +231,12 @@ impl Server {
     /// Tells every session the sessions' names, and moves the process's
     /// working folder to the active one's.
     fn sync(&mut self) {
-        let names: Vec<String> = self.list.iter().map(|e| e.name.clone()).chain(self.foreign.iter().cloned()).collect();
+        let details: Vec<SessionInfo> = self.infos().into_iter().chain(self.foreign.iter().cloned()).collect();
+        let names: Vec<String> = details.iter().map(|d| d.name.clone()).collect();
         for e in &self.list {
             let mut st = e.session.editor().lock();
             st.session_names = names.clone();
+            st.session_details = details.clone();
             st.session_name = e.name.clone();
         }
         if self.follow_cwd {
@@ -227,11 +248,29 @@ impl Server {
     }
 
     /// Sessions on the window's other machines.
-    pub fn set_foreign(&mut self, names: Vec<String>) {
-        if names != self.foreign {
-            self.foreign = names;
+    pub fn set_foreign(&mut self, sessions: Vec<SessionInfo>) {
+        if sessions != self.foreign {
+            self.foreign = sessions;
             self.sync();
         }
+    }
+
+    /// Each session: its project, buffers and unsaved files.
+    pub fn infos(&self) -> Vec<SessionInfo> {
+        self.list
+            .iter()
+            .map(|e| {
+                let st = e.session.editor().lock();
+                let folder = st.project.clone().unwrap_or_else(|| st.cwd.clone());
+                let files: Vec<_> = st.buffer_ids().into_iter().filter_map(|b| st.buffer_by_id(b)).filter(|b| b.file().is_some()).collect();
+                SessionInfo {
+                    name: e.name.clone(),
+                    project: crate::projects::abbreviate(&folder),
+                    buffers: files.len(),
+                    unsaved: files.iter().filter(|b| b.is_modified()).count(),
+                }
+            })
+            .collect()
     }
 
     /// What sessions asked of the window.
@@ -296,7 +335,7 @@ impl Server {
         match request {
             SessionRequest::Switch(name) => match self.by_name(&name) {
                 Some(id) => self.switch(id),
-                None if self.foreign.contains(&name) => self.window_requests.push(WindowRequest::Switch(name)),
+                None if self.foreign.iter().any(|f| f.name == name) => self.window_requests.push(WindowRequest::Switch(name)),
                 None => self.message(format!("No session {name}")),
             },
             SessionRequest::Connect { host, target } => self.window_requests.push(WindowRequest::Connect { host, target }),
@@ -329,7 +368,14 @@ impl Server {
                     }
                 }
             }
-            SessionRequest::Kill { name, force } => self.kill(&name, force),
+            // Another machine's: the window asks that machine.
+            SessionRequest::Kill { name, force } if self.foreign.iter().any(|f| f.name == name) => {
+                self.window_requests.push(WindowRequest::Kill { name, force })
+            }
+            SessionRequest::Kill { name, force } => {
+                let said = self.kill(&name, force);
+                self.message(said);
+            }
         }
     }
 
@@ -355,13 +401,12 @@ impl Server {
         }
     }
 
-    fn kill(&mut self, name: &str, force: bool) {
-        if self.foreign.iter().any(|f| f == name) {
-            return self.message(format!("{name} is on another machine: kill it from one of its sessions"));
-        }
-        let Some(id) = self.by_name(name) else { return self.message(format!("No session {name}")) };
+    /// Kills a session (refused with unsaved files unless `force`); says
+    /// what came of it.
+    fn kill(&mut self, name: &str, force: bool) -> String {
+        let Some(id) = self.by_name(name) else { return format!("No session {name}") };
         if self.list.len() == 1 {
-            return self.message("That's the only session".into());
+            return format!("{name} is the only session there is");
         }
         let unsaved = {
             let st = self.entry(id).session.editor().lock();
@@ -369,7 +414,7 @@ impl Server {
         };
         if unsaved > 0 && !force {
             let s = if unsaved == 1 { "" } else { "s" };
-            return self.message(format!("{name} has {unsaved} unsaved file{s} (kill it anyway with SPC S K)"));
+            return format!("{name} has {unsaved} unsaved file{s} (kill it anyway with SPC S K)");
         }
         if id == self.active {
             let next = self.last.filter(|l| *l != id).unwrap_or_else(|| self.list.iter().find(|e| e.id != id).expect("another").id);
@@ -380,16 +425,17 @@ impl Server {
         }
         // Dropping the session stops its terminals, language servers and agent.
         self.list.retain(|e| e.id != id);
-        self.message(format!("Killed session {name}"));
+        format!("Killed session {name}")
     }
 
     /// The active session's frame; with several sessions, its name leads
     /// the selected window's modeline.
     pub fn frame(&mut self, viewport: Viewport) -> Frame {
         let several = self.list.len() + self.foreign.len() > 1;
-        let (name, all) = self.names();
+        let (name, _) = self.names();
+        let infos = self.infos();
         let mut frame = self.active_session().frame(viewport);
-        frame.sessions = all;
+        frame.sessions = infos;
         frame.session = name.clone();
         if several && let Some(w) = frame.windows.iter_mut().find(|w| w.selected) {
             w.modeline.insert(0, Segment { text: format!("[{name}]"), face: "accent".into() });

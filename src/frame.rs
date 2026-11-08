@@ -92,9 +92,20 @@ pub struct Frame {
     /// The server's sessions, and the one shown (for a window that shows
     /// several machines' sessions).
     #[serde(default)]
-    pub sessions: Vec<String>,
+    pub sessions: Vec<SessionInfo>,
     #[serde(default)]
     pub session: String,
+}
+
+/// A session, as the switcher and `vmac ls` describe it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SessionInfo {
+    pub name: String,
+    /// Its project (or working) folder, with ~ for home.
+    pub project: String,
+    pub buffers: usize,
+    /// Files changed and not saved.
+    pub unsaved: usize,
 }
 
 /// The theme mode ("system", "light" or "dark") and the theme for each.

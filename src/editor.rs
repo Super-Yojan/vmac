@@ -396,6 +396,8 @@ pub struct EditorState {
     /// it in a session of its own.
     pub session_name: String,
     pub session_names: Vec<String>,
+    /// Each of them (named as in `session_names`): project, buffers, unsaved.
+    pub session_details: Vec<crate::frame::SessionInfo>,
     pub session_requests: Vec<SessionRequest>,
     pub in_server: bool,
     pub session_per_project: bool,
@@ -574,6 +576,7 @@ impl EditorState {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             session_name: "main".into(),
             session_names: Vec::new(),
+            session_details: Vec::new(),
             session_requests: Vec::new(),
             in_server: false,
             session_per_project: true,
