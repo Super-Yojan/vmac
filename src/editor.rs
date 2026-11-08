@@ -277,6 +277,11 @@ pub struct EditorState {
     pub minibuffer_prompt: Option<String>,
     pub message: String,
     pub kill_ring: Vec<String>,
+    /// The system clipboard (None: vmac's register only, as in tests), and
+    /// whether yanks and pastes go through it; what vmac last put there.
+    pub clipboard: Option<SystemClipboard>,
+    pub clipboard_sync: bool,
+    clipboard_last: String,
     /// Scheme source queued by `eval-string` (the primitive can't re-enter the
     /// engine that is calling it), run by the host after the current command.
     pub pending_eval: Vec<String>,
@@ -354,6 +359,15 @@ pub struct EditorState {
     search_cache: Option<(String, Regex)>,
 }
 
+/// The system clipboard, behind its trait.
+pub struct SystemClipboard(pub Box<dyn crate::clipboard::Clipboard>);
+
+impl std::fmt::Debug for SystemClipboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SystemClipboard")
+    }
+}
+
 /// A terminal running a command for the agent: its id, its buffer, the
 /// most output to hand back (bytes), and requests waiting for it to exit.
 #[derive(Debug)]
@@ -418,6 +432,9 @@ impl EditorState {
             minibuffer_prompt: None,
             message: String::new(),
             kill_ring: Vec::new(),
+            clipboard: None,
+            clipboard_sync: true,
+            clipboard_last: String::new(),
             pending_eval: Vec::new(),
             pending_scheme: Vec::new(),
             plugin_dir: None,
@@ -1962,6 +1979,49 @@ impl EditorState {
             self.message = e;
         }
         self.agent_refresh();
+    }
+
+    // ---- Registers and the system clipboard
+
+    /// A yank or delete: into the register, and the system clipboard when
+    /// they're synced.
+    pub fn register_set(&mut self, text: String) {
+        if self.clipboard_sync && let Some(c) = self.clipboard.as_mut() {
+            c.0.write(&text);
+            self.clipboard_last = text.clone();
+        }
+        self.kill_ring.push(text);
+    }
+
+    /// What p pastes: the system clipboard when something else put text
+    /// there since vmac's last yank (and they're synced), else the register.
+    pub fn register_get(&mut self) -> String {
+        if self.clipboard_sync {
+            let outside = self.clipboard.as_mut().and_then(|c| c.0.read()).filter(|t| !t.is_empty());
+            if let Some(text) = outside.filter(|t| *t != self.clipboard_last) {
+                self.clipboard_last = text.clone();
+                self.kill_ring.push(text);
+            }
+        }
+        self.kill_ring.last().cloned().unwrap_or_default()
+    }
+
+    /// The system clipboard, whatever the sync (Cmd-V); the register when
+    /// there's no clipboard.
+    pub fn clipboard_get(&mut self) -> String {
+        match self.clipboard.as_mut().and_then(|c| c.0.read()) {
+            Some(text) => text,
+            None => self.kill_ring.last().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Copies to the system clipboard (Cmd-C), and the register.
+    pub fn clipboard_set(&mut self, text: String) {
+        if let Some(c) = self.clipboard.as_mut() {
+            c.0.write(&text);
+            self.clipboard_last = text.clone();
+        }
+        self.kill_ring.push(text);
     }
 
     // ---- Projects and the dashboard

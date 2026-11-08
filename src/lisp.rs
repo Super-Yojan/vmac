@@ -1131,8 +1131,15 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "undo", |s| s.current().undo());
     prim!(reg, editor, "redo", |s| s.current().redo());
     // The register: the last deleted or yanked text.
-    prim!(reg, editor, "register-set", |s, text: String| s.kill_ring.push(text));
-    prim!(reg, editor, "register-get", |s| s.kill_ring.last().cloned().unwrap_or_default());
+    prim!(reg, editor, "register-set", |s, text: String| s.register_set(text));
+    prim!(reg, editor, "register-get", |s| s.register_get());
+    // The system clipboard itself (Cmd-V, Cmd-C), and whether yanks and p use it.
+    prim!(reg, editor, "clipboard-get", |s| s.clipboard_get());
+    prim!(reg, editor, "clipboard-set", |s, text: String| s.clipboard_set(text));
+    prim!(reg, editor, "set-clipboard-sync", |s, on: bool| {
+        s.clipboard_sync = on;
+        s.message = if on { "Yanks and p use the system clipboard".into() } else { "vmac's register is its own".into() };
+    });
     prim!(reg, editor, "buffer-string", |s| s.current().text().to_string());
 
     // About the file buffer (not the minibuffer).
@@ -3291,6 +3298,47 @@ mod tests {
         lisp.eval("(call-binding 'dashboard)").unwrap();
         assert!(text(&editor).contains("z   Zebra"), "{}", text(&editor));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn yanks_and_pastes_go_through_the_system_clipboard() {
+        let (mut lisp, editor) = lisp_with("one two\n");
+        let board = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        editor.lock().clipboard = Some(crate::editor::SystemClipboard(Box::new(crate::clipboard::Memory(board.clone()))));
+
+        // A yank lands on the clipboard.
+        typed(&mut lisp, "yiw");
+        assert_eq!(*board.lock().unwrap(), "one");
+        // Copied in another app: p pastes that, not the older yank.
+        *board.lock().unwrap() = "FROM MAC".into();
+        typed(&mut lisp, "$p");
+        assert_eq!(text(&editor), "one twoFROM MAC\n");
+        typed(&mut lisp, "0yiw");
+        typed(&mut lisp, "$p");
+        assert_eq!(text(&editor), "one twoFROM MACone\n", "then vmac's own yank again");
+
+        // Cmd-V in insert state and in a prompt; Cmd-C copies the selection.
+        *board.lock().unwrap() = "pasted".into();
+        typed(&mut lisp, "o");
+        lisp.dispatch_key("s-v", "");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(text(&editor), "one twoFROM MACone\npasted\n");
+        typed(&mut lisp, "ggviw");
+        lisp.dispatch_key("s-c", "");
+        assert_eq!(*board.lock().unwrap(), "one");
+        typed(&mut lisp, ":");
+        lisp.dispatch_key("s-v", "");
+        assert_eq!(editor.lock().minibuffer.text().to_string(), "one");
+        lisp.dispatch_key("ESC", "");
+
+        // Unsynced, p uses vmac's register; Cmd-V still the clipboard.
+        lisp.eval("(set-clipboard-sync #f)").unwrap();
+        *board.lock().unwrap() = "elsewhere".into();
+        typed(&mut lisp, "Gddu");
+        typed(&mut lisp, "ggyy");
+        assert_eq!(*board.lock().unwrap(), "elsewhere", "the yank stayed in vmac");
+        typed(&mut lisp, "P");
+        assert!(text(&editor).starts_with("one twoFROM MACone\none twoFROM MACone\n"), "{}", text(&editor));
     }
 
     /// vmac on a file served by the fake language server (lsp.rs's tests).

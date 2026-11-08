@@ -801,7 +801,10 @@ impl Agent {
                     r.line("", Target::None);
                 }
                 Entry::Notice(s) => {
-                    r.styled(&format!("— {s}"), "dim", Target::None);
+                    for (i, piece) in wrap(&format!("— {s}"), width).into_iter().enumerate() {
+                        let piece = if i == 0 { piece } else { format!("  {piece}") };
+                        r.styled(&piece, "dim", Target::None);
+                    }
                     r.line("", Target::None);
                 }
             }

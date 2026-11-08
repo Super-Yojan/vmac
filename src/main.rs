@@ -3,6 +3,7 @@
 
 mod agent;
 mod buffer;
+mod clipboard;
 mod editor;
 mod lisp;
 mod lsp;
@@ -48,6 +49,7 @@ fn main() {
             gpui_kit::open_window(options, cx, move |window, cx| {
                 let editor = Editor::new(buffer);
                 editor.lock().set_state_dir(projects::History::default_dir());
+                editor.lock().clipboard = Some(editor::SystemClipboard(Box::new(clipboard::System)));
                 let mut lisp = Lisp::with_config(
                     editor.clone(),
                     Lisp::default_sources(),

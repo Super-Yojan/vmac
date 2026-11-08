@@ -61,7 +61,7 @@
         (list "C" (shorthand op-change 'line-end))
         (list "Y" (lambda () ((start-operator "y" op-yank)) (operator-lines)))
         (list "p" 'paste-after) (list "P" 'paste-before)
-        (list "u" 'evil-undo) (list "C-r" 'evil-redo)
+        (list "u" 'evil-undo) (list "C-r" 'evil-redo) (list "s-v" 'clipboard-paste)
         (list ":" 'ex) (list "ESC" 'keyboard-quit)
         ;; Doom's leader
         (list "SPC :" 'execute-extended-command) (list "SPC ;" 'eval-expression)
@@ -122,20 +122,23 @@
         (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
         (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
         (list "z z" 'recenter-center) (list "SPC c a" 'code-actions)
-        (list "SPC c f" 'format-buffer) (list "SPC a s" 'agent-ask-selection)))
+        (list "SPC c f" 'format-buffer) (list "SPC a s" 'agent-ask-selection)
+        (list "s-c" 'clipboard-copy)))
 
 (define-key operator-map "ESC" 'keyboard-quit)
 
 (for-each-pair (lambda (k b) (define-key insert-map k b))
   '(("ESC" normal-state) ("RET" newline) ("TAB" table-next-cell) ("S-TAB" table-previous-cell)
     ("DEL" delete-backward) ("<delete>" delete-forward)
-    ("<left>" char-left) ("<right>" char-right) ("<down>" line-down-cmd) ("<up>" line-up)))
+    ("<left>" char-left) ("<right>" char-right) ("<down>" line-down-cmd) ("<up>" line-up)
+    ("s-v" clipboard-paste)))
 
 (for-each-pair (lambda (k b) (define-key minibuffer-map k b))
   '(("RET" minibuffer-exit) ("ESC" minibuffer-escape)
     ("DEL" delete-backward) ("<left>" char-left) ("<right>" char-right)
     ("C-n" picker-next) ("C-j" picker-next) ("<down>" picker-next)
-    ("C-p" picker-previous) ("C-k" picker-previous) ("<up>" picker-previous)))
+    ("C-p" picker-previous) ("C-k" picker-previous) ("<up>" picker-previous)
+    ("s-v" clipboard-paste)))
 
 (for-each-pair (lambda (k b) (define-key picker-normal-map k b))
   (list (list "j" (lambda () (picker-move current-count)))

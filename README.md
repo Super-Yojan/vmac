@@ -45,15 +45,15 @@ updating to rebuild the app.
 
 ## How it is split
 
-| Layer | Where | What |
-|---|---|---|
-| Text, undo | `src/buffer.rs` | a rope, the point, undo snapshots |
-| Editor state | `src/editor.rs` | buffers, windows and splits, LSP, the picker |
-| Primitives | `src/lisp.rs` | `insert`, `char-at`, `delete-region`, `find-file`, ... in both Scheme and Lua |
-| Window | `src/shell.rs` | draws windows, modelines, popups; sends every key to Scheme |
-| The editor | `lisp/core/*.scm` | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
-| Plugins | `~/.config/vmac/plugins/` | Scheme and Lua, loaded after the core |
-| Your config | `~/.config/vmac/init.scm`, `~/.config/vmac/init.lua` | loaded last |
+| Layer        | Where                                                | What                                                                           |
+|--------------|------------------------------------------------------|--------------------------------------------------------------------------------|
+| Text, undo   | `src/buffer.rs`                                      | a rope, the point, undo snapshots                                              |
+| Editor state | `src/editor.rs`                                      | buffers, windows and splits, LSP, the picker                                   |
+| Primitives   | `src/lisp.rs`                                        | `insert`, `char-at`, `delete-region`, `find-file`, ... in both Scheme and Lua  |
+| Window       | `src/shell.rs`                                       | draws windows, modelines, popups; sends every key to Scheme                    |
+| The editor   | `lisp/core/*.scm`                                    | states, motions, operators, keymaps, picker, file tree, LSP commands, modeline |
+| Plugins      | `~/.config/vmac/plugins/`                            | Scheme and Lua, loaded after the core                                          |
+| Your config  | `~/.config/vmac/init.scm`, `~/.config/vmac/init.lua` | loaded last                                                                    |
 
 The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
 `75-file-tree.scm`, ...), loaded as one program in name order.
@@ -102,6 +102,11 @@ The core is one file per area (`20-dispatch.scm`, `45-operators.scm`,
   keeps only this one. Each window has its own cursor. `:q` closes a window
   and quits from the last; `:qa` quits.
 - **Editing:** `i a I A o O`, `x`, `p P`, `u`, `C-r`. Insert: type; `ESC` back.
+- **System clipboard:** yanks and deletes also copy to it, and `p P` paste
+  what was copied last anywhere (text copied in another app wins over an
+  older yank). Cmd-V pastes it at the cursor (normal, insert, prompts, the
+  picker, terminals); Cmd-C copies the visual selection.
+  `(set-clipboard-sync #f)` keeps yanks and `p` to vmac's own register.
 - **Ex:** `:w`, `:q`, `:wq`, `:e FILE`, `:eval EXPR`, or `:any-command-name`.
 - **Leader:** `SPC :` run a command by name, `SPC ;` evaluate Scheme,
   `SPC f f` find file, `SPC f s` save, `SPC q q` quit.

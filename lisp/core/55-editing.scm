@@ -89,3 +89,20 @@
   (when (minibuffer-active?) (minibuffer-close))
   (message "Quit"))
 
+
+;;;; The system clipboard
+;;
+;; Yanks and deletes also copy to the system clipboard, and p/P paste what
+;; was copied last anywhere: text copied in another app wins over an older
+;; yank. (set-clipboard-sync #f) keeps vmac's register to itself. Cmd-V
+;; pastes the clipboard at the cursor (normal, insert, prompts, the picker,
+;; terminals); Cmd-C copies the visual selection.
+
+(defcommand (clipboard-paste)
+  (insert (clipboard-get))
+  (when (picker-active?) (picker-filter (minibuffer-contents))))
+
+(defcommand (clipboard-copy)
+  ((visual-operator op-yank))
+  (clipboard-set (register-get))
+  (message "Copied"))

@@ -39,9 +39,10 @@
 (defcommand (terminal-type) (set! evil-state 'insert))
 (defcommand (terminal-paste) (terminal-send "" (register-get)))
 (defcommand (terminal-send-escape) (terminal-send "ESC" ""))
+(defcommand (terminal-paste-clipboard) (terminal-send "" (clipboard-get)))
 
 (for-each-pair (lambda (k b) (define-key terminal-map k b))
-  '(("ESC" normal-state) ("C-\\" terminal-send-escape)))
+  '(("ESC" normal-state) ("C-\\" terminal-send-escape) ("s-v" terminal-paste-clipboard)))
 
 (for-each-pair (lambda (k b) (define-key terminal-normal-map k b))
   '(("i" terminal-type) ("a" terminal-type) ("I" terminal-type) ("A" terminal-type)
