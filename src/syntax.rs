@@ -26,6 +26,21 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "go" => "go",
         "sh" | "bash" | "zsh" => "bash",
         "md" | "markdown" => "markdown",
+        // Grammars vmac installs when such a file opens (packages.rs).
+        "lua" => "lua",
+        "yml" | "yaml" => "yaml",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "java" => "java",
+        "rb" => "ruby",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "zig" => "zig",
+        "nix" => "nix",
+        "php" => "php",
+        "hs" => "haskell",
+        "ex" | "exs" => "elixir",
+        "scala" | "sc" => "scala",
+        "cs" => "c_sharp",
         _ => return None,
     })
 }
@@ -33,6 +48,43 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
 struct LanguageConfig {
     language: Language,
     query: Query,
+}
+
+/// A built-in highlight query, for an installed grammar that adds to it.
+fn builtin_query(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "c" => tree_sitter_c::HIGHLIGHT_QUERY,
+        "javascript" => tree_sitter_javascript::HIGHLIGHT_QUERY,
+        _ => return None,
+    })
+}
+
+/// A grammar vmac installed (packages.rs); asks for it when it's missing.
+fn load_installed(name: &str) -> Option<LanguageConfig> {
+    if !crate::packages::grammar_installed(name) {
+        crate::packages::want_grammar(name);
+        return None;
+    }
+    let (language, own) = match crate::packages::load_grammar(name) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            crate::packages::notify(format!("the {name} grammar didn't load: {e}"));
+            return None;
+        }
+    };
+    let inherited = crate::packages::grammar_for(name).and_then(|g| g.inherits).and_then(builtin_query);
+    let source = match inherited {
+        Some(base) => format!("{own}\n{base}"),
+        None => own.clone(),
+    };
+    // With the inherited query first if that works, else the grammar's own alone.
+    match Query::new(&language, &source).or_else(|_| Query::new(&language, &own)) {
+        Ok(query) => Some(LanguageConfig { language, query }),
+        Err(e) => {
+            crate::packages::notify(format!("the {name} highlights didn't load: {e}"));
+            None
+        }
+    }
 }
 
 fn load_language(name: &str) -> Option<LanguageConfig> {
@@ -56,7 +108,7 @@ fn load_language(name: &str) -> Option<LanguageConfig> {
         "c" => (tree_sitter_c::LANGUAGE.into(), vec![tree_sitter_c::HIGHLIGHT_QUERY.into()]),
         "go" => (tree_sitter_go::LANGUAGE.into(), vec![tree_sitter_go::HIGHLIGHTS_QUERY.into()]),
         "bash" => (tree_sitter_bash::LANGUAGE.into(), vec![tree_sitter_bash::HIGHLIGHT_QUERY.into()]),
-        _ => return None,
+        _ => return load_installed(name),
     };
     let query = queries.iter().find_map(|q| Query::new(&language, q).ok())?;
     Some(LanguageConfig { language, query })
@@ -80,7 +132,9 @@ struct Parsed {
 
 #[derive(Default)]
 pub struct Syntax {
-    languages: HashMap<&'static str, Option<LanguageConfig>>,
+    /// Each language's grammar, or None with the install generation it was
+    /// missing in (looked for again after an install).
+    languages: HashMap<&'static str, (Option<LanguageConfig>, u64)>,
     parsed: HashMap<BufferId, Parsed>,
 }
 
@@ -101,8 +155,12 @@ impl Syntax {
             return crate::markdown::highlight(rope, lines);
         }
         let empty = || vec![Vec::new(); lines.len()];
-        let config = self.languages.entry(language).or_insert_with(|| load_language(language));
-        let Some(config) = config.as_ref() else { return empty() };
+        let generation = crate::packages::generation();
+        let entry = self.languages.entry(language).or_insert_with(|| (load_language(language), generation));
+        if entry.0.is_none() && entry.1 != generation {
+            *entry = (load_language(language), generation);
+        }
+        let Some(config) = entry.0.as_ref() else { return empty() };
 
         let stale = self
             .parsed

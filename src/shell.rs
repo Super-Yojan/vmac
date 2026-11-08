@@ -11,7 +11,8 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     App, Context, prelude::FluentBuilder as _, FocusHandle, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    Keystroke, ParentElement as _, Render, Styled as _, Window, div, px,
+    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render, ScrollWheelEvent,
+    Styled as _, Window, div, px,
 };
 use std::time::Duration;
 
@@ -42,13 +43,72 @@ pub struct Shell {
     /// the system's appearance change.
     applied_mode: Option<(gpui_kit::component::ThemeMode, String)>,
     _appearance: gpui_kit::Subscription,
-    /// TODO: Markdown buffers shouldn't show rendered in normal mode, only in preview mode, or preview pane. 
-    /// Markdown buffers shown rendered (in normal state): their gpui-kit
+    /// Markdown buffers shown rendered in normal state (opt-in, `SPC t m`;
+    /// the default hides the markup instead): their gpui-kit
     /// view, the text it last got and the cursor line it last revealed.
     md_views: std::collections::HashMap<crate::editor::BufferId, MdView>,
     /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
     /// parsed from, and the cursor line it last selected.
     review_view: Option<ReviewView>,
+    /// Where the last frame drew each window's lines, for the mouse.
+    hits: Vec<WindowHit>,
+    /// The button held down since a press in a window.
+    drag: Option<Drag>,
+    /// Wheel movement short of a whole line, kept for the next event.
+    wheel: f32,
+}
+
+/// A window as last drawn: its area in pixels and where each line is.
+#[derive(Debug, Clone, Default)]
+struct WindowHit {
+    id: crate::editor::WindowId,
+    buffer: crate::editor::BufferId,
+    /// The whole window, modeline included.
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    /// Where text starts, after the padding and line numbers.
+    text_left: f32,
+    /// Each line on screen: its buffer line, top, height and screen
+    /// column per character (`layout_line`'s map).
+    lines: Vec<(usize, f32, f32, Vec<usize>)>,
+    /// Drawn by gpui-kit (rendered Markdown, the review), which has its own mouse.
+    custom: bool,
+    terminal: bool,
+}
+
+impl WindowHit {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    /// The buffer line and screen column at a point (outside the window,
+    /// the nearest), and the character on that line: past the end of the
+    /// text, the rows below continue the last line's numbering.
+    fn at(&self, x: f32, y: f32) -> (usize, usize, usize) {
+        let col = ((x - self.text_left) / (FONT_SIZE * CHAR_WIDTH)).max(0.) as usize;
+        let Some(last) = self.lines.last() else { return (0, col, col) };
+        let (line, cols) = match self.lines.iter().find(|l| y < l.1 + l.2) {
+            Some(l) => (l.0, l.3.as_slice()),
+            None => (last.0 + ((y - last.1 - last.2) / ROW_HEIGHT) as usize + 1, &[][..]),
+        };
+        // The last character starting at or before the column; the line's end after it.
+        let chars = cols.len().saturating_sub(2);
+        let ch = (0..=chars).rev().find(|&i| cols.get(i).is_some_and(|&c| c <= col)).unwrap_or(0);
+        (line, col, ch)
+    }
+}
+
+/// A button held down: in a window's text (dragging selects), or reported
+/// to the terminal program that asked for the mouse.
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    window: crate::editor::WindowId,
+    /// The terminal's button, when the program has the mouse.
+    terminal: Option<u8>,
+    /// The last position reported: a buffer position, or a terminal cell.
+    last: (usize, usize),
 }
 
 struct ReviewView {
@@ -112,6 +172,9 @@ impl Shell {
             _appearance: appearance,
             md_views: Default::default(),
             review_view: None,
+            hits: Vec::new(),
+            drag: None,
+            wheel: 0.,
         };
         shell.apply_theme(window, cx);
         shell
@@ -151,6 +214,13 @@ impl Shell {
             }
         }
         Theme::change(wanted, Some(window), cx);
+        // Terminal programs that ask for the colors get the theme's.
+        let hex = |c: gpui_kit::Hsla| {
+            let c = c.to_rgb();
+            ((c.r * 255.).round() as u32) << 16 | ((c.g * 255.).round() as u32) << 8 | (c.b * 255.).round() as u32
+        };
+        let t = cx.theme();
+        crate::terminal::set_colors(hex(t.foreground), hex(t.background));
     }
 
     /// Reloads lisp/core/ and init.scm when they change on disk.
@@ -226,6 +296,160 @@ impl Shell {
         }
         cx.notify();
     }
+
+    /// Runs a mouse call in Scheme; its error, if any, in the echo area.
+    fn mouse_call(&mut self, code: &str, cx: &mut Context<Self>) {
+        if let Err(e) = self.lisp.eval(code) {
+            self.editor.lock().message = format!("mouse: {}", e.lines().next().unwrap_or(""));
+        }
+        if self.editor.lock().quit_requested {
+            cx.quit();
+        }
+        cx.notify();
+    }
+
+    /// The window under a point, unless a picker or prompt has the screen.
+    fn hit_at(&self, x: f32, y: f32) -> Option<WindowHit> {
+        let st = self.editor.lock();
+        if st.picker.is_some() || st.minibuffer_prompt.is_some() {
+            return None;
+        }
+        self.hits.iter().find(|h| h.contains(x, y)).cloned()
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let (x, y): (f32, f32) = (event.position.x.into(), event.position.y.into());
+        let Some(hit) = self.hit_at(x, y) else { return };
+        window.focus(&self.focus, cx);
+        let button = match event.button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            _ => return,
+        };
+        let (line, col, ch) = hit.at(x, y);
+        // A program that asked for the mouse gets it; shift selects its text instead.
+        if hit.terminal && !event.modifiers.shift {
+            let taken = {
+                let mut st = self.editor.lock();
+                let taken = st.terminal_mouse(hit.buffer, crate::terminal::MouseAction::Press(button), line, col, mouse_mods(&event.modifiers));
+                if taken {
+                    st.select_window(hit.id);
+                }
+                taken
+            };
+            if taken {
+                self.drag = Some(Drag { window: hit.id, terminal: Some(button), last: (line, col) });
+                // Typing goes to the program you clicked in.
+                self.mouse_call("(set! evil-state 'insert)", cx);
+                return;
+            }
+        }
+        if button != 0 {
+            return;
+        }
+        let pos = {
+            let mut st = self.editor.lock();
+            st.select_window(hit.id);
+            let text = st.buffer().text();
+            let line = line.min(text.len_lines().saturating_sub(1));
+            let start = text.line_to_char(line);
+            let len = text_line_len(text, line);
+            start + ch.min(len)
+        };
+        if hit.custom {
+            cx.notify();
+            return;
+        }
+        self.drag = Some(Drag { window: hit.id, terminal: None, last: (pos, 0) });
+        self.mouse_call(&format!("(mouse-click {pos} {})", event.click_count.max(1)), cx);
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag else { return };
+        if event.pressed_button.is_none() {
+            self.drag = None;
+            return;
+        }
+        let Some(hit) = self.hits.iter().find(|h| h.id == drag.window).cloned() else { return };
+        let (x, y): (f32, f32) = (event.position.x.into(), event.position.y.into());
+        let (line, col, ch) = hit.at(x, y);
+        if let Some(button) = drag.terminal {
+            if (line, col) != drag.last {
+                self.drag = Some(Drag { last: (line, col), ..drag });
+                let action = crate::terminal::MouseAction::Drag(button);
+                self.editor.lock().terminal_mouse(hit.buffer, action, line, col, mouse_mods(&event.modifiers));
+            }
+            return;
+        }
+        let pos = {
+            let st = self.editor.lock();
+            if st.selected_window() != drag.window {
+                return;
+            }
+            let text = st.buffer().text();
+            let line = line.min(text.len_lines().saturating_sub(1));
+            let len = text_line_len(text, line);
+            // Dragging past the end of a line selects up to its last character.
+            text.line_to_char(line) + ch.min(len.saturating_sub(1))
+        };
+        if pos != drag.last.0 {
+            self.drag = Some(Drag { last: (pos, 0), ..drag });
+            self.mouse_call(&format!("(mouse-drag {pos})"), cx);
+        }
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        let Some(drag) = self.drag.take() else { return };
+        if let Some(button) = drag.terminal
+            && let Some(hit) = self.hits.iter().find(|h| h.id == drag.window)
+        {
+            let (line, col, _) = hit.at(event.position.x.into(), event.position.y.into());
+            let action = crate::terminal::MouseAction::Release(button);
+            self.editor.lock().terminal_mouse(hit.buffer, action, line, col, mouse_mods(&event.modifiers));
+        }
+    }
+
+    /// The wheel scrolls the window under the pointer, selected or not; a
+    /// terminal program that asked for the mouse gets the wheel instead.
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let (x, y): (f32, f32) = (event.position.x.into(), event.position.y.into());
+        let Some(hit) = self.hit_at(x, y).filter(|h| !h.custom) else { return };
+        let dy: f32 = event.delta.pixel_delta(px(ROW_HEIGHT)).y.into();
+        // Wheel up (content down) scrolls toward the top: negative lines.
+        self.wheel -= dy / ROW_HEIGHT;
+        let n = self.wheel.trunc();
+        self.wheel -= n;
+        if n == 0. {
+            return;
+        }
+        let n = n as isize;
+        let mut st = self.editor.lock();
+        if hit.terminal && !event.modifiers.shift {
+            let (line, col, _) = hit.at(x, y);
+            let action = if n < 0 { crate::terminal::MouseAction::WheelUp } else { crate::terminal::MouseAction::WheelDown };
+            let mods = mouse_mods(&event.modifiers);
+            if st.terminal_mouse(hit.buffer, action, line, col, mods) {
+                for _ in 1..n.unsigned_abs() {
+                    st.terminal_mouse(hit.buffer, action, line, col, mods);
+                }
+                return;
+            }
+        }
+        st.scroll_window_by(hit.id, n);
+        drop(st);
+        cx.notify();
+    }
+}
+
+/// A line's length in characters, without its line break.
+fn text_line_len(text: &ropey::Rope, line: usize) -> usize {
+    text.line(line).to_string().trim_end_matches(['\n', '\r']).chars().count()
+}
+
+/// The modifier keys of a mouse event, as terminals report them.
+fn mouse_mods(m: &gpui_kit::Modifiers) -> crate::terminal::MouseMods {
+    crate::terminal::MouseMods { shift: m.shift, alt: m.alt, control: m.control }
 }
 
 gpui_kit::actions!(vmac, [TabKey, ShiftTabKey]);
@@ -714,8 +938,8 @@ fn display_line(rope_line: ropey::RopeSlice<'_>) -> String {
 
 /// Which lines fill `room` pixels: scrolls down from `top` until the
 /// cursor's line fits, then takes lines while they fit (at least one), up to
-/// `end`. Returns the first and one-past-last lines.
-fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl Fn(usize) -> f32) -> (usize, usize) {
+/// `end`. Returns the first and one-past-last lines, and the row capacity.
+fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl Fn(usize) -> f32) -> (usize, usize, usize) {
     while top < cursor && (top..=cursor).map(&height).sum::<f32>() > room {
         top += 1;
     }
@@ -725,7 +949,10 @@ fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl 
         used += height(last);
         last += 1;
     }
-    (top, last)
+    // Blank space below a short buffer still fits terminal rows. Counting
+    // only drawn lines would resize a newly opened PTY to one or two rows.
+    let rows = last - top + ((room - used).max(0.) / ROW_HEIGHT) as usize;
+    (top, last, rows.max(1))
 }
 
 /// Text rows a window of this size shows: its height less its modeline.
@@ -881,6 +1108,8 @@ impl Render for Shell {
         let comments: Vec<crate::editor::ReviewComment> = st.review_comments.clone();
         let review_id = st.review_buffer_id();
 
+        let mut hits: Vec<WindowHit> = Vec::new();
+        let terminal_buffers: std::collections::HashSet<crate::editor::BufferId> = st.terminals.iter().map(|t| t.buffer).collect();
         let windows: Vec<_> = rects
             .iter()
             .filter_map(|(id, r)| {
@@ -948,10 +1177,40 @@ impl Render for Shell {
                     })
                     .unwrap_or_default();
                 let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
+                // Line numbers, in a gutter: for files, when they're on.
+                let numbers = match st.line_numbers.as_str() {
+                    "on" | "relative" if buffer.file().is_some() && !is_sidebar && !rendered.contains_key(id) => Some(st.line_numbers == "relative"),
+                    _ => None,
+                };
+                let gutter = numbers.map_or(0, |_| text.len_lines().max(1).to_string().len() + 1);
 
                 let room = (r.h * area - ROW_HEIGHT).max(ROW_HEIGHT);
-                let (top, last) = fit_lines(w.scroll_top.min(cur_line), cur_line, hi, room, height_of);
-                fitted.push((*id, top, last - top));
+                let (top, last, rows) = fit_lines(w.scroll_top.min(cur_line), cur_line, hi, room, height_of);
+                fitted.push((*id, top, rows));
+                {
+                    let mut y = r.y * area;
+                    let lines = (top..last)
+                        .map(|i| {
+                            let raw = text.line(i).to_string();
+                            let cols = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(i)).1;
+                            let at = (i, y, height_of(i), cols);
+                            y += height_of(i);
+                            at
+                        })
+                        .collect();
+                    hits.push(WindowHit {
+                        id: *id,
+                        buffer: w.buffer,
+                        left: r.x * width,
+                        top: r.y * area,
+                        right: (r.x + r.w) * width,
+                        bottom: (r.y + r.h) * area,
+                        text_left: r.x * width + 8. + gutter as f32 * FONT_SIZE * CHAR_WIDTH,
+                        lines,
+                        custom: rendered.contains_key(id) || (review_state.is_some() && Some(w.buffer) == review_id),
+                        terminal: terminal_buffers.contains(&w.buffer),
+                    });
+                }
                 if is_selected && (top..last).contains(&cur_line) {
                     let raw = text.line(cur_line).to_string();
                     let col = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(cur_line))
@@ -959,7 +1218,7 @@ impl Render for Shell {
                         .get(cur_col)
                         .copied()
                         .unwrap_or(cur_col);
-                    let x = r.x * width + 8. + col as f32 * FONT_SIZE * CHAR_WIDTH;
+                    let x = r.x * width + 8. + (col + gutter) as f32 * FONT_SIZE * CHAR_WIDTH;
                     let y = r.y * area + (top..cur_line).map(height_of).sum::<f32>();
                     cursor_at = Some((x, y, height_of(cur_line)));
                 }
@@ -1003,6 +1262,27 @@ impl Render for Shell {
                             diagnostics: line_diagnostics,
                         };
                         let row = line_element(view, bar, cx);
+                        // The number beside it: the current line's brighter; relative
+                        // numbers count from the cursor (the current line its own).
+                        let row = match numbers {
+                            Some(relative) => {
+                                let n = if relative && i != cur_line { i.abs_diff(cur_line) } else { i + 1 };
+                                let shown = if i + 1 == text.len_lines() && text.line(i).len_chars() == 0 { String::new() } else { format!("{n:>width$} ", width = gutter - 1) };
+                                h_flex()
+                                    .items_end()
+                                    .child(
+                                        div()
+                                            .h(px(height_of(i)))
+                                            .flex_shrink_0()
+                                            .whitespace_nowrap()
+                                            .text_color(if i == cur_line { theme.foreground } else { theme.muted_foreground.opacity(0.7) })
+                                            .child(shown),
+                                    )
+                                    .child(row)
+                                    .into_any_element()
+                            }
+                            None => row.into_any_element(),
+                        };
                         let current = is_sidebar && i == cur_line;
                         let marks = review_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
                         let added = marks.contains(&(i, true));
@@ -1141,6 +1421,7 @@ impl Render for Shell {
             })
             .collect();
 
+        self.hits = hits;
         for (id, top, rows) in fitted {
             if let Some(w) = st.window_by_id_mut(id) {
                 w.scroll_top = top;
@@ -1288,6 +1569,12 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key))
             .on_action(cx.listener(|shell, _: &TabKey, _, cx| shell.dispatch("TAB", "", cx)))
             .on_action(cx.listener(|shell, _: &ShiftTabKey, _, cx| shell.dispatch("S-TAB", "", cx)))
+            .on_any_mouse_down(cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_scroll_wheel(cx.listener(Self::on_scroll))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
@@ -1318,11 +1605,56 @@ mod tests {
         // Line 0 is a heading twice as tall; room for 4 normal rows.
         let h = |i: usize| if i == 0 { 2. * ROW_HEIGHT } else { ROW_HEIGHT };
         let room = 4. * ROW_HEIGHT;
-        assert_eq!(fit_lines(0, 1, 10, room, h), (0, 3), "heading + 2 lines fit");
-        assert_eq!(fit_lines(0, 3, 10, room, h), (1, 5), "the cursor on line 3 scrolls the heading off");
-        assert_eq!(fit_lines(0, 0, 1, room, h), (0, 1), "stops at the buffer's end");
+        assert_eq!(fit_lines(0, 1, 10, room, h), (0, 3, 3), "heading + 2 lines fit");
+        assert_eq!(fit_lines(0, 3, 10, room, h), (1, 5, 4), "the cursor on line 3 scrolls the heading off");
+        assert_eq!(fit_lines(0, 0, 1, room, h), (0, 1, 3), "stops drawing at the buffer's end, with room below the heading");
         let huge = |_| 10. * ROW_HEIGHT;
-        assert_eq!(fit_lines(0, 0, 10, room, huge), (0, 1), "always at least one line");
+        assert_eq!(fit_lines(0, 0, 10, room, huge), (0, 1, 1), "always at least one line");
+    }
+
+    #[test]
+    fn the_mouse_finds_the_line_and_character_under_it() {
+        let cw = FONT_SIZE * CHAR_WIDTH;
+        let hit = WindowHit {
+            left: 0.,
+            top: 0.,
+            right: 400.,
+            bottom: 200.,
+            text_left: 8. + 3. * cw,
+            // A heading twice as tall, then a line with a tab (four columns).
+            lines: vec![
+                (10, 0., 40., display_columns("# Hi")),
+                (11, 40., 20., display_columns("\tx")),
+            ],
+            ..Default::default()
+        };
+        assert!(hit.contains(10., 10.) && !hit.contains(410., 10.));
+        let x = |col: f32| 8. + (3. + col) * cw + 1.;
+        assert_eq!(hit.at(x(2.), 30.), (10, 2, 2), "inside the tall line");
+        assert_eq!(hit.at(x(2.), 45.), (11, 2, 0), "inside the tab: the tab");
+        assert_eq!(hit.at(x(4.), 45.), (11, 4, 1), "after it, the x");
+        assert_eq!(hit.at(x(30.), 45.), (11, 30, 2), "past the end: the line's end");
+        assert_eq!(hit.at(0., 45.).2, 0, "on the line numbers: the first character");
+        assert_eq!(hit.at(x(1.), 105.).0, 14, "below the text, rows keep counting (terminals)");
+    }
+
+    #[test]
+    fn an_empty_terminal_keeps_the_panes_full_height() {
+        // The first frame has one empty buffer line, but space for 40 rows.
+        // Feeding the content count back to the PTY used to shrink it to 2.
+        let (top, last, rows) = fit_lines(0, 0, 1, 800., |_| ROW_HEIGHT);
+        assert_eq!((top, last), (0, 1), "only existing buffer lines are drawn");
+        let mut st = crate::editor::EditorState::new(Buffer::new("*agent*"));
+        let id = st.selected_window();
+        st.fit_window(id, rows);
+        assert_eq!(st.selected_size().0, 40, "the PTY must get the pane's capacity");
+
+        // Output arriving and a later pane resize must preserve the same rule.
+        for (lines, room, expected) in [(2, 800., 40), (40, 800., 40), (2, 200., 10)] {
+            let (_, _, rows) = fit_lines(0, 0, lines, room, |_| ROW_HEIGHT);
+            st.fit_window(id, rows);
+            assert_eq!(st.selected_size().0, expected);
+        }
     }
 
     #[test]

@@ -11,7 +11,8 @@
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use qwertty_term_vt::snapshot::{Snapshot, SnapshotColor};
 use qwertty_term_vt::stream::{Stream, TerminalHandler};
-use qwertty_term_vt::terminal::{Options, Terminal};
+pub use qwertty_term_vt::terminal::{MouseEvent, MouseFormat};
+use qwertty_term_vt::terminal::{Options, ScreenKey, Terminal};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{Sender, channel};
@@ -216,6 +217,139 @@ enum Msg {
     Resize(u16, u16),
 }
 
+/// What a program asked of the mouse, and where its screen starts in the
+/// buffer (the line of screen row 0, below the scrollback).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MouseMode {
+    pub event: MouseEvent,
+    pub format: MouseFormat,
+    pub screen_top: usize,
+    /// On the alternate screen (a full-screen program: less, vim, htop).
+    pub alternate: bool,
+}
+
+/// A mouse event to report to a program.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MouseAction {
+    /// Button 0 (left), 1 (middle) or 2 (right) went down.
+    Press(u8),
+    Release(u8),
+    /// The pointer moved with a button down.
+    Drag(u8),
+    WheelUp,
+    WheelDown,
+}
+
+/// Modifier keys held during a mouse event.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MouseMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+/// The bytes reporting a mouse event at a cell (0-based row and column) in
+/// the encoding the program asked for; None when its mode doesn't report it.
+pub fn mouse_report(mode: &MouseMode, action: MouseAction, row: usize, col: usize, mods: MouseMods) -> Option<Vec<u8>> {
+    let reported = match mode.event {
+        MouseEvent::None => false,
+        MouseEvent::X10 => matches!(action, MouseAction::Press(_) | MouseAction::WheelUp | MouseAction::WheelDown),
+        MouseEvent::Normal => !matches!(action, MouseAction::Drag(_)),
+        MouseEvent::Button | MouseEvent::Any => true,
+    };
+    if !reported {
+        return None;
+    }
+    let sgr = matches!(mode.format, MouseFormat::Sgr | MouseFormat::SgrPixels);
+    let mut code: u32 = match action {
+        MouseAction::Press(b) => b.min(2) as u32,
+        // Only SGR says which button let go.
+        MouseAction::Release(b) => if sgr { b.min(2) as u32 } else { 3 },
+        MouseAction::Drag(b) => 32 + b.min(2) as u32,
+        MouseAction::WheelUp => 64,
+        MouseAction::WheelDown => 65,
+    };
+    // X10 compatibility mode reports no modifiers.
+    if mode.event != MouseEvent::X10 {
+        code += 4 * mods.shift as u32 + 8 * mods.alt as u32 + 16 * mods.control as u32;
+    }
+    let (x, y) = match mode.format {
+        // A cell of the editor's font is about 8 by 16 pixels (as `answer_queries` says).
+        MouseFormat::SgrPixels => (col as u32 * 8 + 1, row as u32 * 16 + 1),
+        _ => (col as u32 + 1, row as u32 + 1),
+    };
+    let release = matches!(action, MouseAction::Release(_));
+    Some(match mode.format {
+        MouseFormat::Sgr | MouseFormat::SgrPixels => {
+            format!("\x1b[<{code};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes()
+        }
+        MouseFormat::Urxvt => format!("\x1b[{};{x};{y}M", code + 32).into_bytes(),
+        MouseFormat::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for v in [code + 32, x + 32, y + 32] {
+                let c = char::from_u32(v.min(2047))?;
+                out.extend(c.to_string().into_bytes());
+            }
+            out
+        }
+        // Plain X10 bytes reach column and row 223 at most.
+        MouseFormat::X10 => vec![0x1b, b'[', b'M', (code + 32) as u8, (x.min(223) + 32) as u8, (y.min(223) + 32) as u8],
+    })
+}
+
+/// The colors terminals report as theirs when a program asks (OSC 10 / 11 /
+/// 12): the editor's text and background, set as its theme changes.
+static COLORS: Mutex<(u32, u32)> = Mutex::new((0xdddddd, 0x1c1c1c));
+
+/// The theme's text and background colors (0xRRGGBB), for programs that ask.
+pub fn set_colors(foreground: u32, background: u32) {
+    *COLORS.lock().unwrap_or_else(|e| e.into_inner()) = (foreground, background);
+}
+
+/// Answers to queries in a program's output that the engine doesn't answer:
+/// its colors (OSC 10 text, 11 background, 12 cursor; programs like Claude
+/// Code wait for these to pick a light or dark look) and its size (CSI 14 /
+/// 16 / 18 t). `size` is (rows, cols).
+pub fn answer_queries(bytes: &[u8], size: (u16, u16)) -> Vec<u8> {
+    let (fg, bg) = *COLORS.lock().unwrap_or_else(|e| e.into_inner());
+    let rgb = |c: u32| {
+        let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+        format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+    };
+    let mut out = Vec::new();
+    let text = String::from_utf8_lossy(bytes);
+    for (code, color) in [("10", fg), ("11", bg), ("12", fg)] {
+        for (query, end) in [(format!("\x1b]{code};?\x07"), "\x07"), (format!("\x1b]{code};?\x1b\\"), "\x1b\\")] {
+            for _ in text.matches(query.as_str()) {
+                out.extend(format!("\x1b]{code};{}{end}", rgb(color)).into_bytes());
+            }
+        }
+    }
+    let (rows, cols) = size;
+    // A cell of the editor's font, roughly: 8 by 16 pixels.
+    for (query, reply) in [
+        ("\x1b[18t", format!("\x1b[8;{rows};{cols}t")),
+        ("\x1b[16t", "\x1b[6;16;8t".to_string()),
+        ("\x1b[14t", format!("\x1b[4;{};{}t", rows as u32 * 16, cols as u32 * 8)),
+    ] {
+        for _ in text.matches(query) {
+            out.extend(reply.clone().into_bytes());
+        }
+    }
+    out
+}
+
+/// With VMAC_PTY_LOG=FILE, what terminal programs print, what vmac answers
+/// their queries with, and the keys sent, escaped, one line each: for a
+/// program that hangs or draws wrong.
+fn pty_log(direction: &str, bytes: &[u8]) {
+    let Some(path) = std::env::var_os("VMAC_PTY_LOG") else { return };
+    let text: String = String::from_utf8_lossy(bytes).escape_debug().collect();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{direction} {text}");
+    }
+}
+
 /// A program on a local pseudo-terminal. Ghostty's engine isn't `Send`, so
 /// each terminal's engine lives on its own thread: it is fed the program's
 /// output and new sizes, answers the program's queries, and hands back
@@ -230,6 +364,8 @@ pub struct LocalPty {
     /// The screen and scrollback as text, always the latest (what an agent
     /// reads of a command it ran).
     text: Arc<Mutex<String>>,
+    /// The program's mouse mode, as of the latest screen.
+    mouse: Arc<Mutex<MouseMode>>,
     size: (u16, u16),
 }
 
@@ -274,7 +410,12 @@ impl LocalPty {
         let tx = to_engine.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
-            while let Ok(n) = reader.read(&mut buf) {
+            loop {
+                let r = reader.read(&mut buf);
+                if let Ok(n) = &r {
+                    pty_log("<-", &buf[..*n]);
+                }
+                let Ok(n) = r else { break };
                 if n == 0 || tx.send(Msg::Output(buf[..n].to_vec())).is_err() {
                     break;
                 }
@@ -284,25 +425,45 @@ impl LocalPty {
         // The engine: made here and never leaves this thread.
         let latest = Arc::new(Mutex::new(None));
         let text = Arc::new(Mutex::new(String::new()));
-        let (screen_out, replies, text_out) = (latest.clone(), writer.clone(), text.clone());
+        let mouse = Arc::new(Mutex::new(MouseMode::default()));
+        let (screen_out, replies, text_out, mouse_out) = (latest.clone(), writer.clone(), text.clone(), mouse.clone());
         std::thread::spawn(move || {
             let mut stream = engine(rows, cols);
-            let apply = |stream: &mut Stream<TerminalHandler>, msg: Msg| match msg {
-                Msg::Output(bytes) => stream.feed(&bytes),
-                Msg::Resize(rows, cols) => stream.terminal_mut().resize(cols, rows),
+            let mut size = (rows, cols);
+            // Queries the engine leaves unanswered, answered here.
+            let mut extra: Vec<u8> = Vec::new();
+            let mut apply = |stream: &mut Stream<TerminalHandler>, msg: Msg, extra: &mut Vec<u8>| match msg {
+                Msg::Output(bytes) => {
+                    extra.extend(answer_queries(&bytes, size));
+                    stream.feed(&bytes)
+                }
+                Msg::Resize(rows, cols) => {
+                    size = (rows, cols);
+                    stream.terminal_mut().resize(cols, rows)
+                }
             };
             while let Ok(msg) = from_pty.recv() {
-                apply(&mut stream, msg);
+                apply(&mut stream, msg, &mut extra);
                 // Take everything already waiting before building a screen.
                 while let Ok(msg) = from_pty.try_recv() {
-                    apply(&mut stream, msg);
+                    apply(&mut stream, msg, &mut extra);
                 }
-                let answers = stream.handler.take_output();
+                let mut answers = stream.handler.take_output();
+                answers.append(&mut extra);
                 if !answers.is_empty() {
+                    pty_log("answer ->", &answers);
                     let mut w = replies.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = w.write_all(&answers).and_then(|()| w.flush());
                 }
-                let screen = read_screen(&stream.terminal().snapshot());
+                let snapshot = stream.terminal().snapshot();
+                let screen = read_screen(&snapshot);
+                let flags = &stream.terminal().flags;
+                *mouse_out.lock().unwrap_or_else(|e| e.into_inner()) = MouseMode {
+                    event: flags.mouse_event,
+                    format: flags.mouse_format,
+                    screen_top: snapshot.active_start,
+                    alternate: stream.terminal().screens.active_key() == ScreenKey::Alternate,
+                };
                 let mut lines: Vec<&str> = screen.lines.iter().map(|l| l.trim_end()).collect();
                 while lines.last().is_some_and(|l| l.is_empty()) {
                     lines.pop();
@@ -312,12 +473,18 @@ impl LocalPty {
             }
         });
 
-        Ok(Self { master: pty.master, writer, child, to_engine, latest, text, size: (rows, cols) })
+        Ok(Self { master: pty.master, writer, child, to_engine, latest, text, mouse, size: (rows, cols) })
     }
 
     pub fn send(&mut self, bytes: &[u8]) {
+        pty_log("keys ->", bytes);
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let _ = w.write_all(bytes).and_then(|()| w.flush());
+    }
+
+    /// What the program asked of the mouse, as of its latest screen.
+    pub fn mouse_mode(&self) -> MouseMode {
+        *self.mouse.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -364,7 +531,62 @@ impl Drop for LocalPty {
 
 #[cfg(test)]
 mod tests {
+    /// A program on a PTY, its screen after a few seconds: VMAC_PTY_CMD.
+    #[test]
+    #[ignore]
+    fn shows_a_programs_screen() {
+        let Ok(cmd) = std::env::var("VMAC_PTY_CMD") else { return };
+        let dir = std::env::current_dir().unwrap();
+        let mut pty = LocalPty::start(&cmd, &dir, 30, 100).unwrap();
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let _ = pty.screen();
+        }
+        println!("alive={} exit={:?}\n---\n{}\n---", pty.alive(), pty.exit_status(), pty.text());
+    }
+
     use super::*;
+
+    #[test]
+    fn color_and_size_queries_are_answered() {
+        set_colors(0x112233, 0xffeedd);
+        let a = String::from_utf8(answer_queries(b"\x1b]11;?\x1b\\x\x1b]10;?\x07", (24, 80))).unwrap();
+        assert!(a.contains("\x1b]11;rgb:ffff/eeee/dddd\x1b\\"), "{a:?}");
+        assert!(a.contains("\x1b]10;rgb:1111/2222/3333\x07"), "the query's terminator: {a:?}");
+        let s = String::from_utf8(answer_queries(b"\x1b[18t\x1b[14t", (24, 80))).unwrap();
+        assert_eq!(s, "\x1b[8;24;80t\x1b[4;384;640t");
+        assert!(answer_queries(b"plain text", (24, 80)).is_empty());
+        set_colors(0xdddddd, 0x1c1c1c);
+    }
+
+    #[test]
+    fn mouse_events_are_reported_as_the_program_asked() {
+        let mut mode = MouseMode::default();
+        let none = MouseMods::default();
+        assert_eq!(mouse_report(&mode, MouseAction::Press(0), 0, 0, none), None, "no tracking, no reports");
+        mode.event = MouseEvent::Normal;
+        assert_eq!(mouse_report(&mode, MouseAction::Press(0), 2, 4, none).unwrap(), b"\x1b[M\x20\x25\x23");
+        assert_eq!(mouse_report(&mode, MouseAction::Release(0), 2, 4, none).unwrap(), b"\x1b[M\x23\x25\x23");
+        assert_eq!(mouse_report(&mode, MouseAction::Drag(0), 2, 4, none), None, "normal tracking skips motion");
+        mode.format = MouseFormat::Sgr;
+        assert_eq!(mouse_report(&mode, MouseAction::Release(2), 9, 0, none).unwrap(), b"\x1b[<2;1;10m");
+        assert_eq!(mouse_report(&mode, MouseAction::WheelDown, 0, 0, MouseMods { control: true, ..none }).unwrap(), b"\x1b[<81;1;1M");
+        mode.event = MouseEvent::Button;
+        assert_eq!(mouse_report(&mode, MouseAction::Drag(0), 1, 1, none).unwrap(), b"\x1b[<32;2;2M");
+    }
+
+    #[test]
+    fn programs_mouse_modes_reach_the_pty() {
+        let script = r"printf '\033[?1002h\033[?1006h'; sleep 2".to_string();
+        let mut pty = LocalPty::run("sh", &["-c".into(), script], &[], &std::env::temp_dir(), 10, 40).unwrap();
+        let start = std::time::Instant::now();
+        while pty.mouse_mode().event != MouseEvent::Button && start.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = pty.screen();
+        }
+        let mode = pty.mouse_mode();
+        assert_eq!((mode.event, mode.format), (MouseEvent::Button, MouseFormat::Sgr));
+    }
 
     #[test]
     fn keys_become_terminal_bytes() {

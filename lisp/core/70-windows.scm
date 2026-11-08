@@ -24,6 +24,32 @@
 (defcommand (recenter-top) (recenter "top"))
 (defcommand (recenter-bottom) (recenter "bottom"))
 
+;;;; The mouse
+;;
+;; Rust selects the window under a click, then calls these with the buffer
+;; position clicked (the wheel scrolls without them). A click puts the
+;; cursor there (and leaves visual state); a double click selects the word,
+;; or opens the file tree's entry; a triple click selects the line. Dragging
+;; selects, as v does. Programs in terminals that ask for the mouse get it
+;; instead; hold shift to select their text.
+
+(define (mouse-click pos clicks)
+  (completion-close)
+  (when (visual?) (set! evil-state 'normal))
+  (goto-char pos)
+  (cond ((inserting?) #t)
+        ((and (= clicks 2) (equal? (buffer-name) tree-buffer)) (call-binding 'tree-activate))
+        ((= clicks 2) (for-each (lambda (k) (dispatch-key k k)) '("v" "i" "w")))
+        ((>= clicks 3) (dispatch-key "V" "V"))
+        (else (clamp-to-line!))))
+
+(define (mouse-drag pos)
+  (when (not (visual?))
+    (completion-close)
+    (set! evil-state 'visual)
+    (set! visual-anchor (point)))
+  (goto-char pos))
+
 ;;;; Buffers and windows
 ;;
 ;; Every open file is a buffer. Windows show buffers; split them with C-w v

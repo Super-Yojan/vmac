@@ -330,8 +330,12 @@ pub struct EditorState {
     /// bold without **...), and the preview pane, with the last buffer it showed.
     pub markdown_conceal: bool,
     /// Markdown files drawn like the preview (rendered) outside insert and
-    /// visual state; when off, `markdown_conceal` hides the markup instead.
+    /// visual state. Off by default: rendering is the preview pane's job, and
+    /// `markdown_conceal` hides the markup instead.
     pub markdown_rendered: bool,
+    /// Line numbers beside files: "off", "on", or "relative" (counted from
+    /// the cursor's line).
+    pub line_numbers: String,
     pub markdown_preview: bool,
     pub preview_last: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
@@ -509,7 +513,8 @@ impl EditorState {
             theme_names: Vec::new(),
             system_dark: false,
             markdown_conceal: true,
-            markdown_rendered: true,
+            markdown_rendered: false,
+            line_numbers: "off".into(),
             markdown_preview: false,
             preview_last: None,
             terminals_to_kill: Vec::new(),
@@ -940,6 +945,67 @@ impl EditorState {
         w.scroll_top = (w.scroll_top as isize + n).clamp(0, last) as usize;
     }
 
+    /// Scrolls any window by `n` lines (the mouse wheel), moving its point
+    /// onto the screen when it scrolls off, as `C-e` and `C-y` do.
+    pub fn scroll_window_by(&mut self, id: WindowId, n: isize) {
+        let Some(w) = self.window_by_id(id) else { return };
+        let Some(buffer) = self.buffer_by_id(w.buffer) else { return };
+        let text = buffer.text().clone();
+        let last = text.len_lines().saturating_sub(1) as isize;
+        let (top, rows) = ((w.scroll_top as isize + n).clamp(0, last) as usize, w.rows.max(1));
+        let point = self.window_point(id).min(text.len_chars());
+        let line = text.char_to_line(point);
+        let to = line.clamp(top, top + rows - 1).min(last as usize);
+        let new_point = if to == line { point } else { text.line_to_char(to) };
+        if id == self.selected {
+            self.buffer_mut().goto_char(new_point);
+        }
+        if let Some(w) = self.window_by_id_mut(id) {
+            w.scroll_top = top;
+            w.point = new_point;
+        }
+    }
+
+    /// Reports a mouse event at a buffer line and screen column to the
+    /// terminal in `buffer`, when its program asked for the mouse (or, on
+    /// the alternate screen, turns the wheel into arrow keys, as terminals
+    /// do). Returns whether the terminal took it.
+    pub fn terminal_mouse(
+        &mut self,
+        buffer: BufferId,
+        action: crate::terminal::MouseAction,
+        line: usize,
+        col: usize,
+        mods: crate::terminal::MouseMods,
+    ) -> bool {
+        use crate::terminal::{MouseAction, MouseEvent};
+        let Some(t) = self.terminal_for(buffer) else { return false };
+        if t.exited {
+            return false;
+        }
+        let (TermBackend::Local(pty) | TermBackend::Attached { pty, .. }) = &mut t.backend else { return false };
+        let mode = pty.mouse_mode();
+        if mode.event == MouseEvent::None {
+            let key = match action {
+                MouseAction::WheelUp if mode.alternate => b"\x1b[A",
+                MouseAction::WheelDown if mode.alternate => b"\x1b[B",
+                _ => return false,
+            };
+            pty.send(key);
+            return true;
+        }
+        // Lines above the screen are history: the program can't see them.
+        let Some(row) = line.checked_sub(mode.screen_top) else { return false };
+        match crate::terminal::mouse_report(&mode, action, row, col, mods) {
+            Some(bytes) => {
+                pty.send(&bytes);
+                true
+            }
+            // Tracking is on but doesn't want this one (motion): still the program's.
+            None => true,
+        }
+    }
+
     /// Scrolls so the cursor's line is at the top, center or bottom.
     pub fn recenter(&mut self, place: &str) {
         let line = self.buffer().line();
@@ -996,6 +1062,11 @@ impl EditorState {
             .collect();
         let mut changed = self.lsp.pump(&docs, crate::picker::project_root);
         if let Some(notice) = self.lsp.take_notice() {
+            self.message = notice;
+            changed = true;
+        }
+        // Installs of servers and grammars: what started, finished or failed.
+        if let Some(notice) = crate::packages::take_notice() {
             self.message = notice;
             changed = true;
         }

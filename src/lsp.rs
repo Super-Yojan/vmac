@@ -444,8 +444,9 @@ struct Client {
 }
 
 impl Client {
-    fn start(config: &ServerConfig, root: &Path) -> std::io::Result<Self> {
-        let mut child = Command::new(&config.command)
+    /// Runs `program` (where the config's command was found) for a project.
+    fn start(config: &ServerConfig, program: &str, root: &Path) -> std::io::Result<Self> {
+        let mut child = Command::new(program)
             .args(&config.args)
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -721,7 +722,10 @@ impl Lsp {
             }
             let index = match self.clients.iter().position(|c| c.command == config.command && c.root == root) {
                 Some(i) => i,
-                None => match Client::start(&config, &root) {
+                None => match crate::packages::resolve_command(&config.command) {
+                    // Being installed: it starts once it's there.
+                    None => continue,
+                    Some(program) => match Client::start(&config, &program, &root) {
                     Ok(client) => {
                         self.clients.push(client);
                         self.clients.len() - 1
@@ -732,6 +736,7 @@ impl Lsp {
                         changed = true;
                         continue;
                     }
+                    },
                 },
             };
             self.clients[index].sync(doc);

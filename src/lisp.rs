@@ -21,6 +21,7 @@ use steel::steel_vm::register_fn::RegisterFn;
 /// checkout, so edits there load on the next start.
 const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("agents.lua", include_str!("../lua/core/agents.lua")),
+    ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
 ];
 
@@ -1375,7 +1376,34 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "align-table", |s, move_cells: isize| align_table_at_point(s.current(), move_cells));
 
     // Language servers.
-    prim!(reg, editor, "lsp-status", |s| s.lsp.status().to_string());
+    prim!(reg, editor, "lsp-status", |s| {
+        // What servers are doing, and what's being installed for them.
+        let installs = crate::packages::status();
+        match (s.lsp.status(), installs.as_str()) {
+            (lsp, "") => lsp.to_string(),
+            ("", installs) => installs.to_string(),
+            (lsp, installs) => format!("{lsp} · {installs}"),
+        }
+    });
+    // Language servers and grammars vmac installs (packages.rs).
+    prim!(reg, editor, "package-list", |_s| crate::packages::list());
+    prim!(reg, editor, "package-name", |_s, line: String| crate::packages::name_in_line(&line));
+    prim!(reg, editor, "package-installed?", |_s, name: String| crate::packages::is_installed(&name));
+    prim!(reg, editor, "package-install", |s, name: String| {
+        if let Err(e) = crate::packages::install(&name) {
+            s.message = e;
+        }
+    });
+    prim!(reg, editor, "package-uninstall", |s, name: String| {
+        s.message = match crate::packages::uninstall(&name) {
+            Ok(()) => format!("Removed {name}"),
+            Err(e) => e,
+        };
+        // A removed server stops; a grammar goes on until vmac restarts.
+        s.lsp.restart();
+    });
+    prim!(reg, editor, "set-auto-install", |_s, on: bool| crate::packages::set_auto_install(on));
+    prim!(reg, editor, "auto-install?", |_s| crate::packages::auto_install());
     prim!(reg, editor, "lsp-goto-definition", |s| s.lsp_request(crate::lsp::RequestKind::Definition));
     prim!(reg, editor, "lsp-hover", |s| s.lsp_request(crate::lsp::RequestKind::Hover));
     prim!(reg, editor, "lsp-references", |s| s.lsp_request(crate::lsp::RequestKind::References));
@@ -1619,6 +1647,15 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         s.theme_name(dark)
     });
     prim!(reg, editor, "theme", |s| s.theme_mode.clone());
+    // Line numbers beside files: "on", "relative" or "off".
+    prim!(reg, editor, "set-line-numbers", |s, mode: String| {
+        if matches!(mode.as_str(), "on" | "relative" | "off") {
+            s.line_numbers = mode;
+        } else {
+            s.message = format!("{mode}: line numbers are on, relative or off");
+        }
+    });
+    prim!(reg, editor, "line-numbers", |s| s.line_numbers.clone());
     // Markdown: the preview pane, and markup hidden outside insert state.
     prim!(reg, editor, "markdown-preview-toggle", |s| {
         s.markdown_preview = !s.markdown_preview;
@@ -1630,12 +1667,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "set-markdown-preview", |s, on: bool| s.markdown_preview = on);
     prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
-    // SPC t m: rendered (like the preview) -> markup hidden -> as typed.
+    // SPC t m: markup hidden (the default) -> as typed -> rendered, like the preview.
     prim!(reg, editor, "markdown-view-cycle", |s| {
         let (rendered, conceal, name) = match (s.markdown_rendered, s.markdown_conceal) {
-            (true, _) => (false, true, "markup hidden"),
             (false, true) => (false, false, "as typed"),
             (false, false) => (true, true, "rendered, like the preview"),
+            (true, _) => (false, true, "markup hidden"),
         };
         s.markdown_rendered = rendered;
         s.markdown_conceal = conceal;
@@ -3541,15 +3578,15 @@ mod tests {
         typed(&mut lisp, "v");
         assert_eq!(lisp.eval("(markdown-raw?)").unwrap(), "#true", "selecting shows the text too");
         lisp.dispatch_key("ESC", "");
-        // SPC t m: rendered -> markup hidden -> as typed -> rendered.
-        assert!(editor.lock().markdown_rendered, "rendered by default");
-        typed(&mut lisp, " tm");
+        // SPC t m: markup hidden -> as typed -> rendered -> markup hidden.
         let view = || { let st = editor.lock(); (st.markdown_rendered, st.markdown_conceal) };
-        assert_eq!(view(), (false, true));
+        assert_eq!(view(), (false, true), "markup hidden, not rendered, by default");
         typed(&mut lisp, " tm");
         assert_eq!(view(), (false, false));
         typed(&mut lisp, " tm");
         assert_eq!(view(), (true, true));
+        typed(&mut lisp, " tm");
+        assert_eq!(view(), (false, true));
         lisp.eval(r#"(set-markdown-view "raw")"#).unwrap();
         assert_eq!(view(), (false, false));
 
@@ -3805,6 +3842,88 @@ for line in sys.stdin:
         typed(&mut lisp, " aS");
         assert!(editor.lock().message.contains("No comments to send"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_mouse_clicks_drags_and_double_clicks() {
+        let (mut lisp, editor) = lisp_with("alpha beta\ngamma delta\n");
+        let state = |lisp: &mut Lisp| lisp.eval("evil-state").unwrap();
+        lisp.eval("(mouse-click 8 1)").unwrap();
+        assert_eq!(editor.lock().buffer().point(), 8);
+        lisp.eval("(mouse-click 10 1)").unwrap();
+        assert_eq!(editor.lock().buffer().point(), 9, "past the line's end: its last character");
+        // Dragging from beta into gamma selects, as v does.
+        lisp.eval("(mouse-click 6 1)").unwrap();
+        lisp.eval("(mouse-drag 13)").unwrap();
+        assert_eq!(state(&mut lisp), "visual");
+        assert_eq!(lisp.selection(), vec![(6, 14)]);
+        lisp.eval("(mouse-click 0 1)").unwrap();
+        assert_eq!(state(&mut lisp), "normal", "a click ends the selection");
+        lisp.eval("(mouse-click 13 2)").unwrap();
+        assert_eq!(lisp.selection(), vec![(11, 16)], "a double click selects the word");
+        lisp.eval("(mouse-click 13 3)").unwrap();
+        assert_eq!(state(&mut lisp), "visual-line", "a triple click, the line");
+        // Typing: a click moves the cursor and keeps inserting.
+        lisp.eval("(mouse-click 0 1)").unwrap();
+        typed(&mut lisp, "i");
+        lisp.eval("(mouse-click 10 1)").unwrap();
+        assert_eq!((state(&mut lisp).as_str(), editor.lock().buffer().point()), ("insert", 10));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_window_and_keeps_its_cursor_on_screen() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let (_lisp, editor) = lisp_with(&text);
+        let mut st = editor.lock();
+        let id = st.selected_window();
+        st.fit_window(id, 10);
+        st.scroll_window_by(id, 30);
+        assert_eq!(st.window().scroll_top, 30);
+        assert_eq!(st.buffer().line(), 30, "the cursor comes along");
+        st.scroll_window_by(id, -25);
+        assert_eq!((st.window().scroll_top, st.buffer().line()), (5, 14), "to the bottom row, scrolling up");
+        st.scroll_window_by(id, -50);
+        assert_eq!(st.window().scroll_top, 0, "not above the top");
+    }
+
+    #[test]
+    fn terminal_programs_that_ask_for_the_mouse_get_it() {
+        let (mut lisp, editor) = lisp_with("");
+        // Turns on click tracking with SGR reports; the tty echoes what it reads.
+        typed(&mut lisp, ":term sh\n");
+        typed(&mut lisp, "printf '\\033[?1000h\\033[?1006h'; cat\n");
+        let buffer = editor.lock().window().buffer;
+        let mode = |st: &EditorState| {
+            st.terminals.iter().find(|t| t.buffer == buffer).and_then(|t| match &t.backend {
+                crate::editor::TermBackend::Local(pty) => Some(pty.mouse_mode()),
+                _ => None,
+            })
+        };
+        let asked = pump_terminals_until(&mut lisp, &editor, |st| mode(st).is_some_and(|m| m.event != crate::terminal::MouseEvent::None));
+        assert!(asked, "the program asked for the mouse");
+        let mods = crate::terminal::MouseMods::default();
+        let top = mode(&editor.lock()).unwrap().screen_top;
+        assert!(editor.lock().terminal_mouse(buffer, crate::terminal::MouseAction::Press(0), top + 2, 4, mods));
+        // Column 5, row 3 (1-based), left button down.
+        assert!(
+            pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("[<0;5;3M")),
+            "{}",
+            editor.lock().buffer().text()
+        );
+    }
+
+    #[test]
+    fn line_numbers_are_set_from_lua_and_toggled() {
+        let (mut lisp, editor) = lisp_with("one\ntwo\n");
+        assert_eq!(editor.lock().line_numbers, "off");
+        lisp.eval_lua("vmac.set_line_numbers('on')").unwrap();
+        assert_eq!(editor.lock().line_numbers, "on");
+        typed(&mut lisp, " tl");
+        assert_eq!(editor.lock().line_numbers, "relative");
+        typed(&mut lisp, " tl");
+        assert_eq!(editor.lock().line_numbers, "off");
+        lisp.eval_lua("vmac.set_line_numbers('sideways')").unwrap();
+        assert_eq!(editor.lock().line_numbers, "off", "unknown modes are refused");
     }
 
     /// vmac on a file served by the fake language server (lsp.rs's tests).

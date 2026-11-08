@@ -73,7 +73,7 @@
         (list "SPC p d" 'project-forget-command) (list "SPC f P" 'open-config)
         (list "SPC o p" 'tree-toggle) (list "SPC o P" 'tree-open)
         (list "SPC o t" 'terminal-toggle) (list "SPC o T" 'terminal-new)
-        (list "SPC h F" 'font-picker) (list "SPC h t" 'theme-picker)
+        (list "SPC h F" 'font-picker) (list "SPC h m" 'package-manager) (list "SPC h t" 'theme-picker)
         (list "SPC m a" 'table-align) (list "SPC m p" 'markdown-preview)
         (list "SPC t m" 'markdown-conceal)
         ;; Language servers

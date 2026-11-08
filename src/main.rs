@@ -8,6 +8,7 @@ mod editor;
 mod lisp;
 mod lsp;
 mod markdown;
+mod packages;
 mod picker;
 mod review;
 mod sessions;
@@ -39,6 +40,8 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // Opening a file installs its language server and grammar; init files can turn it off.
+            packages::set_auto_install(true);
             shell::bind_keys(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

@@ -4,6 +4,13 @@
 ;; server starts when a file of its language opens, one per project.
 ;; Errors and warnings are underlined; ]d and [d jump between them, SPC c x
 ;; lists them. Change this list to use other servers.
+;;
+;; A server that isn't installed is installed when its first file opens, as
+;; is the language's tree-sitter grammar (like Neovim's Mason): into
+;; ~/.local/share/vmac. SPC h m or :packages lists what vmac can install
+;; (RET installs or removes one); :install NAME and :uninstall NAME do it by
+;; name. (set-auto-install #f) in init.scm, or vmac.set_auto_install(false)
+;; in init.lua, installs only when asked.
 
 (define (lsp-servers)
   (list (list "rust" "rust-analyzer")
@@ -12,7 +19,27 @@
         (list "tsx" "typescript-language-server" "--stdio")
         (list "javascript" "typescript-language-server" "--stdio")
         (list "c" "clangd")
-        (list "go" "gopls")))
+        (list "cpp" "clangd")
+        (list "go" "gopls")
+        (list "lua" "lua-language-server")
+        (list "bash" "bash-language-server" "start")
+        (list "yaml" "yaml-language-server" "--stdio")
+        (list "html" "vscode-html-language-server" "--stdio")
+        (list "css" "vscode-css-language-server" "--stdio")
+        (list "json" "vscode-json-language-server" "--stdio")
+        (list "toml" "taplo" "lsp" "stdio")
+        (list "markdown" "marksman" "server")))
+
+;; :packages / SPC h m: everything vmac can install, ✓ when installed.
+(defcommand (package-manager)
+  (pick "Packages (RET installs, or removes an installed one)" (package-list) ""
+        (lambda (line)
+          (let ((name (package-name line)))
+            (if (package-installed? name)
+                (read-from-minibuffer (string-append "Remove " name "? (y/n) ")
+                  (lambda (answer)
+                    (if (contains? '("y" "yes") answer) (package-uninstall name) (message "kept"))))
+                (package-install name))))))
 
 ;; Completion: typing a word asks the server; the popup then narrows as you
 ;; type. . and : ask afresh (foo. std::); other characters close it.
