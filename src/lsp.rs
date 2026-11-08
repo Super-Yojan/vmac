@@ -34,6 +34,8 @@ pub struct Diagnostic {
     pub severity: u8,
     pub message: String,
     pub source: Option<String>,
+    /// As the server sent it: code actions send it back to ask for fixes.
+    pub raw: Value,
 }
 
 impl Diagnostic {
@@ -77,6 +79,12 @@ pub enum RequestKind {
     Hover,
     References,
     Completion,
+    Rename,
+    CodeActions,
+    /// codeAction/resolve: an action's edit, fetched when chosen.
+    ResolveAction,
+    /// workspace/executeCommand: the server acts (and may send edits).
+    ExecuteCommand,
 }
 
 /// A place in a file, as (line, UTF-16 column).
@@ -97,6 +105,64 @@ pub enum Reply {
     References(Vec<Location>),
     /// What could be typed at the cursor.
     Completion(Vec<CompletionItem>),
+    /// Edits to make, by file (rename, a code action, workspace/applyEdit).
+    Edit(WorkspaceEdit),
+    /// Fixes and refactorings for a place, as the server sent them.
+    CodeActions(Vec<Value>),
+    /// A chosen code action, with its edit filled in.
+    ResolvedAction(Value),
+}
+
+/// One replacement in a file: positions as (line, UTF-16 column).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextEdit {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub text: String,
+}
+
+/// Edits across files.
+pub type WorkspaceEdit = Vec<(PathBuf, Vec<TextEdit>)>;
+
+fn parse_text_edits(edits: &Value) -> Vec<TextEdit> {
+    edits
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|e| TextEdit {
+                    start: position(&e["range"]["start"]),
+                    end: position(&e["range"]["end"]),
+                    text: e["newText"].as_str().unwrap_or_default().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A WorkspaceEdit: `changes` (uri -> edits) or `documentChanges` (edits
+/// per document; file creates/renames/deletes are skipped).
+pub fn parse_workspace_edit(edit: &Value) -> WorkspaceEdit {
+    let mut out: WorkspaceEdit = Vec::new();
+    if let Some(changes) = edit["changes"].as_object() {
+        for (uri, edits) in changes {
+            if let Some(path) = uri_to_path(uri) {
+                out.push((path, parse_text_edits(edits)));
+            }
+        }
+    }
+    if let Some(docs) = edit["documentChanges"].as_array() {
+        for doc in docs {
+            if let Some(path) = doc["textDocument"]["uri"].as_str().and_then(uri_to_path) {
+                out.push((path, parse_text_edits(&doc["edits"])));
+            }
+        }
+    }
+    out
+}
+
+/// A code action's title (a bare Command has one too).
+pub fn action_title(action: &Value) -> String {
+    action["title"].as_str().unwrap_or("(untitled)").to_string()
 }
 
 /// One completion candidate.
@@ -429,8 +495,19 @@ impl Client {
                     "textDocument": {
                         "synchronization": { "didSave": true, "dynamicRegistration": false },
                         "publishDiagnostics": { "relatedInformation": false },
+                        "rename": { "prepareSupport": false },
+                        "codeAction": {
+                            "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [
+                                "", "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                                "refactor.rewrite", "source", "source.organizeImports" ] } },
+                            "resolveSupport": { "properties": ["edit"] },
+                            "dataSupport": true,
+                        },
                     },
-                    "workspace": { "configuration": true, "workspaceFolders": true },
+                    "workspace": {
+                        "configuration": true, "workspaceFolders": true, "applyEdit": true,
+                        "workspaceEdit": { "documentChanges": true },
+                    },
                     "window": { "workDoneProgress": true },
                 },
             },
@@ -454,6 +531,19 @@ impl Client {
         }
     }
 
+    /// Sends a request with its own params; the answer comes back as `kind`.
+    fn send(&mut self, kind: RequestKind, method: &str, params: Value) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.pending.insert(id, kind);
+        if self.ready {
+            self.write(&message);
+        } else {
+            self.queued.push(message);
+        }
+    }
+
     fn request(&mut self, kind: RequestKind, path: &Path, position: (usize, usize)) {
         let id = self.next_id;
         self.next_id += 1;
@@ -462,6 +552,7 @@ impl Client {
             RequestKind::Hover => "textDocument/hover",
             RequestKind::References => "textDocument/references",
             RequestKind::Completion => "textDocument/completion",
+            _ => return, // these go through `send`, with their own params
         };
         let mut params = json!({
             "textDocument": { "uri": path_to_uri(path) },
@@ -571,6 +662,17 @@ impl Lsp {
             .find(|c| c.open.contains_key(path))
             .ok_or_else(|| "No language server for this file".to_string())?;
         client.request(kind, path, position);
+        Ok(())
+    }
+
+    /// Sends a request with its own params to the server that has `path` open.
+    pub fn send(&mut self, path: &Path, kind: RequestKind, method: &str, params: Value) -> Result<(), String> {
+        let client = self
+            .clients
+            .iter_mut()
+            .find(|c| c.open.contains_key(path))
+            .ok_or_else(|| "No language server for this file".to_string())?;
+        client.send(kind, method, params);
         Ok(())
     }
 
@@ -689,6 +791,10 @@ fn handle(
             RequestKind::Hover => Reply::Hover(if result.is_null() { None } else { parse_hover(result) }),
             RequestKind::References => Reply::References(parse_locations(result)),
             RequestKind::Completion => Reply::Completion(parse_completions(result)),
+            RequestKind::Rename => Reply::Edit(parse_workspace_edit(result)),
+            RequestKind::CodeActions => Reply::CodeActions(result.as_array().cloned().unwrap_or_default()),
+            RequestKind::ResolveAction => Reply::ResolvedAction(result.clone()),
+            RequestKind::ExecuteCommand => return false,
         });
         return true;
     }
@@ -709,6 +815,10 @@ fn handle(
     // Requests from the server need an answer, or some servers wait forever.
     if let (Some(id), false) = (id, method.is_empty()) {
         let result = match method.as_str() {
+            "workspace/applyEdit" => {
+                replies.push(Reply::Edit(parse_workspace_edit(&message["params"]["edit"])));
+                json!({ "applied": true })
+            }
             "workspace/configuration" => {
                 let n = message["params"]["items"].as_array().map_or(0, Vec::len);
                 Value::Array(vec![Value::Null; n])
@@ -733,6 +843,7 @@ fn handle(
                             severity: d["severity"].as_u64().unwrap_or(1) as u8,
                             message: d["message"].as_str().unwrap_or_default().to_string(),
                             source: d["source"].as_str().map(str::to_string),
+                            raw: d.clone(),
                         })
                         .collect()
                 })
@@ -785,7 +896,7 @@ pub(crate) mod tests {
         assert_eq!(utf16_to_char(&rope, (0, 99)), 3, "clamped to the line's end");
         assert_eq!(utf16_to_char(&rope, (1, 1)), 5);
         assert_eq!(utf16_to_char(&rope, (9, 0)), rope.len_chars());
-        let d = Diagnostic { start: (1, 1), end: (1, 1), severity: 1, message: "m".into(), source: None };
+        let d = Diagnostic { start: (1, 1), end: (1, 1), severity: 1, message: "m".into(), source: None, raw: Value::Null };
         assert_eq!(d.to_chars(&rope), (5, 6), "an empty range covers one character");
     }
 
@@ -827,6 +938,30 @@ while True:
             {"label": "greeting", "kind": 6, "detail": "str", "sortText": "1"},
             {"label": "great()", "kind": 3, "insertText": "great(${1:n})$0", "insertTextFormat": 2, "sortText": "2"},
             {"label": "other", "kind": 6, "sortText": "3"}]}})
+    elif method == "textDocument/rename":
+        uri = m["params"]["textDocument"]["uri"]
+        name = m["params"]["newName"]
+        edit = lambda l, c: {"range": {"start": {"line": l, "character": c}, "end": {"line": l, "character": c + 1}}, "newText": name}
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"changes": {uri: [edit(1, 4), edit(2, 0)]}}})
+    elif method == "textDocument/codeAction":
+        uri = m["params"]["textDocument"]["uri"]
+        got = len(m["params"]["context"]["diagnostics"])
+        at = lambda l, c, t: {"range": {"start": {"line": l, "character": c}, "end": {"line": l, "character": c}}, "newText": t}
+        send({"jsonrpc": "2.0", "id": m["id"], "result": [
+            {"title": "Add semicolon (%d diagnostics)" % got, "kind": "quickfix",
+             "edit": {"documentChanges": [{"textDocument": {"uri": uri, "version": None}, "edits": [at(1, 9, ";")]}]}},
+            {"title": "Resolve me", "data": {"uri": uri}},
+            {"title": "Run a command", "command": "fake.run", "arguments": [uri]}]})
+    elif method == "codeAction/resolve":
+        uri = m["params"]["data"]["uri"]
+        action = dict(m["params"])
+        action["edit"] = {"changes": {uri: [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// resolved\n"}]}}
+        send({"jsonrpc": "2.0", "id": m["id"], "result": action})
+    elif method == "workspace/executeCommand":
+        uri = m["params"]["arguments"][0]
+        send({"jsonrpc": "2.0", "id": 500, "method": "workspace/applyEdit", "params": {"edit": {"changes": {uri: [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// ran\n"}]}}}})
+        send({"jsonrpc": "2.0", "id": m["id"], "result": None})
     elif method == "textDocument/hover":
         line = m["params"]["position"]["line"]
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown",
@@ -988,6 +1123,42 @@ while True:
         );
     }
 
+    /// Against the real pyright: `cargo test -- --ignored pyright`.
+    #[test]
+    #[ignore]
+    fn pyright_renames_across_uses() {
+        let dir = std::env::temp_dir().join(format!("gmacs-pyright-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.py");
+        let text = "def greeting():\n    pass\n\ngreeting()\n";
+        std::fs::write(&file, text).unwrap();
+        let mut lsp = Lsp::default();
+        lsp.set_configs(vec![ServerConfig {
+            language: "python".into(),
+            command: "pyright-langserver".into(),
+            args: vec!["--stdio".into()],
+        }]);
+        let docs = vec![Doc { path: file.clone(), language: "python", revision: 0, saves: 0, text: Rope::from_str(text) }];
+        lsp.pump(&docs, |_| dir.clone());
+        let params = json!({ "textDocument": { "uri": path_to_uri(&file) },
+                             "position": { "line": 3, "character": 2 }, "newName": "hello" });
+        lsp.send(&file, RequestKind::Rename, "textDocument/rename", params).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..200 {
+            lsp.pump(&docs, |_| dir.clone());
+            replies.extend(lsp.take_replies());
+            if !replies.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        let Some(Reply::Edit(edit)) = replies.first() else { panic!("{replies:?}") };
+        let edits: usize = edit.iter().map(|(_, e)| e.len()).sum();
+        assert_eq!(edits, 2, "the definition and the call: {edit:?}");
+        assert!(edit.iter().flat_map(|(_, e)| e).all(|e| e.text == "hello"));
+    }
+
     /// Against the real rust-analyzer: `cargo test -- --ignored rust_analyzer`.
     #[test]
     #[ignore]
@@ -1033,6 +1204,20 @@ while True:
         let rope = Rope::from_str("a😀b\nxyz");
         assert_eq!(char_to_utf16(&rope, 2), (0, 3), "b comes after two UTF-16 units of emoji");
         assert_eq!(char_to_utf16(&rope, 5), (1, 1));
+    }
+
+    #[test]
+    fn workspace_edits_parse_both_forms() {
+        let changes = json!({ "changes": { "file:///a.rs": [
+            { "range": { "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 5 } }, "newText": "x" } ] } });
+        assert_eq!(
+            parse_workspace_edit(&changes),
+            vec![(PathBuf::from("/a.rs"), vec![TextEdit { start: (1, 2), end: (1, 5), text: "x".into() }])]
+        );
+        let docs = json!({ "documentChanges": [
+            { "textDocument": { "uri": "file:///b.rs", "version": 3 }, "edits": [] },
+            { "kind": "create", "uri": "file:///new.rs" } ] });
+        assert_eq!(parse_workspace_edit(&docs), vec![(PathBuf::from("/b.rs"), vec![])], "file creation skipped");
     }
 
     #[test]

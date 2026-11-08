@@ -6,7 +6,8 @@
 //! is never contended; it is only there to satisfy the bounds.
 
 use crate::buffer::Buffer;
-use crate::lsp::{CompletionItem, Diagnostic, Doc, Location, Lsp, Reply, RequestKind, ServerConfig};
+use crate::lsp::{CompletionItem, Diagnostic, Doc, Location, Lsp, Reply, RequestKind, ServerConfig, WorkspaceEdit};
+use serde_json::{Value, json};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use crate::picker::Picker;
@@ -71,6 +72,10 @@ impl Completion {
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         self.shown = scored.into_iter().map(|(_, i)| i).collect();
     }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn is_word_char(c: char) -> bool {
@@ -201,6 +206,8 @@ pub struct EditorState {
     jumps: Vec<(BufferId, usize)>,
     /// The completion popup while typing, if open.
     pub completion: Option<Completion>,
+    /// The code actions SPC c a last offered, as the server sent them.
+    code_actions: Vec<Value>,
     /// Things for Scheme to handle (a function name and its arguments),
     /// raised where Rust can't call Scheme (server replies).
     events: Vec<(String, Vec<String>)>,
@@ -230,6 +237,7 @@ impl EditorState {
             hover: None,
             jumps: Vec::new(),
             completion: None,
+            code_actions: Vec::new(),
             events: Vec::new(),
             search_cache: None,
         }
@@ -654,6 +662,116 @@ impl EditorState {
         }
     }
 
+    /// Asks the server to rename what's under the point everywhere.
+    pub fn lsp_rename(&mut self, new_name: &str) {
+        let Some(path) = self.buffer().file().cloned() else {
+            self.message = "This buffer has no file".into();
+            return;
+        };
+        self.lsp_sync();
+        let (line, character) = crate::lsp::char_to_utf16(self.buffer().text(), self.buffer().point());
+        let params = json!({ "textDocument": { "uri": crate::lsp::path_to_uri(&path) },
+                             "position": { "line": line, "character": character }, "newName": new_name });
+        if let Err(e) = self.lsp.send(&path, RequestKind::Rename, "textDocument/rename", params) {
+            self.message = e;
+        }
+    }
+
+    /// Asks for code actions for `start..end` (the cursor, or a selection),
+    /// sending the diagnostics there so the server can offer fixes.
+    pub fn lsp_code_actions(&mut self, start: usize, end: usize) {
+        let Some(path) = self.buffer().file().cloned() else {
+            self.message = "This buffer has no file".into();
+            return;
+        };
+        self.lsp_sync();
+        let rope = self.buffer().text();
+        let (a, b) = (crate::lsp::char_to_utf16(rope, start), crate::lsp::char_to_utf16(rope, end));
+        let line_of = |p: usize| rope.char_to_line(p.min(rope.len_chars()));
+        let (first, last) = (line_of(start), line_of(end));
+        let diagnostics: Vec<Value> = self
+            .lsp
+            .diagnostics(&path)
+            .iter()
+            .filter(|d| d.start.0 <= last && d.end.0 >= first)
+            .map(|d| d.raw.clone())
+            .collect();
+        let params = json!({
+            "textDocument": { "uri": crate::lsp::path_to_uri(&path) },
+            "range": { "start": { "line": a.0, "character": a.1 }, "end": { "line": b.0, "character": b.1 } },
+            "context": { "diagnostics": diagnostics, "triggerKind": 1 } });
+        if let Err(e) = self.lsp.send(&path, RequestKind::CodeActions, "textDocument/codeAction", params) {
+            self.message = e;
+        }
+    }
+
+    /// Carries out the code action at `index` of the last offered: applies
+    /// its edit, runs its command, or first asks the server for its edit.
+    pub fn apply_code_action(&mut self, index: usize) {
+        let Some(action) = self.code_actions.get(index).cloned() else { return };
+        let Some(path) = self.buffer().file().cloned() else { return };
+        let has_edit = action["edit"].is_object();
+        // A bare Command has "command" as a string; a CodeAction may carry one as an object.
+        let command = if action["command"].is_string() { Some(action.clone()) } else { action.get("command").cloned() };
+        if !has_edit && command.is_none() && action.get("data").is_some() {
+            let _ = self.lsp.send(&path, RequestKind::ResolveAction, "codeAction/resolve", action);
+            return;
+        }
+        if has_edit {
+            let edit = crate::lsp::parse_workspace_edit(&action["edit"]);
+            self.apply_workspace_edit(&edit);
+        }
+        if let Some(command) = command.filter(|c| c["command"].is_string()) {
+            let params = json!({ "command": command["command"], "arguments": command["arguments"].clone() });
+            let _ = self.lsp.send(&path, RequestKind::ExecuteCommand, "workspace/executeCommand", params);
+        }
+    }
+
+    /// The buffer for a file, loading it (without showing it) if needed.
+    fn file_buffer(&mut self, path: &Path) -> Option<BufferId> {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canonical(path);
+        if let Some((id, _)) = self.buffers.iter().find(|(_, b)| b.file().is_some_and(|f| canonical(f) == want)) {
+            return Some(*id);
+        }
+        Buffer::from_file(path.to_path_buf()).ok().map(|b| self.add_buffer(b))
+    }
+
+    /// Makes edits across files: each file's edits are one undo step, applied
+    /// from the end back so positions stay valid. Edited files stay unsaved.
+    pub fn apply_workspace_edit(&mut self, edit: &WorkspaceEdit) {
+        let mut files = 0;
+        let mut count = 0;
+        for (path, edits) in edit {
+            if edits.is_empty() {
+                continue;
+            }
+            let Some(id) = self.file_buffer(path) else {
+                self.message = format!("couldn't open {}", path.display());
+                continue;
+            };
+            let Some((_, buffer)) = self.buffers.iter_mut().find(|(b, _)| *b == id) else { continue };
+            buffer.undo_boundary();
+            let rope = buffer.text().clone();
+            let mut ranges: Vec<(usize, usize, &str)> = edits
+                .iter()
+                .map(|e| {
+                    let a = crate::lsp::utf16_to_char(&rope, e.start);
+                    (a, crate::lsp::utf16_to_char(&rope, e.end).max(a), e.text.as_str())
+                })
+                .collect();
+            ranges.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)));
+            for (a, b, text) in ranges {
+                buffer.replace(a, b, text);
+            }
+            files += 1;
+            count += edits.len();
+        }
+        if files > 0 {
+            self.message = format!("{count} edit{} in {files} file{}", plural(count), plural(files));
+        }
+    }
+
     /// Asks for completions at the point, saying nothing when there's no
     /// server (it happens on every word character typed).
     pub fn lsp_complete(&mut self) {
@@ -788,6 +906,33 @@ impl EditorState {
                         self.goto_location(&items[0]);
                     }
                     _ => self.events.push(("lsp-show-references".into(), items)),
+                }
+            }
+            Reply::Edit(edit) => {
+                if edit.iter().all(|(_, e)| e.is_empty()) {
+                    self.message = "Nothing to change".into();
+                } else {
+                    self.apply_workspace_edit(&edit);
+                }
+            }
+            Reply::CodeActions(actions) => {
+                if actions.is_empty() {
+                    self.message = "No code actions here".into();
+                } else {
+                    let titles = actions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| format!("{}. {}", i + 1, crate::lsp::action_title(a)))
+                        .collect();
+                    self.code_actions = actions;
+                    self.events.push(("lsp-show-code-actions".into(), titles));
+                }
+            }
+            Reply::ResolvedAction(action) => {
+                if action["edit"].is_object() {
+                    self.apply_workspace_edit(&crate::lsp::parse_workspace_edit(&action["edit"]));
+                } else {
+                    self.message = "The server gave no edit for that action".into();
                 }
             }
             Reply::Completion(items) => {

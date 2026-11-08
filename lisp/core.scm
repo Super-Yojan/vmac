@@ -1379,6 +1379,28 @@
 (define (lsp-show-references items)
   (pick "References" items (project-root) (lambda (item) (goto-location item))))
 
+;; SPC c r: rename everywhere, starting from the current name.
+(defcommand (rename-symbol)
+  (let ((name (word-at-point)))
+    (read-from-minibuffer "Rename to: "
+      (lambda (new) (when (not (or (equal? new "") (equal? new name))) (lsp-rename new))))
+    (insert name)))
+
+;; SPC c a: fixes and refactorings for the cursor, or the selection.
+(defcommand (code-actions)
+  (if (visual?)
+      (let ((b (visual-bounds)))
+        (set! evil-state 'normal)
+        (lsp-code-actions (car b) (second b)))
+      (lsp-code-actions (point) (point))))
+
+;; "2. Title" -> the second action.
+(define (lsp-show-code-actions items)
+  (pick "Code actions" items ""
+        (lambda (item)
+          (let ((dot (let loop ((i 0)) (if (equal? (substring item i (+ i 1)) ".") i (loop (+ i 1))))))
+            (apply-code-action (- (string->number (substring item 0 dot)) 1))))))
+
 (defcommand (goto-definition) (lsp-goto-definition))
 (defcommand (find-references) (lsp-references))
 (defcommand (hover-documentation) (lsp-hover))
@@ -1472,6 +1494,7 @@
         ;; Language servers
         (list "] d" 'diagnostic-next) (list "[ d" 'diagnostic-previous)
         (list "g d" 'goto-definition) (list "g r" 'find-references)
+        (list "SPC c r" 'rename-symbol) (list "SPC c a" 'code-actions)
         (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
         (list "SPC c x" 'diagnostic-list)
         ;; Buffers
@@ -1507,7 +1530,7 @@
         (list "p" 'visual-paste) (list "ESC" 'exit-visual) (list ":" 'ex)
         (list "C-d" 'scroll-half-down) (list "C-u" 'scroll-half-up)
         (list "C-f" 'scroll-page-down) (list "C-b" 'scroll-page-up)
-        (list "z z" 'recenter-center)))
+        (list "z z" 'recenter-center) (list "SPC c a" 'code-actions)))
 
 (define-key operator-map "ESC" 'keyboard-quit)
 

@@ -247,6 +247,29 @@ impl Buffer {
         removed
     }
 
+    /// Replaces `start..end` with `text` without moving the cursor along
+    /// (unlike `insert`): a point after the range shifts by the change in
+    /// length, one inside it goes to its start.
+    pub fn replace(&mut self, start: usize, end: usize, text: &str) {
+        if self.read_only {
+            return;
+        }
+        let (a, b) = (start.min(self.len()), end.min(self.len()));
+        let (a, b) = (a.min(b), a.max(b));
+        let added = text.chars().count();
+        self.text.remove(a..b);
+        self.text.insert(a, text);
+        self.point = if self.point >= b {
+            self.point - (b - a) + added
+        } else if self.point > a {
+            a
+        } else {
+            self.point
+        };
+        self.goal_column = None;
+        self.touch();
+    }
+
     fn touch(&mut self) {
         self.revision += 1;
         self.modified = true;
@@ -428,6 +451,17 @@ mod tests {
         assert_eq!(b.faces().len(), 1);
         b.set_text("again");
         assert!(b.faces().is_empty(), "new text, no old faces");
+    }
+
+    #[test]
+    fn replace_keeps_the_cursor_in_place() {
+        let mut b = Buffer::new("t");
+        b.insert("let x = x + 1;");
+        b.goto_char(12); // on "1"
+        b.replace(8, 9, "count");
+        b.replace(4, 5, "count");
+        assert_eq!(b.text().to_string(), "let count = count + 1;");
+        assert_eq!(b.char_at(b.point()), "1", "the cursor stayed on the 1");
     }
 
     #[test]

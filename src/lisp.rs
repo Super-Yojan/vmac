@@ -608,6 +608,22 @@ fn register_primitives(engine: &mut Engine, editor: &Editor) {
     prim!(engine, editor, "lsp-hover", |s| s.lsp_request(crate::lsp::RequestKind::Hover));
     prim!(engine, editor, "lsp-references", |s| s.lsp_request(crate::lsp::RequestKind::References));
     prim!(engine, editor, "goto-location", |s, item: String| s.goto_location(&item));
+    prim!(engine, editor, "lsp-rename", |s, name: String| s.lsp_rename(&name));
+    prim!(engine, editor, "lsp-code-actions", |s, start: isize, end: isize| s
+        .lsp_code_actions(start.max(0) as usize, end.max(0) as usize));
+    prim!(engine, editor, "apply-code-action", |s, index: isize| s.apply_code_action(index.max(0) as usize));
+    prim!(engine, editor, "word-at-point", |s| {
+        let b = s.buffer();
+        let word = |p: usize| b.char_at(p).chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let (mut a, mut z) = (b.point(), b.point());
+        while a > 0 && word(a - 1) {
+            a -= 1;
+        }
+        while word(z) {
+            z += 1;
+        }
+        b.substring(a, z)
+    });
     // Completion while typing.
     prim!(engine, editor, "lsp-complete", |s| s.lsp_complete());
     prim!(engine, editor, "completion-active?", |s| s.completion.is_some());
@@ -1853,6 +1869,7 @@ mod tests {
             severity,
             message: message.into(),
             source: None,
+            raw: serde_json::Value::Null,
         };
         let abs = std::path::absolute(&path).unwrap();
         editor
@@ -2068,6 +2085,73 @@ mod tests {
         typed(&mut lisp, "a");
         lisp.dispatch_key("RET", "");
         assert_eq!(editor.lock().buffer().text().to_string(), "fn main() {}\ng o\n", "RET is a newline with no popup");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spc_c_r_renames_with_the_current_name_to_start_from() {
+        let (mut lisp, editor, dir) = with_fake_server("rename", "fn main() {}\nlet x = 1;\nx\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "jw");
+        typed(&mut lisp, " cr");
+        assert_eq!(editor.lock().minibuffer.text().to_string(), "x", "starts from the current name");
+        lisp.dispatch_key("DEL", "");
+        typed(&mut lisp, "count\n");
+        assert!(
+            pump_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("count")),
+            "the rename's edits arrived"
+        );
+        let st = editor.lock();
+        assert_eq!(st.buffer().text().to_string(), "fn main() {}\nlet count = 1;\ncount\n");
+        assert_eq!(st.message, "2 edits in 1 file");
+        drop(st);
+        typed(&mut lisp, "u");
+        assert_eq!(editor.lock().buffer().text().to_string(), "fn main() {}\nlet x = 1;\nx\n", "one undo step");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Opens SPC c a and picks the action titled starting with `prefix`.
+    fn pick_code_action(lisp: &mut Lisp, editor: &Editor, prefix: &str) {
+        typed(lisp, " ca");
+        assert!(pump_until(lisp, editor, |st| !st.take_events_peek().is_empty()), "actions came back");
+        lisp.run_events();
+        let titles: Vec<String> = {
+            let st = editor.lock();
+            let p = st.picker.as_ref().expect("code actions picker");
+            assert_eq!(p.title(), "Code actions");
+            p.matches().iter().map(|m| m.item.clone()).collect()
+        };
+        let index = titles.iter().position(|t| t[3..].starts_with(prefix)).unwrap_or_else(|| panic!("{titles:?}"));
+        for _ in 0..index {
+            lisp.dispatch_key("C-n", "");
+        }
+        lisp.dispatch_key("RET", "");
+    }
+
+    #[test]
+    fn spc_c_a_applies_an_action_with_its_edit() {
+        let (mut lisp, editor, dir) = with_fake_server("action", "fn main() {}\nlet x = 1\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        typed(&mut lisp, "gg");
+        pick_code_action(&mut lisp, &editor, "Add semicolon (1 diagnostics)");
+        assert_eq!(editor.lock().buffer().text().to_string(), "fn main() {}\nlet x = 1;\n", "the diagnostic there was sent along");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spc_c_a_resolves_or_runs_actions_without_an_edit() {
+        let (mut lisp, editor, dir) = with_fake_server("resolve", "fn main() {}\n");
+        assert!(pump_until(&mut lisp, &editor, |st| !st.buffer_diagnostics().is_empty()), "server up");
+        pick_code_action(&mut lisp, &editor, "Resolve me");
+        assert!(
+            pump_until(&mut lisp, &editor, |st| st.buffer().text().to_string().starts_with("// resolved\n")),
+            "asked for the edit, then applied it"
+        );
+        pick_code_action(&mut lisp, &editor, "Run a command");
+        assert!(
+            pump_until(&mut lisp, &editor, |st| st.buffer().text().to_string().starts_with("// ran\n")),
+            "the server ran it and sent the edit back"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
