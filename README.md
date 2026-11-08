@@ -3,7 +3,7 @@
 <p align="center">A modal (evil-style) editor on GPUI whose behavior is written in Steel
 Scheme and Lua, and can be redefined while it runs.</p>
 
-<p align="center"><a href="https://super-yojan.github.io/vmac/">Install and configure</a></p>
+<p align="center"><a href="https://super-yojan.dev/vmac/">Install and configure</a></p>
 
 vmac was called gmacs. Plugins that use `gmacs.*` in Lua still work (it's an
 alias of `vmac`), and `~/.config/gmacs/` is read while `~/.config/vmac/`
