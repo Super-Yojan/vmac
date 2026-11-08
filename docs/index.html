@@ -3,119 +3,184 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vmac: a modal editor you program in Scheme and Lua</title>
+<title>vmac: the editor you rewrite while you use it</title>
 <meta name="description" content="vmac is a modal, evil-style editor on GPUI whose behavior is written in Steel Scheme and Lua and can be redefined while it runs. Install it and configure it.">
 <link rel="icon" href="logo.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0d0f14;
-    --surface: #141720;
-    --raised: #1b1f2a;
-    --border: #262b38;
-    --text: #e6e8ee;
-    --muted: #9aa1b2;
-    --dim: #6b7285;
+    --bg: #0b0d12;
+    --surface: #12151d;
+    --raised: #191d27;
+    --border: #232836;
+    --border-strong: #2f3546;
+    --text: #e8eaf0;
+    --muted: #9aa1b3;
+    --dim: #646b80;
     --violet: #8b5cf6;
     --violet-soft: #c4b5fd;
     --teal: #5eead4;
+    --green: #86efac;
+    --blue: #93c5fd;
+    --yellow: #fcd34d;
+    --red: #fca5a5;
     --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
     --sans: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
   }
   * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font: 16px/1.65 var(--sans);
-    -webkit-font-smoothing: antialiased;
-  }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; }
   a { color: var(--violet-soft); text-decoration: none; }
   a:hover { text-decoration: underline; }
   code, kbd, pre { font-family: var(--mono); }
-  code { font-size: .9em; background: var(--raised); border: 1px solid var(--border); padding: .08em .38em; border-radius: 5px; }
-  kbd {
-    font-size: .82em; background: var(--raised); border: 1px solid var(--border);
-    border-bottom-width: 2px; padding: .1em .45em; border-radius: 5px; white-space: nowrap;
-  }
-  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  code { font-size: .88em; background: var(--raised); border: 1px solid var(--border); padding: .06em .36em; border-radius: 5px; }
+  kbd { font-size: .8em; background: var(--raised); border: 1px solid var(--border-strong); border-bottom-width: 2px; padding: .08em .42em; border-radius: 5px; white-space: nowrap; color: var(--text); }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  .eyebrow { font: 500 12px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--teal); }
 
   /* Header */
-  header {
-    position: sticky; top: 0; z-index: 10;
-    background: rgba(13, 15, 20, .82); backdrop-filter: blur(10px);
-    border-bottom: 1px solid var(--border);
-  }
+  header { position: sticky; top: 0; z-index: 20; background: rgba(11,13,18,.8); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); }
   header .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
-  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font: 700 18px var(--mono); }
-  .brand img { width: 28px; height: 28px; }
-  nav { display: flex; gap: 22px; font-size: 14px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font: 700 17px var(--mono); }
+  .brand:hover { text-decoration: none; }
+  .brand img { width: 26px; height: 26px; }
+  nav { display: flex; align-items: center; gap: 24px; font-size: 14px; }
   nav a { color: var(--muted); }
   nav a:hover { color: var(--text); text-decoration: none; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; border-radius: 9px; padding: 9px 16px; font: 600 14px var(--sans); border: 1px solid var(--border-strong); color: var(--text); background: var(--raised); }
+  .btn:hover { text-decoration: none; border-color: var(--violet); }
+  .btn.primary { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .btn.primary:hover { background: #fff; }
 
   /* Hero */
-  .hero { padding: 88px 0 56px; text-align: center; }
-  .hero img { width: 112px; height: 112px; }
-  .hero h1 { font: 700 clamp(40px, 7vw, 64px)/1.05 var(--mono); letter-spacing: -2px; margin: 22px 0 14px; }
-  .hero h1 span { color: var(--violet); }
-  .hero p.lead { color: var(--muted); font-size: 19px; max-width: 640px; margin: 0 auto 32px; }
-  .badges { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 18px; font-size: 13px; color: var(--dim); }
-  .badges span { border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; }
+  .hero { position: relative; padding: 84px 0 40px; text-align: center; overflow: hidden; }
+  .hero::before {
+    content: ""; position: absolute; inset: -20% 10% auto; height: 520px; pointer-events: none;
+    background: radial-gradient(closest-side, rgba(139,92,246,.20), transparent 70%);
+  }
+  .pill { display: inline-flex; gap: 8px; align-items: center; border: 1px solid var(--border-strong); background: var(--surface); border-radius: 999px; padding: 5px 14px 5px 6px; font-size: 13px; color: var(--muted); }
+  .pill b { background: var(--violet); color: #fff; font: 600 11px var(--mono); padding: 2px 8px; border-radius: 999px; }
+  .hero h1 { position: relative; font: 700 clamp(38px, 6.4vw, 68px)/1.04 var(--sans); letter-spacing: -.035em; margin: 22px auto 18px; max-width: 900px; }
+  .hero h1 em { font-style: normal; background: linear-gradient(90deg, var(--violet-soft), var(--violet)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lead { position: relative; color: var(--muted); font-size: 19px; max-width: 640px; margin: 0 auto 30px; }
+  .cta { position: relative; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; align-items: center; }
 
-  /* Command boxes */
-  .cmd {
-    display: flex; align-items: center; gap: 12px;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    padding: 14px 14px 14px 18px; text-align: left; max-width: 760px; margin: 0 auto;
-  }
-  .cmd pre { margin: 0; flex: 1; overflow-x: auto; font-size: 14px; color: var(--text); }
+  .cmd { display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 11px; padding: 8px 8px 8px 16px; text-align: left; min-width: 0; }
+  .cmd pre { margin: 0; flex: 1; overflow-x: auto; font-size: 13.5px; white-space: nowrap; scrollbar-width: none; }
   .cmd pre .p { color: var(--teal); user-select: none; }
-  .copy {
-    flex: none; font: 600 12px var(--sans); color: var(--muted); background: var(--raised);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; cursor: pointer;
-  }
+  .copy { flex: none; font: 600 12px var(--sans); color: var(--muted); background: var(--raised); border: 1px solid var(--border-strong); border-radius: 7px; padding: 6px 11px; cursor: pointer; }
   .copy:hover { color: var(--text); border-color: var(--violet); }
+  .hero .cmd { max-width: 560px; flex: 1 1 420px; }
+
+  /* The editor window */
+  .window {
+    position: relative; margin: 56px auto 0; max-width: 1040px; text-align: left;
+    background: #0f1118; border: 1px solid var(--border-strong); border-radius: 14px; overflow: hidden;
+    box-shadow: 0 40px 120px -20px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.02), 0 -30px 120px -40px rgba(139,92,246,.35);
+    font: 13px/20px var(--mono);
+  }
+  .titlebar { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; background: #151822; border-bottom: 1px solid var(--border); }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; }
+  .dot:nth-child(2) { background: #febc2e; } .dot:nth-child(3) { background: #28c840; }
+  .titlebar span { flex: 1; text-align: center; color: var(--dim); font-size: 12px; margin-right: 52px; }
+  .panes { display: grid; grid-template-columns: 200px 1fr 1fr; min-height: 360px; }
+  .pane { position: relative; display: flex; flex-direction: column; border-left: 1px solid var(--border); min-width: 0; }
+  .pane:first-child { border-left: 0; background: #12151e; }
+  .lines { flex: 1; padding: 10px 14px; white-space: pre; overflow: hidden; }
+  .ml { display: flex; gap: 14px; height: 24px; align-items: center; padding: 0 12px; border-top: 1px solid var(--border); background: #151822; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; }
+  .ml .st { color: var(--violet-soft); font-weight: 700; }
+  .ml .err { color: var(--red); }
+  .tree .lines { white-space: normal; }
+  .tree .row { padding: 0 14px; color: var(--muted); white-space: pre; }
+  .tree .row.dir { color: var(--blue); }
+  .tree .row.on { background: rgba(139,92,246,.18); color: var(--text); }
+  .kw { color: #c4b5fd; } .fn { color: var(--blue); } .str { color: var(--green); } .ty { color: var(--yellow); } .num { color: var(--teal); } .com { color: var(--dim); } .pun { color: var(--dim); }
+  .squiggle { text-decoration: underline wavy var(--red); text-underline-offset: 3px; }
+  .cur { background: var(--text); color: var(--bg); }
+  .complete { position: absolute; left: 132px; top: 152px; width: 250px; background: #1b1f2b; border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: 0 16px 40px rgba(0,0,0,.5); padding: 4px 0; font-size: 12px; }
+  .complete div { display: flex; justify-content: space-between; padding: 1px 10px; color: var(--muted); }
+  .complete div b { font-weight: 400; color: var(--text); }
+  .complete div i { font-style: normal; color: var(--violet-soft); }
+  .complete .sel { background: rgba(139,92,246,.25); }
+  .echo { height: 26px; display: flex; align-items: center; gap: 8px; padding: 0 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; }
+  .echo b { color: var(--red); font-weight: 500; }
+
+  .status { display: flex; gap: 28px; justify-content: center; flex-wrap: wrap; margin: 26px 0 0; font: 12px var(--mono); color: var(--dim); letter-spacing: .04em; }
+  .status span b { color: var(--teal); font-weight: 500; }
 
   /* Sections */
-  section { padding: 56px 0; border-top: 1px solid var(--border); }
-  section h2 { font: 700 28px var(--mono); letter-spacing: -.5px; margin: 0 0 8px; }
-  section h2 .n { color: var(--violet); margin-right: 10px; }
-  section > .wrap > p.sub { color: var(--muted); margin: 0 0 28px; max-width: 700px; }
-  h3 { font: 600 17px var(--sans); margin: 28px 0 10px; }
+  section { padding: 96px 0; }
+  .head { max-width: 680px; margin-bottom: 40px; }
+  .head h2 { font: 700 clamp(30px, 4vw, 42px)/1.1 var(--sans); letter-spacing: -.03em; margin: 10px 0 12px; }
+  .head p { color: var(--muted); font-size: 17px; margin: 0; }
 
-  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
-  .card h3 { margin-top: 0; }
-  .card p { color: var(--muted); margin: 6px 0 14px; font-size: 15px; }
-  .card .cmd { max-width: none; padding: 10px 10px 10px 14px; }
-  .card .cmd pre { font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* Feature bento */
+  .bento { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
+  .card { grid-column: span 2; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+  .card.wide { grid-column: span 3; }
+  .card h3 { font: 600 17px var(--sans); margin: 14px 0 0; }
+  .card p { color: var(--muted); font-size: 14.5px; margin: 0; }
+  .vis { background: #0f1118; border: 1px solid var(--border); border-radius: 10px; padding: 14px; font: 12.5px/1.75 var(--mono); white-space: pre; overflow: hidden; color: var(--muted); min-height: 128px; }
+  .keys-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .keys-row kbd { font-size: 13px; padding: .2em .55em; }
+  .keys-row .arrow { color: var(--dim); }
+  .hover-doc { background: #1b1f2b; border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 10px; margin-top: 8px; font-family: var(--sans); white-space: normal; color: var(--text); line-height: 1.5; }
+  .hover-doc code { background: transparent; border: 0; padding: 0; color: var(--blue); }
 
-  pre.code {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    padding: 16px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; margin: 0 0 8px;
-  }
-  .c { color: var(--dim); }
-  .s { color: #86efac; }
-  .k { color: var(--violet-soft); }
-  .f { color: #93c5fd; }
+  /* Steps */
+  .steps { display: grid; grid-template-columns: 1fr 1.25fr; gap: 40px; align-items: start; }
+  .step-list { border-top: 1px solid var(--border); }
+  .step { display: block; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--border); padding: 18px 0; color: var(--muted); cursor: pointer; font: inherit; }
+  .step .t { display: flex; justify-content: space-between; align-items: baseline; font: 600 18px var(--sans); color: var(--muted); }
+  .step .t i { font: 500 12px var(--mono); font-style: normal; color: var(--dim); }
+  .step .d { display: none; margin-top: 8px; font-size: 15px; }
+  .step.on .t { color: var(--text); }
+  .step.on .t i { color: var(--violet-soft); }
+  .step.on .d { display: block; }
+  .panel { position: sticky; top: 90px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
+  .panel .bar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); font: 12px var(--mono); color: var(--dim); }
+  .panel pre { margin: 0; padding: 18px 20px; font: 13px/1.7 var(--mono); overflow-x: auto; min-height: 270px; }
+  .panel pre[hidden] { display: none; }
+  .c { color: var(--dim); } .s { color: var(--green); } .k { color: var(--violet-soft); } .f { color: var(--blue); } .p { color: var(--teal); }
 
-  table.keys { width: 100%; border-collapse: collapse; font-size: 14.5px; }
-  table.keys td { padding: 7px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
-  table.keys td:first-child { width: 42%; padding-right: 16px; }
+  /* Keys */
+  .grid3 { display: grid; gap: 16px; grid-template-columns: repeat(3, 1fr); }
+  table.keys { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.keys td { padding: 7px 0; border-bottom: 1px solid var(--border); vertical-align: top; color: var(--muted); }
+  table.keys td:first-child { width: 1%; white-space: nowrap; padding-right: 18px; color: var(--text); }
   table.keys tr:last-child td { border-bottom: 0; }
+  .tcard { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px 22px; }
+  .tcard h3 { margin: 0 0 8px; font: 600 15px var(--sans); color: var(--muted); }
 
-  .note { color: var(--muted); font-size: 14.5px; border-left: 2px solid var(--violet); padding: 2px 0 2px 14px; margin: 18px 0 0; }
+  /* Closing CTA */
+  .closing { text-align: center; padding: 100px 0 110px; border-top: 1px solid var(--border); background: radial-gradient(60% 80% at 50% 100%, rgba(139,92,246,.14), transparent 70%); }
+  .closing img { width: 64px; height: 64px; }
+  .closing h2 { font: 700 clamp(30px, 4vw, 44px)/1.1 var(--sans); letter-spacing: -.03em; margin: 18px 0 12px; }
+  .closing p { color: var(--muted); margin: 0 0 28px; }
+  .closing .cmd { max-width: 640px; margin: 0 auto; }
 
-  footer { border-top: 1px solid var(--border); padding: 36px 0 56px; color: var(--dim); font-size: 14px; }
+  footer { border-top: 1px solid var(--border); padding: 28px 0 40px; color: var(--dim); font-size: 13.5px; }
   footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 
+  @media (max-width: 960px) {
+    .panes { grid-template-columns: 1fr 1fr; }
+    .pane.side { display: none; }
+    .bento { grid-template-columns: 1fr 1fr; }
+    .card, .card.wide { grid-column: span 1; }
+    .steps { grid-template-columns: 1fr; }
+    .panel { position: static; }
+    .grid3 { grid-template-columns: 1fr; }
+  }
   @media (max-width: 640px) {
-    nav { display: none; }
+    nav a:not(.btn) { display: none; }
     .hero { padding-top: 56px; }
-    table.keys td:first-child { width: 48%; }
+    .panes { grid-template-columns: 1fr; }
+    .pane.second { display: none; }
+    .complete { left: 90px; }
+    .bento { grid-template-columns: 1fr; }
+    section { padding: 72px 0; }
   }
 </style>
 </head>
@@ -125,201 +190,257 @@
   <div class="wrap">
     <a class="brand" href="#"><img src="logo.svg" alt="">vmac</a>
     <nav>
-      <a href="#install">Install</a>
+      <a href="#features">Features</a>
+      <a href="#start">Get started</a>
       <a href="#keys">Keys</a>
-      <a href="#configure">Configure</a>
-      <a href="#plugins">Plugins</a>
-      <a href="https://github.com/Super-Yojan/vmac">GitHub</a>
+      <a class="btn" href="https://github.com/Super-Yojan/vmac">GitHub</a>
     </nav>
   </div>
 </header>
 
 <main>
-  <div class="hero wrap">
-    <img src="logo.svg" alt="vmac logo">
-    <h1>v<span>mac</span></h1>
-    <p class="lead">A modal, evil-style editor on GPUI. Its behavior is written in Steel Scheme and
-      Lua, and every part of it can be redefined while it runs.</p>
-    <div class="cmd">
-      <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh</pre>
-      <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh">Copy</button>
+  <div class="hero">
+    <div class="wrap">
+      <span class="pill"><b>v0.0.1</b> Open source · macOS</span>
+      <h1>The editor you <em>rewrite</em> while you use it.</h1>
+      <p class="lead">vmac is a modal, Vim-style editor on GPUI. Every command, key and panel is written in
+        Steel Scheme or Lua, and you can redefine any of it without restarting.</p>
+      <div class="cta">
+        <div class="cmd">
+          <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh</pre>
+          <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh">Copy</button>
+        </div>
+        <a class="btn" href="#start">Get started</a>
+      </div>
+
+      <!-- vmac, drawn from its real interface: tree, two windows, a completion popup, modelines, echo area -->
+      <div class="window" role="img" aria-label="vmac with a file tree, a Rust file and its completion popup, and a Lua config">
+        <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>vmac — main.rs</span></div>
+        <div class="panes">
+          <div class="pane side tree">
+            <div class="lines" style="padding:10px 0">
+<div class="row">vmac</div><div class="row dir">▾ src/</div><div class="row">    editor.rs</div><div class="row on">    main.rs</div><div class="row">    lsp.rs</div><div class="row dir">▸ lisp/</div><div class="row dir">▸ examples/</div><div class="row">  Cargo.toml</div><div class="row">  README.md</div></div>
+            <div class="ml">*tree*</div>
+          </div>
+          <div class="pane">
+<div class="lines"><span class="kw">use</span> <span class="ty">editor</span><span class="pun">::</span><span class="ty">Editor</span><span class="pun">;</span>
+
+<span class="com">/// Opens the file given, else a scratch buffer.</span>
+<span class="kw">fn</span> <span class="fn">main</span><span class="pun">() {</span>
+    <span class="kw">let</span> path <span class="pun">=</span> std<span class="pun">::</span>env<span class="pun">::</span><span class="fn">args</span><span class="pun">().</span><span class="fn">nth</span><span class="pun">(</span><span class="num">1</span><span class="pun">);</span>
+    <span class="kw">let</span> editor <span class="pun">=</span> <span class="ty">Editor</span><span class="pun">::</span><span class="fn">new</span><span class="pun">(</span><span class="squiggle">pth</span><span class="pun">);</span>
+    editor<span class="pun">.</span><span class="fn">ope</span><span class="cur"> </span>
+<span class="pun">}</span>
+</div>
+            <div class="complete">
+              <div class="sel"><b>open_file</b><i>method</i></div>
+              <div><b>only_window</b><i>method</i></div>
+              <div><b>other_window</b><i>method</i></div>
+            </div>
+            <div class="ml"><span class="st">INSERT</span><span>main.rs</span><span>7:15</span><span>rust</span><span class="err">E1</span></div>
+          </div>
+          <div class="pane second">
+<div class="lines"><span class="com">-- ~/.config/vmac/init.lua</span>
+vmac.<span class="fn">command</span>(<span class="str">"insert-date"</span>, <span class="kw">function</span>()
+  vmac.<span class="fn">insert</span>(os.<span class="fn">date</span>(<span class="str">"%F"</span>))
+<span class="kw">end</span>)
+vmac.<span class="fn">map</span>(<span class="str">"normal"</span>, <span class="str">"SPC i d"</span>, <span class="str">"insert-date"</span>)
+
+vmac.hooks.modeline = <span class="kw">function</span>()
+  <span class="kw">return</span> { { vmac.<span class="fn">buffer_name</span>(), <span class="str">"strong"</span> } }
+<span class="kw">end</span>
+</div>
+            <div class="ml"><span>init.lua</span><span>9:4</span><span>lua</span></div>
+          </div>
+        </div>
+        <div class="echo"><b>error:</b> cannot find value `pth` in this scope</div>
+      </div>
+
+      <div class="status">
+        <span>SCHEME <b>LOADED</b></span><span>LUA <b>LOADED</b></span><span>LSP <b>RUST-ANALYZER</b></span><span>PLUGINS <b>3</b></span><span>RELOAD <b>ON SAVE</b></span>
+      </div>
     </div>
-    <div class="badges"><span>v0.0.1</span><span>macOS</span><span>Rust · GPUI</span><span>Scheme + Lua</span></div>
   </div>
 
-  <section id="install">
+  <section id="features">
     <div class="wrap">
-      <h2><span class="n">01</span>Install</h2>
-      <p class="sub">vmac builds from source with Rust's <code>cargo</code>. Get it from
-        <a href="https://rustup.rs">rustup.rs</a> if you don't have it; the build takes a few minutes.</p>
-      <div class="grid">
-        <div class="card">
-          <h3>The installer</h3>
-          <p>Builds the v0.0.1 release with cargo and makes <code>~/.config/vmac/</code>.</p>
-          <div class="cmd">
-            <pre>curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh</pre>
-            <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh">Copy</button>
-          </div>
-        </div>
-        <div class="card">
-          <h3>With cargo</h3>
-          <p>The same build, by hand. vmac lands in <code>~/.cargo/bin</code>.</p>
-          <div class="cmd">
-            <pre>cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.1 --locked</pre>
-            <button class="copy" data-copy="cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.1 --locked">Copy</button>
-          </div>
-        </div>
-        <div class="card">
-          <h3>From a checkout</h3>
-          <p>For hacking on vmac: edits to <code>lisp/core/</code> reload as you save.</p>
-          <div class="cmd">
-            <pre>git clone https://github.com/Super-Yojan/vmac && cd vmac && cargo run -- README.md</pre>
-            <button class="copy" data-copy="git clone https://github.com/Super-Yojan/vmac && cd vmac && cargo run -- README.md">Copy</button>
-          </div>
-        </div>
+      <div class="head">
+        <span class="eyebrow">What's inside</span>
+        <h2>Vim's keys. Emacs's soul. A GPU underneath.</h2>
+        <p>The core is small Rust: buffers, windows, language servers and drawing. Everything you touch is
+          Scheme you can read in <code>lisp/core/</code> and change from your config.</p>
       </div>
-      <p class="note">Then open a file with <code>vmac FILE</code>. Optional extras: a Nerd Font
-        (for terminal icons), language servers such as <code>rust-analyzer</code> or
-        <code>pyright</code>, and <code>fish</code>, which terminals use when it's installed.</p>
-    </div>
-  </section>
+      <div class="bento">
+        <div class="card wide">
+          <div class="vis"><div class="keys-row"><kbd>c</kbd><kbd>i</kbd><kbd>"</kbd><span class="arrow">→</span><span style="color:var(--text)">change inside quotes</span></div><div class="keys-row"><kbd>V</kbd><kbd>j</kbd><kbd>&gt;</kbd><span class="arrow">→</span><span style="color:var(--text)">indent two lines</span></div><div class="keys-row"><kbd>C-v</kbd><kbd>j</kbd><kbd>j</kbd><kbd>I</kbd><span class="arrow">→</span><span style="color:var(--text)">type on every line</span></div><div class="keys-row" style="margin:0"><kbd>.</kbd><span class="arrow">→</span><span style="color:var(--text)">and again</span></div></div>
+          <h3>Real Vim editing</h3>
+          <p>Operators with motions and text objects, visual and block selection, search, <code>f</code>/<code>t</code>, counts and <code>.</code> repeat.</p>
+        </div>
+        <div class="card wide">
+          <div class="vis">    <span class="kw">let</span> editor <span class="pun">=</span> <span class="ty">Editor</span><span class="pun">::</span><span class="fn">new</span><span class="pun">(</span>path<span class="pun">);</span>
+<div class="hover-doc"><code>pub fn new(buffer: Buffer) -&gt; Editor</code><br>The editor's state, shared between the primitives and the window.</div></div>
+          <h3>Language servers</h3>
+          <p>Diagnostics, go to definition, hover docs, references, completion, rename, code actions and formatting, over LSP.</p>
+        </div>
+        <div class="card">
+          <div class="vis"><span class="p">❯</span> ls
+<span style="color:var(--blue)">src/</span>    <span style="color:var(--yellow)">Cargo.toml</span>
+<span style="color:var(--blue)">lisp/</span>   <span style="color:var(--text)">README.md</span>
+<span class="p">❯</span> <span class="cur"> </span></div>
+          <h3>Terminals</h3>
+          <p>On Ghostty's engine, with scrollback you can search. Backends plug in: run them in herdr-core.</p>
+        </div>
+        <div class="card">
+          <div class="vis"><span class="k">(defcommand</span> (<span class="f">zen</span>)
+  (delete-other-windows))
 
-  <section id="keys">
-    <div class="wrap">
-      <h2><span class="n">02</span>First steps</h2>
-      <p class="sub">It starts in normal state, like Vim. <kbd>SPC</kbd> is the leader, like Doom Emacs.</p>
-      <div class="grid">
-        <div class="card">
-          <h3>Editing</h3>
-          <table class="keys">
-            <tr><td><kbd>i</kbd> <kbd>a</kbd> <kbd>o</kbd> … <kbd>ESC</kbd></td><td>type, then back to normal</td></tr>
-            <tr><td><kbd>d</kbd> <kbd>c</kbd> <kbd>y</kbd> + motion</td><td><code>dw</code>, <code>ci"</code>, <code>y$</code>, <code>dap</code></td></tr>
-            <tr><td><kbd>v</kbd> <kbd>V</kbd> <kbd>C-v</kbd></td><td>visual, lines, block</td></tr>
-            <tr><td><kbd>/</kbd> <kbd>f</kbd> <kbd>t</kbd> <kbd>.</kbd></td><td>search, find a character, repeat</td></tr>
-            <tr><td><kbd>u</kbd> <kbd>C-r</kbd> <kbd>p</kbd></td><td>undo, redo, paste</td></tr>
-          </table>
+<span class="k">(define-key</span> normal-map
+  <span class="s">"SPC t z"</span> 'zen)</div>
+          <h3>Scheme or Lua</h3>
+          <p>Both get every primitive. Save your config and vmac reloads it; a mistake keeps the last good version.</p>
         </div>
         <div class="card">
-          <h3>Files, windows</h3>
-          <table class="keys">
-            <tr><td><kbd>SPC</kbd> <kbd>SPC</kbd></td><td>find a file (fuzzy, with preview)</td></tr>
-            <tr><td><kbd>SPC</kbd> <kbd>,</kbd></td><td>switch buffer</td></tr>
-            <tr><td><kbd>SPC</kbd> <kbd>o</kbd> <kbd>p</kbd></td><td>file tree</td></tr>
-            <tr><td><kbd>C-w</kbd> <kbd>v</kbd> / <kbd>s</kbd> / <kbd>hjkl</kbd></td><td>split, move between windows</td></tr>
-            <tr><td><kbd>SPC</kbd> <kbd>o</kbd> <kbd>t</kbd></td><td>terminal</td></tr>
-          </table>
-        </div>
-        <div class="card">
-          <h3>Code</h3>
-          <table class="keys">
-            <tr><td><kbd>g</kbd> <kbd>d</kbd> · <kbd>C-o</kbd></td><td>definition, back</td></tr>
-            <tr><td><kbd>K</kbd> · <kbd>g</kbd> <kbd>r</kbd></td><td>docs, references</td></tr>
-            <tr><td><kbd>SPC</kbd> <kbd>c</kbd> <kbd>r</kbd> / <kbd>a</kbd> / <kbd>f</kbd></td><td>rename, actions, format</td></tr>
-            <tr><td><kbd>]</kbd> <kbd>d</kbd> · <kbd>SPC</kbd> <kbd>c</kbd> <kbd>x</kbd></td><td>next error, list errors</td></tr>
-            <tr><td><kbd>:</kbd> · <kbd>SPC</kbd> <kbd>:</kbd></td><td>ex commands, run any command</td></tr>
-          </table>
+          <div class="vis"><span class="c">SPC h p</span>
+<span style="color:var(--text)">word-count</span>   <span class="s">loaded</span>
+<span style="color:var(--text)">zen</span>          <span class="s">loaded</span>
+<span style="color:var(--text)">herdr-term</span>   <span class="s">loaded</span>
+<span style="color:var(--text)">broken</span>       <span style="color:var(--red)">failed</span></div>
+          <h3>Plugins</h3>
+          <p>Folders of Scheme or Lua, installed from git. A broken one is skipped; the rest still load.</p>
         </div>
       </div>
     </div>
   </section>
 
-  <section id="configure">
+  <section id="start">
     <div class="wrap">
-      <h2><span class="n">03</span>Configure</h2>
-      <p class="sub">Everything lives in <code>~/.config/vmac/</code>. Write Scheme, Lua, or both:
-        they share the same commands, keys and primitives, and vmac reloads as you save.</p>
+      <div class="head">
+        <span class="eyebrow">Get started</span>
+        <h2>From install to your own editor.</h2>
+        <p>vmac builds with Rust's <code>cargo</code> (from <a href="https://rustup.rs">rustup.rs</a>); the first build takes a few minutes.</p>
+      </div>
+      <div class="steps">
+        <div class="step-list" role="tablist">
+          <button class="step on" data-step="0" role="tab" aria-selected="true">
+            <div class="t">Install <i>01</i></div>
+            <div class="d">The installer runs <code>cargo install</code> for the v0.0.1 release and makes <code>~/.config/vmac/</code>. Or run the cargo line yourself.</div>
+          </button>
+          <button class="step" data-step="1" role="tab" aria-selected="false">
+            <div class="t">Open a file <i>02</i></div>
+            <div class="d">It starts in normal state. <kbd>SPC</kbd> is the leader, like Doom Emacs: <kbd>SPC</kbd><kbd>SPC</kbd> finds files, <kbd>SPC</kbd><kbd>o</kbd><kbd>t</kbd> opens a terminal.</div>
+          </button>
+          <button class="step" data-step="2" role="tab" aria-selected="false">
+            <div class="t">Configure <i>03</i></div>
+            <div class="d">Write <code>init.lua</code> or <code>init.scm</code> in <code>~/.config/vmac/</code>. Add commands and keys, change the modeline, faces, font, language servers and terminal shell.</div>
+          </button>
+          <button class="step" data-step="3" role="tab" aria-selected="false">
+            <div class="t">Extend <i>04</i></div>
+            <div class="d">Install plugins from git, or write your own: a folder in <code>~/.config/vmac/plugins/</code>. <kbd>SPC</kbd><kbd>h</kbd><kbd>p</kbd> manages them.</div>
+          </button>
+        </div>
+        <div class="panel">
+          <div class="bar"><span id="panel-name">install</span></div>
+<pre data-panel="0"><span class="c"># the installer</span>
+<span class="p">$</span> curl -fsSL \
+    https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh
 
-      <h3>In Lua: <code>~/.config/vmac/init.lua</code></h3>
-<pre class="code"><span class="c">-- A command, and a key for it (SPC i d).</span>
+<span class="c"># or by hand</span>
+<span class="p">$</span> cargo install --git https://github.com/Super-Yojan/vmac \
+    --tag v0.0.1 --locked
+
+<span class="c"># optional: a Nerd Font, language servers, fish</span>
+<span class="p">$</span> brew install --cask font-jetbrains-mono-nerd-font
+<span class="p">$</span> rustup component add rust-analyzer</pre>
+<pre data-panel="1" hidden><span class="p">$</span> vmac src/main.rs
+
+<span class="c">i a o ... ESC     type, then back to normal</span>
+<span class="c">SPC SPC           find a file (fuzzy, previewed)</span>
+<span class="c">SPC o p           the file tree</span>
+<span class="c">C-w v / C-w s     split beside / below</span>
+<span class="c">g d · K · g r     definition, docs, references</span>
+<span class="c">:w  :q  :e FILE   as in Vim</span></pre>
+<pre data-panel="2" hidden><span class="c">-- ~/.config/vmac/init.lua</span>
 vmac.<span class="f">command</span>(<span class="s">"insert-date"</span>, <span class="k">function</span>()
   vmac.<span class="f">insert</span>(os.date(<span class="s">"%Y-%m-%d"</span>))
 <span class="k">end</span>)
 vmac.<span class="f">map</span>(<span class="s">"normal"</span>, <span class="s">"SPC i d"</span>, <span class="s">"insert-date"</span>)
 
-<span class="c">-- Replace the modeline: a list of {text, face}.</span>
-vmac.hooks.modeline = <span class="k">function</span>()
-  <span class="k">return</span> { { vmac.<span class="f">buffer_name</span>(), <span class="s">"strong"</span> }, { vmac.<span class="f">buffer_language</span>(), <span class="s">"dim"</span> } }
+vmac.<span class="f">set_font</span>(<span class="s">"JetBrainsMono NFM"</span>)
+vmac.<span class="f">set_terminal_shell</span>(<span class="s">"/opt/homebrew/bin/fish"</span>)
+vmac.hooks.lsp_servers = <span class="k">function</span>()
+  <span class="k">return</span> { {<span class="s">"python"</span>, <span class="s">"pylsp"</span>}, {<span class="s">"rust"</span>, <span class="s">"rust-analyzer"</span>} }
 <span class="k">end</span></pre>
+<pre data-panel="3" hidden><span class="c"># a plugin from git</span>
+<span class="p">:</span>plugin-install https://github.com/someone/vmac-plugin
 
-      <h3>In Scheme: <code>~/.config/vmac/init.scm</code></h3>
-<pre class="code">(<span class="k">defcommand</span> (<span class="f">insert-date</span>) (insert <span class="s">"2026-11-07"</span>))
-(<span class="k">define-key</span> normal-map <span class="s">"SPC i d"</span> 'insert-date)
+<span class="c"># or your own: ~/.config/vmac/plugins/hello/init.lua</span>
+vmac.<span class="f">command</span>(<span class="s">"hello"</span>, <span class="k">function</span>()
+  vmac.<span class="f">message</span>(<span class="s">"hello from a plugin"</span>)
+<span class="k">end</span>)
 
-<span class="c">;; Bigger headings in Markdown.</span>
-(set-faces! (heading-faces 1 2.2 'magenta))</pre>
-
-      <div class="grid" style="margin-top:22px">
-        <div class="card">
-          <h3>Language servers</h3>
-          <p>rust-analyzer, pyright, typescript-language-server, clangd and gopls are set up.
-            Use others from your config:</p>
-<pre class="code">vmac.hooks.lsp_servers = <span class="k">function</span>()
-  <span class="k">return</span> { {<span class="s">"python"</span>, <span class="s">"pylsp"</span>} }
-<span class="k">end</span></pre>
-        </div>
-        <div class="card">
-          <h3>Font</h3>
-          <p>vmac starts with an installed Nerd Font, else the theme's. Pick another with
-            <code>:fonts</code>, or:</p>
-<pre class="code">vmac.<span class="f">set_font</span>(<span class="s">"Hack Nerd Font Mono"</span>)</pre>
-        </div>
-        <div class="card">
-          <h3>Terminal</h3>
-          <p>Terminals run fish when it's installed. Change the shell, or run them in herdr-core
-            with the <code>herdr-terminal</code> plugin:</p>
-<pre class="code">vmac.<span class="f">set_terminal_shell</span>(<span class="s">"/bin/zsh"</span>)
-vmac.<span class="f">set_terminal_backend</span>(<span class="s">"herdr"</span>)</pre>
+<span class="c"># SPC h p     list them, RET turns one off</span>
+<span class="c"># :plugin-update · :plugin-remove NAME</span></pre>
         </div>
       </div>
-      <p class="note">Live, without saving anything: <code>:lua 1 + 2</code> evaluates Lua,
-        <kbd>SPC</kbd> <kbd>;</kbd> evaluates Scheme. The whole editor is in
-        <a href="https://github.com/Super-Yojan/vmac/tree/master/lisp/core"><code>lisp/core/</code></a>,
-        one file per area; anything there can be redefined from your config.</p>
     </div>
   </section>
 
-  <section id="plugins">
+  <section id="keys" style="padding-top:0">
     <div class="wrap">
-      <h2><span class="n">04</span>Plugins</h2>
-      <p class="sub">A plugin is config you can share: a folder in <code>~/.config/vmac/plugins/</code>
-        with an <code>init.scm</code> and/or <code>init.lua</code>. Plugins load after the core and
-        before your config, and a broken one is skipped without taking the rest down.</p>
-      <div class="grid">
-        <div class="card">
-          <h3>Install one</h3>
-          <p>From a git repository; vmac clones it and reloads.</p>
-          <div class="cmd">
-            <pre>:plugin-install https://github.com/someone/vmac-plugin</pre>
-            <button class="copy" data-copy=":plugin-install https://github.com/someone/vmac-plugin">Copy</button>
-          </div>
-        </div>
-        <div class="card">
-          <h3>Manage them</h3>
+      <div class="head">
+        <span class="eyebrow">Keys</span>
+        <h2>A cheat sheet to start with.</h2>
+      </div>
+      <div class="grid3">
+        <div class="tcard">
+          <h3>Editing</h3>
           <table class="keys">
-            <tr><td><kbd>SPC</kbd> <kbd>h</kbd> <kbd>p</kbd></td><td>list; <kbd>RET</kbd> turns one on or off</td></tr>
-            <tr><td><code>:plugin-update</code></td><td>pull them all</td></tr>
-            <tr><td><code>:plugin-remove NAME</code></td><td>delete one</td></tr>
+            <tr><td><kbd>d</kbd> <kbd>c</kbd> <kbd>y</kbd></td><td>+ a motion: <code>dw</code> <code>ci"</code></td></tr>
+            <tr><td><kbd>v</kbd> <kbd>V</kbd> <kbd>C-v</kbd></td><td>visual, lines, block</td></tr>
+            <tr><td><kbd>/</kbd> <kbd>f</kbd> <kbd>t</kbd> <kbd>.</kbd></td><td>search, find, repeat</td></tr>
+            <tr><td><kbd>u</kbd> <kbd>C-r</kbd> <kbd>p</kbd></td><td>undo, redo, paste</td></tr>
           </table>
         </div>
-        <div class="card">
-          <h3>Examples</h3>
-          <p>In <a href="https://github.com/Super-Yojan/vmac/tree/master/examples/plugins"><code>examples/plugins</code></a>:
-            <code>word-count</code> (Lua), <code>zen</code> (Scheme) and <code>herdr-terminal</code>,
-            a terminal backend.</p>
-          <div class="cmd">
-            <pre>cp -r examples/plugins/* ~/.config/vmac/plugins/</pre>
-            <button class="copy" data-copy="cp -r examples/plugins/* ~/.config/vmac/plugins/">Copy</button>
-          </div>
+        <div class="tcard">
+          <h3>Files and windows</h3>
+          <table class="keys">
+            <tr><td><kbd>SPC</kbd> <kbd>SPC</kbd></td><td>find a file</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>,</kbd></td><td>switch buffer</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>o</kbd> <kbd>p</kbd></td><td>file tree</td></tr>
+            <tr><td><kbd>C-w</kbd> <kbd>v</kbd> <kbd>s</kbd> <kbd>hjkl</kbd></td><td>split, move</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>o</kbd> <kbd>t</kbd></td><td>terminal</td></tr>
+          </table>
+        </div>
+        <div class="tcard">
+          <h3>Code</h3>
+          <table class="keys">
+            <tr><td><kbd>g</kbd> <kbd>d</kbd> · <kbd>C-o</kbd></td><td>definition, back</td></tr>
+            <tr><td><kbd>K</kbd> · <kbd>g</kbd> <kbd>r</kbd></td><td>docs, references</td></tr>
+            <tr><td><kbd>SPC</kbd> <kbd>c</kbd> <kbd>r</kbd>/<kbd>a</kbd>/<kbd>f</kbd></td><td>rename, fix, format</td></tr>
+            <tr><td><kbd>]</kbd> <kbd>d</kbd> · <kbd>SPC</kbd> <kbd>c</kbd> <kbd>x</kbd></td><td>next error, all errors</td></tr>
+          </table>
         </div>
       </div>
     </div>
   </section>
+
+  <div class="closing">
+    <div class="wrap">
+      <img src="logo.svg" alt="">
+      <h2>Make it yours.</h2>
+      <p>Install vmac, then start changing it.</p>
+      <div class="cmd">
+        <pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh</pre>
+        <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh">Copy</button>
+      </div>
+    </div>
+  </div>
 </main>
 
 <footer>
   <div class="wrap">
     <span>vmac v0.0.1 · MIT or Apache-2.0</span>
-    <span><a href="https://github.com/Super-Yojan/vmac">github.com/Super-Yojan/vmac</a></span>
+    <span><a href="https://github.com/Super-Yojan/vmac">GitHub</a> · <a href="https://github.com/Super-Yojan/vmac/releases">Releases</a> · <a href="https://github.com/Super-Yojan/vmac/tree/master/examples/plugins">Example plugins</a></span>
   </div>
 </footer>
 
@@ -333,6 +454,20 @@ vmac.<span class="f">set_terminal_backend</span>(<span class="s">"herdr"</span>)
         button.textContent = "Select it";
       }
       setTimeout(() => (button.textContent = "Copy"), 1600);
+    });
+  });
+
+  // Get started: one step open at a time, with its panel.
+  const names = ["install", "open a file", "~/.config/vmac/init.lua", "plugins"];
+  document.querySelectorAll(".step").forEach((step) => {
+    step.addEventListener("click", () => {
+      const n = step.dataset.step;
+      document.querySelectorAll(".step").forEach((s) => {
+        s.classList.toggle("on", s === step);
+        s.setAttribute("aria-selected", s === step);
+      });
+      document.querySelectorAll("[data-panel]").forEach((p) => (p.hidden = p.dataset.panel !== n));
+      document.getElementById("panel-name").textContent = names[n];
     });
   });
 </script>
