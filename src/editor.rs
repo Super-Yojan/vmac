@@ -313,6 +313,14 @@ pub struct EditorState {
     /// "system" (follow light or dark mode as the system does), "light" or "dark".
     pub theme_mode: String,
     pub terminals_to_kill: Vec<(String, String)>,
+    /// The coding agent (ACP), how to start it, its buffer, and the
+    /// conversation revision that buffer shows.
+    pub agent: Option<crate::agent::Agent>,
+    pub agent_config: crate::agent::AgentConfig,
+    agent_buffer: Option<BufferId>,
+    agent_shown: u64,
+    /// Permissions already put to the person (so each is asked once).
+    agent_asked: usize,
     /// The code actions SPC c a last offered, as the server sent them.
     code_actions: Vec<Value>,
     /// Things for Scheme to handle (a function name and its arguments),
@@ -356,6 +364,11 @@ impl EditorState {
             fonts: Vec::new(),
             theme_mode: "system".into(),
             terminals_to_kill: Vec::new(),
+            agent: None,
+            agent_config: crate::agent::AgentConfig::claude(),
+            agent_buffer: None,
+            agent_shown: 0,
+            agent_asked: 0,
             events: Vec::new(),
             search_cache: None,
         }
@@ -937,6 +950,228 @@ impl EditorState {
     #[cfg(test)]
     pub fn take_events_peek(&self) -> &[(String, Vec<String>)] {
         &self.events
+    }
+
+    // ---- The coding agent
+
+    /// Where the agent works: the project of the selected buffer's file, or
+    /// of the current folder.
+    fn agent_root(&self) -> PathBuf {
+        let start = self.buffer().file().cloned().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        crate::picker::project_root(&start)
+    }
+
+    /// Starts the agent unless it is running. Err says why it couldn't.
+    pub fn agent_start(&mut self) -> Result<(), String> {
+        if self.agent.as_ref().is_some_and(|a| a.state != crate::agent::State::Exited) {
+            return Ok(());
+        }
+        let config = self.agent_config.clone();
+        let root = self.agent_root();
+        let agent = crate::agent::Agent::start(config.clone(), &root)
+            .map_err(|e| format!("{}: {e}", config.command))?;
+        self.agent = Some(agent);
+        self.agent_shown = 0;
+        self.agent_asked = 0;
+        Ok(())
+    }
+
+    /// The agent buffer, made if it doesn't exist.
+    fn agent_buffer_id(&mut self) -> BufferId {
+        if let Some(id) = self.agent_buffer.filter(|&id| self.buffer_by_id(id).is_some()) {
+            return id;
+        }
+        let mut buffer = Buffer::new("*agent*");
+        buffer.set_read_only(true);
+        let id = self.add_buffer(buffer);
+        self.agent_buffer = Some(id);
+        self.agent_shown = 0;
+        id
+    }
+
+    /// Shows the agent buffer: in the window already showing it, else in a
+    /// new window on the right.
+    pub fn agent_show(&mut self) {
+        let id = self.agent_buffer_id();
+        if let Some(w) = self.windows.iter().find(|w| w.buffer == id && !self.is_sidebar(w.id)).map(|w| w.id) {
+            self.select_window(w);
+            return;
+        }
+        self.split_window(Axis::Row);
+        self.show_buffer(id);
+        self.agent_refresh();
+    }
+
+    /// Sends the agent a prompt, starting it if needed.
+    pub fn agent_prompt(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Err(e) = self.agent_start() {
+            self.message = e;
+            return;
+        }
+        if let Some(agent) = self.agent.as_mut() {
+            agent.prompt(text);
+        }
+        self.agent_refresh();
+    }
+
+    pub fn agent_cancel(&mut self) {
+        if let Some(agent) = self.agent.as_mut() {
+            agent.cancel();
+            self.message = "Cancelling".into();
+        }
+    }
+
+    /// Stops the agent; the next prompt starts a new one.
+    pub fn agent_stop(&mut self) {
+        if self.agent.take().is_some() {
+            self.message = "Agent stopped".into();
+        }
+    }
+
+    pub fn agent_status(&self) -> String {
+        use crate::agent::State;
+        match self.agent.as_ref().map(|a| a.state) {
+            None => "off".into(),
+            Some(State::Starting) => "starting".into(),
+            Some(State::Idle) => "ready".into(),
+            Some(State::Running) => "running".into(),
+            Some(State::Exited) => "stopped".into(),
+        }
+    }
+
+    /// The choices of the permission the agent is waiting for, numbered.
+    pub fn agent_permission_options(&self) -> Vec<String> {
+        let Some(p) = self.agent.as_ref().and_then(|a| a.permissions.first()) else { return Vec::new() };
+        p.options.iter().enumerate().map(|(i, (_, name, _))| format!("{}. {name}", i + 1)).collect()
+    }
+
+    pub fn agent_permission_title(&self) -> String {
+        self.agent.as_ref().and_then(|a| a.permissions.first()).map(|p| p.title.clone()).unwrap_or_default()
+    }
+
+    pub fn agent_permit(&mut self, index: usize) {
+        if let Some(agent) = self.agent.as_mut() {
+            agent.permit(index);
+        }
+        self.agent_refresh();
+    }
+
+    /// Reads what the agent sent, answers its requests, and redraws its
+    /// buffer. Returns whether anything changed.
+    pub fn agent_pump(&mut self) -> bool {
+        let Some(agent) = self.agent.as_mut() else { return false };
+        let mut changed = agent.pump();
+        let requests = agent.take_requests();
+        for request in requests {
+            self.agent_answer(request);
+            changed = true;
+        }
+        // Put each new permission to the person once.
+        let waiting = self.agent.as_ref().map_or(0, |a| a.permissions.len());
+        if waiting > self.agent_asked {
+            self.agent_asked = waiting;
+            self.events.push(("agent-ask-permission".into(), vec![self.agent_permission_title()]));
+        } else if waiting < self.agent_asked {
+            self.agent_asked = waiting;
+        }
+        changed | self.agent_refresh()
+    }
+
+    /// The open buffer visiting `path`, if any.
+    fn buffer_visiting(&self, path: &Path) -> Option<BufferId> {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canonical(path);
+        self.buffers.iter().find(|(_, b)| b.file().is_some_and(|f| canonical(f) == want)).map(|(id, _)| *id)
+    }
+
+    fn agent_answer(&mut self, request: crate::agent::Request) {
+        let Some(agent) = self.agent.as_mut() else { return };
+        let path = request.params["path"].as_str().map(PathBuf::from);
+        match (request.method.as_str(), path) {
+            ("fs/read_text_file", Some(path)) => {
+                // The buffer's text, saved or not; else the file.
+                let text = match self.buffers.iter().find(|(id, _)| Some(*id) == self.buffer_visiting(&path)) {
+                    Some((_, b)) => Ok(b.text().to_string()),
+                    None => std::fs::read_to_string(&path),
+                };
+                let agent = self.agent.as_mut().expect("checked above");
+                match text {
+                    Ok(text) => {
+                        let content = crate::agent::slice_lines(
+                            &text,
+                            request.params["line"].as_u64(),
+                            request.params["limit"].as_u64(),
+                        );
+                        agent.respond(request.id, json!({ "content": content }));
+                    }
+                    Err(e) => agent.respond_error(request.id, &format!("{}: {e}", path.display())),
+                }
+            }
+            ("fs/write_text_file", Some(path)) => {
+                let content = request.params["content"].as_str().unwrap_or("").to_string();
+                let result = self.agent_write(&path, &content);
+                let agent = self.agent.as_mut().expect("checked above");
+                match result {
+                    Ok(()) => agent.respond(request.id, Value::Null),
+                    Err(e) => agent.respond_error(request.id, &format!("{}: {e}", path.display())),
+                }
+            }
+            // Answered by the person (agent-permit).
+            ("session/request_permission", _) => {}
+            (method, _) => agent.respond_error(request.id, &format!("vmac doesn't support {method}")),
+        }
+    }
+
+    /// Writes what the agent wrote: into the file's buffer when it is open
+    /// (one undo step, then saved), else to disk.
+    fn agent_write(&mut self, path: &Path, content: &str) -> std::io::Result<()> {
+        if let Some(id) = self.buffer_visiting(path) {
+            let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("found above").1;
+            if !b.is_read_only() {
+                b.undo_boundary();
+                let len = b.len();
+                b.replace(0, len, content);
+                b.undo_boundary();
+                b.save()?;
+                return Ok(());
+            }
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, content)
+    }
+
+    /// Puts the conversation in the agent buffer when it changed. Windows
+    /// at its end follow it.
+    fn agent_refresh(&mut self) -> bool {
+        let Some(agent) = self.agent.as_ref() else { return false };
+        let Some(id) = self.agent_buffer.filter(|&id| self.buffer_by_id(id).is_some()) else { return false };
+        let revision = agent.revision;
+        if revision == self.agent_shown {
+            return false;
+        }
+        self.agent_shown = revision;
+        let text = agent.transcript();
+        let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("checked above").1;
+        let old_end = b.len();
+        let follow = b.point() + 1 >= old_end;
+        b.set_text(&text);
+        let end = b.len();
+        if follow {
+            b.goto_char(end);
+        }
+        for w in self.windows.iter_mut().filter(|w| w.buffer == id) {
+            if w.point + 1 >= old_end {
+                w.point = end;
+            } else {
+                w.point = w.point.min(end);
+            }
+        }
+        true
     }
 
     pub fn take_events(&mut self) -> Vec<(String, Vec<String>)> {

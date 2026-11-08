@@ -37,6 +37,7 @@ const CORE_FILES: &[(&str, &str)] = &[
     ("72-terminal.scm", include_str!("../lisp/core/72-terminal.scm")),
     ("75-file-tree.scm", include_str!("../lisp/core/75-file-tree.scm")),
     ("80-lsp.scm", include_str!("../lisp/core/80-lsp.scm")),
+    ("82-agent.scm", include_str!("../lisp/core/82-agent.scm")),
     ("85-bindings.scm", include_str!("../lisp/core/85-bindings.scm")),
     ("90-tables.scm", include_str!("../lisp/core/90-tables.scm")),
     ("92-syntax.scm", include_str!("../lisp/core/92-syntax.scm")),
@@ -1486,6 +1487,27 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         }
     });
     prim!(reg, editor, "theme", |s| s.theme_mode.clone());
+    // The coding agent (ACP): prompts, permission answers, how to start it.
+    prim!(reg, editor, "agent-prompt", |s, text: String| s.agent_prompt(&text));
+    prim!(reg, editor, "agent-show", |s| s.agent_show());
+    prim!(reg, editor, "agent-cancel", |s| s.agent_cancel());
+    prim!(reg, editor, "agent-stop", |s| s.agent_stop());
+    prim!(reg, editor, "agent-status", |s| s.agent_status());
+    prim!(reg, editor, "agent-permission-options", |s| s.agent_permission_options());
+    prim!(reg, editor, "agent-permission-title", |s| s.agent_permission_title());
+    prim!(reg, editor, "agent-permit", |s, index: isize| s.agent_permit(index.max(0) as usize));
+    prim!(reg, editor, "set-agent-command", |s, line: String| {
+        match crate::agent::AgentConfig::parse("agent", &line) {
+            Some(config) => {
+                s.message = format!("agent: {line} (from the next start)");
+                s.agent_config = config;
+            }
+            None => s.message = "set-agent-command needs a command".into(),
+        }
+    });
+    prim!(reg, editor, "agent-command", |s| {
+        std::iter::once(s.agent_config.command.clone()).chain(s.agent_config.args.iter().cloned()).collect::<Vec<_>>().join(" ")
+    });
     prim!(reg, editor, "font-list", |s| s.fonts.clone());
     prim!(reg, editor, "terminal-shell", |s| s.terminal_shell.clone());
     // Runs a program, returning what it printed (for plugins: hc, rex, ...).
@@ -2752,6 +2774,52 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn the_agent_reads_unsaved_text_asks_and_writes() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-e2e-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().agent_config = config;
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, "Aworld");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(editor.lock().buffer().text().to_string(), "helloworld\n");
+
+        typed(&mut lisp, &format!(":agent edit {}", file.display()));
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().name(), "*agent*");
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&EditorState) -> bool| {
+            for _ in 0..250 {
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(pump(&mut lisp, &|s| s.picker.is_some()), "the permission picker opened: {}", editor.lock().message);
+        assert!(editor.lock().picker.as_ref().unwrap().title().contains("Allow Edit"));
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("✓ Edit")));
+
+        let transcript = editor.lock().buffer().text().to_string();
+        assert!(transcript.contains("## > edit"), "{transcript}");
+        assert!(transcript.contains("Reading it."), "{transcript}");
+        assert!(transcript.contains("- [x] Read it"), "{transcript}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "HELLOWORLD\n", "it read the unsaved text");
+        editor.lock().open_file(&file).unwrap();
+        assert_eq!(editor.lock().buffer().text().to_string(), "HELLOWORLD\n");
+        assert!(!editor.lock().buffer().is_modified(), "and saved it");
+        typed(&mut lisp, "u");
+        assert_eq!(editor.lock().buffer().text().to_string(), "helloworld\n", "one u undoes the agent's edit");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// vmac on a file served by the fake language server (lsp.rs's tests).
     fn with_fake_server(tag: &str, text: &str) -> (Lisp, Editor, PathBuf) {
         let dir = std::env::temp_dir().join(format!("vmac-lsp-{tag}-{}", std::process::id()));
@@ -3316,7 +3384,7 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         lisp.dispatch_key("RET", "");
         lisp.dispatch_key("C-c", "");
         lisp.last_terminal_poll -= std::time::Duration::from_secs(1);
-        assert!(pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string() == "fake$ topab<enter><ctrl+c>"));
+        assert!(pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text() == "fake$ topab<enter><ctrl+c>"));
         assert!(lisp.modeline().iter().any(|s| s.text == "terminal (fake)"));
         lisp.dispatch_key("ESC", "");
         typed(&mut lisp, ":bd\n");

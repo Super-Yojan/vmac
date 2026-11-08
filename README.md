@@ -179,6 +179,36 @@ outlive vmac while keys, size and colors work as in a local terminal.
 `vmac.exec(cmd, args)` runs a program and returns its output, for backends
 built on a command line tool.
 
+## Coding agent
+
+vmac talks to coding agents over the
+[Agent Client Protocol](https://agentclientprotocol.com) (ACP), the protocol
+Zed uses, so it drives the real Claude Code, Codex or Gemini CLI rather than
+an agent of its own. `SPC a a` asks the agent something; its replies, plan
+and tool calls stream into the `*agent*` buffer on the right. It works in the
+current file's project.
+
+- It reads files **through your buffers**, so it sees edits you haven't saved.
+- When it edits a file that is open, the change lands in that buffer as one
+  undo step and is saved: `u` takes it back. Other files are written to disk.
+- When it needs permission (to edit, to run a command), a picker asks you;
+  `SPC a p` reopens it if you were busy.
+- `SPC a c` cancels the run, `SPC a k` stops the agent, `SPC a o` shows
+  `*agent*`. `:agent PROMPT` asks from the command line.
+
+The default is Claude Code through
+[claude-code-acp](https://www.npmjs.com/package/@zed-industries/claude-code-acp)
+(installed, or run with `npx`), using your `claude` login. Another agent:
+
+```lua
+vmac.set_agent_command("npx -y @zed-industries/codex-acp")
+```
+
+or `(set-agent-command ...)` in init.scm, or `:agent-command CMD`.
+`VMAC_AGENT_LOG=/tmp/agent.log` logs the traffic. Claude Code won't start
+from a vmac launched inside a Claude Code session (it refuses to nest); start
+vmac from a plain terminal.
+
 ## Plugins
 
 Plugins live in `~/.config/vmac/plugins/`: a folder with an `init.scm`

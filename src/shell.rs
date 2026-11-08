@@ -138,7 +138,10 @@ impl Shell {
                 cx.background_executor().timer(LSP_POLL).await;
                 let alive = this.update(cx, |shell, cx| {
                     let configs = shell.lisp.lsp_servers();
-                    let changed = shell.editor.lock().lsp_pump(configs);
+                    let changed = {
+                        let mut editor = shell.editor.lock();
+                        editor.lsp_pump(configs) | editor.agent_pump()
+                    };
                     // Replies that Scheme handles (the references picker).
                     if shell.lisp.run_events() || changed {
                         cx.notify();

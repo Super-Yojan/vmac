@@ -77,6 +77,10 @@
         (list "SPC c f" 'format-buffer)
         (list "K" 'hover-documentation) (list "C-o" 'jump-back-command)
         (list "SPC c x" 'diagnostic-list)
+        ;; The coding agent
+        (list "SPC a a" 'agent-ask) (list "SPC a o" 'agent-open)
+        (list "SPC a c" 'agent-cancel-run) (list "SPC a p" 'agent-permission)
+        (list "SPC a k" 'agent-kill)
         ;; Buffers
         (list "SPC b b" 'switch-buffer) (list "SPC ," 'switch-buffer)
         (list "SPC b n" 'buffer-next) (list "SPC b p" 'buffer-previous)

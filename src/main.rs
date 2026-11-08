@@ -1,6 +1,7 @@
 //! vmac: a modal (evil-style) editor whose behavior is written in Steel
 //! Scheme and can be redefined while it runs. See README.md.
 
+mod agent;
 mod buffer;
 mod editor;
 mod lisp;
