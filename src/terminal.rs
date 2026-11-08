@@ -227,16 +227,16 @@ pub struct LocalPty {
     to_engine: Sender<Msg>,
     /// The latest screen the engine built, until it is shown.
     latest: Arc<Mutex<Option<Screen>>>,
+    /// The screen and scrollback as text, always the latest (what an agent
+    /// reads of a command it ran).
+    text: Arc<Mutex<String>>,
     size: (u16, u16),
 }
 
 impl LocalPty {
     /// Runs `command` (the user's shell when empty) in `cwd`.
     pub fn start(command: &str, cwd: &Path, rows: u16, cols: u16) -> Result<Self, String> {
-        let pty = native_pty_system()
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| e.to_string())?;
-        let mut cmd = if command.trim().is_empty() {
+        let cmd = if command.trim().is_empty() {
             CommandBuilder::new_default_prog()
         } else {
             let mut words = command.split_whitespace();
@@ -244,6 +244,23 @@ impl LocalPty {
             cmd.args(words);
             cmd
         };
+        Self::spawn(cmd, cwd, rows, cols)
+    }
+
+    /// Runs `program` with exactly these arguments and extra environment.
+    pub fn run(program: &str, args: &[String], env: &[(String, String)], cwd: &Path, rows: u16, cols: u16) -> Result<Self, String> {
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        Self::spawn(cmd, cwd, rows, cols)
+    }
+
+    fn spawn(mut cmd: CommandBuilder, cwd: &Path, rows: u16, cols: u16) -> Result<Self, String> {
+        let pty = native_pty_system()
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| e.to_string())?;
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         let child = pty.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
@@ -266,7 +283,8 @@ impl LocalPty {
 
         // The engine: made here and never leaves this thread.
         let latest = Arc::new(Mutex::new(None));
-        let (screen_out, replies) = (latest.clone(), writer.clone());
+        let text = Arc::new(Mutex::new(String::new()));
+        let (screen_out, replies, text_out) = (latest.clone(), writer.clone(), text.clone());
         std::thread::spawn(move || {
             let mut stream = engine(rows, cols);
             let apply = |stream: &mut Stream<TerminalHandler>, msg: Msg| match msg {
@@ -285,11 +303,16 @@ impl LocalPty {
                     let _ = w.write_all(&answers).and_then(|()| w.flush());
                 }
                 let screen = read_screen(&stream.terminal().snapshot());
+                let mut lines: Vec<&str> = screen.lines.iter().map(|l| l.trim_end()).collect();
+                while lines.last().is_some_and(|l| l.is_empty()) {
+                    lines.pop();
+                }
+                *text_out.lock().unwrap_or_else(|e| e.into_inner()) = lines.join("\n");
                 *screen_out.lock().unwrap_or_else(|e| e.into_inner()) = Some(screen);
             }
         });
 
-        Ok(Self { master: pty.master, writer, child, to_engine, latest, size: (rows, cols) })
+        Ok(Self { master: pty.master, writer, child, to_engine, latest, text, size: (rows, cols) })
     }
 
     pub fn send(&mut self, bytes: &[u8]) {
@@ -309,6 +332,19 @@ impl LocalPty {
     /// The screen, when the engine built a new one since the last call.
     pub fn screen(&mut self) -> Option<Screen> {
         self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Everything on the screen and in its scrollback, as text.
+    pub fn text(&self) -> String {
+        self.text.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// How it ended: (exit code, signal), or None while it runs.
+    pub fn exit_status(&mut self) -> Option<(u32, Option<String>)> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some((status.exit_code(), status.signal().map(str::to_string))),
+            _ => None,
+        }
     }
 
     pub fn alive(&mut self) -> bool {

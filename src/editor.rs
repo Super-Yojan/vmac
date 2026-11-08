@@ -324,6 +324,8 @@ pub struct EditorState {
     agent_asked: usize,
     /// What each line of the agent buffer points at.
     agent_lines: Vec<crate::agent::Target>,
+    /// Terminals the agent asked for (terminal/create), by its ids.
+    agent_terms: Vec<AgentTerm>,
     /// Whether the agent's writes are kept for review (else just applied),
     /// the files waiting, and the review buffer with each line's hunk.
     pub agent_review: bool,
@@ -348,6 +350,34 @@ pub struct EditorState {
     /// raised where Rust can't call Scheme (server replies).
     events: Vec<(String, Vec<String>)>,
     search_cache: Option<(String, Regex)>,
+}
+
+/// A terminal running a command for the agent: its id, its buffer, the
+/// most output to hand back (bytes), and requests waiting for it to exit.
+#[derive(Debug)]
+struct AgentTerm {
+    id: String,
+    buffer: BufferId,
+    limit: Option<usize>,
+    waiting: Vec<Value>,
+}
+
+/// How a program ended: its exit code, and the signal that ended it.
+type ExitStatus = (u32, Option<String>);
+
+/// The end of `text`, at most `limit` bytes (cut at a character), and
+/// whether anything was cut.
+fn keep_tail(text: &str, limit: Option<usize>) -> (String, bool) {
+    match limit {
+        Some(n) if text.len() > n => {
+            let mut start = text.len() - n;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            (text[start..].to_string(), true)
+        }
+        _ => (text.to_string(), false),
+    }
 }
 
 /// A dashboard line: its text, faces (columns), and what RET on it does.
@@ -412,6 +442,7 @@ impl EditorState {
             agent_shown_width: 0,
             agent_asked: 0,
             agent_lines: Vec::new(),
+            agent_terms: Vec::new(),
             agent_review: true,
             reviews: Vec::new(),
             review_buffer: None,
@@ -1011,7 +1042,7 @@ impl EditorState {
 
     /// Where the agent works: the project of the selected buffer's file, or
     /// of the current folder.
-    fn agent_root(&self) -> PathBuf {
+    pub fn agent_root(&self) -> PathBuf {
         // From *agent* itself: the file in another window, else any file open.
         let shown = self.windows.iter().filter_map(|w| self.buffer_by_id(w.buffer)?.file());
         let start = self
@@ -1079,8 +1110,70 @@ impl EditorState {
             self.message = e;
             return;
         }
+        let files = self.agent_attachments(text);
         if let Some(agent) = self.agent.as_mut() {
-            agent.prompt(text);
+            agent.prompt_with(text, text, &files);
+        }
+        self.agent_refresh();
+    }
+
+    /// The files a prompt names as `@path` (from the project), with their
+    /// text: the buffer's when open, saved or not.
+    fn agent_attachments(&self, text: &str) -> Vec<(PathBuf, String)> {
+        let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| self.agent_root());
+        let mut files: Vec<(PathBuf, String)> = Vec::new();
+        for word in text.split_whitespace() {
+            let Some(name) = word.strip_prefix('@') else { continue };
+            let name = name.trim_end_matches([',', '.', ';', ':', ')', '?', '!']);
+            if name.is_empty() {
+                continue;
+            }
+            let path = if Path::new(name).is_absolute() { PathBuf::from(name) } else { root.join(name) };
+            if !path.is_file() || files.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            let content = match self.buffer_visiting(&path).and_then(|id| self.buffer_by_id(id)) {
+                Some(b) => b.text().to_string(),
+                None => match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                },
+            };
+            files.push((path, content));
+        }
+        files
+    }
+
+    /// SPC a e: asks about the selected file's problems (the language
+    /// server's diagnostics), with the file attached.
+    pub fn agent_ask_about_problems(&mut self, question: &str) {
+        let Some(path) = self.buffer().file().cloned() else {
+            self.message = "This buffer has no file".into();
+            return;
+        };
+        let diagnostics = self.lsp.diagnostics(&path).to_vec();
+        if diagnostics.is_empty() {
+            self.message = "No problems reported in this file".into();
+            return;
+        }
+        let root = self.agent_root();
+        let name = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        let list: Vec<String> = diagnostics
+            .iter()
+            .map(|d| format!("- {name}:{}:{}: {}: {}", d.start.0 + 1, d.start.1 + 1, d.severity_name(), d.message.lines().next().unwrap_or("")))
+            .collect();
+        let question = if question.trim().is_empty() { "Fix these problems." } else { question.trim() };
+        let text = format!("{question}\n\nThe language server reports, in `{name}`:\n{}\n", list.join("\n"));
+        let n = diagnostics.len();
+        let shown = format!("{question}  [{n} problem{} in {name}]", if n == 1 { "" } else { "s" });
+        let content = self.buffer().text().to_string();
+        if let Err(e) = self.agent_start() {
+            self.message = e;
+            return;
+        }
+        self.agent_show();
+        if let Some(agent) = self.agent.as_mut() {
+            agent.prompt_with(&shown, &text, &[(path, content)]);
         }
         self.agent_refresh();
     }
@@ -1094,6 +1187,7 @@ impl EditorState {
 
     /// Stops the agent; the next prompt starts a new one.
     pub fn agent_stop(&mut self) {
+        self.agent_kill_terminals();
         if self.agent.take().is_some() {
             self.message = "Agent stopped".into();
         }
@@ -1137,6 +1231,7 @@ impl EditorState {
             self.agent_answer(request);
             changed = true;
         }
+        self.agent_terminals_pump();
         // Put each new permission to the person once.
         let waiting = self.agent.as_ref().map_or(0, |a| a.permissions.len());
         if waiting > self.agent_asked {
@@ -1189,7 +1284,134 @@ impl EditorState {
             }
             // Answered by the person (agent-permit).
             ("session/request_permission", _) => {}
+            (m, _) if m.starts_with("terminal/") => self.agent_terminal(request),
             (method, _) => agent.respond_error(request.id, &format!("vmac doesn't support {method}")),
+        }
+    }
+
+    /// The agent's terminal requests: commands run in vmac terminals
+    /// (`*agent: cargo test*`), so you can watch them.
+    fn agent_terminal(&mut self, request: crate::agent::Request) {
+        let p = &request.params;
+        let id_of = |p: &Value| p["terminalId"].as_str().unwrap_or("").to_string();
+        let result: Result<Option<Value>, String> = match request.method.as_str() {
+            "terminal/create" => {
+                let command = p["command"].as_str().unwrap_or("").to_string();
+                let args: Vec<String> =
+                    p["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                let env: Vec<(String, String)> = p["env"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| Some((e["name"].as_str()?.to_string(), e["value"].as_str()?.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_default();
+                let cwd = p["cwd"].as_str().map(PathBuf::from).unwrap_or(root);
+                match crate::terminal::LocalPty::run(&command, &args, &env, &cwd, 30, 120) {
+                    Ok(pty) => {
+                        let shown = std::iter::once(command.as_str()).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
+                        let short: String = shown.chars().take(40).collect();
+                        let mut buffer = Buffer::new(format!("*agent: {short}*"));
+                        buffer.set_read_only(true);
+                        let buffer = self.add_buffer(buffer);
+                        self.terminals.push(Terminal { buffer, backend: TermBackend::Local(pty), exited: false });
+                        let id = format!("term-{buffer}");
+                        let limit = p["outputByteLimit"].as_u64().map(|n| n as usize);
+                        self.agent_terms.push(AgentTerm { id: id.clone(), buffer, limit, waiting: Vec::new() });
+                        Ok(Some(json!({ "terminalId": id })))
+                    }
+                    Err(e) => Err(format!("{command}: {e}")),
+                }
+            }
+            "terminal/output" => {
+                let id = id_of(p);
+                match self.agent_term_state(&id) {
+                    Some((text, status, limit)) => {
+                        let (output, truncated) = keep_tail(&text, limit);
+                        let mut reply = json!({ "output": output, "truncated": truncated });
+                        if let Some((code, signal)) = status {
+                            reply["exitStatus"] = json!({ "exitCode": code, "signal": signal });
+                        }
+                        Ok(Some(reply))
+                    }
+                    None => Err(format!("no terminal {id}")),
+                }
+            }
+            "terminal/wait_for_exit" => {
+                let id = id_of(p);
+                match self.agent_terms.iter_mut().find(|t| t.id == id) {
+                    // Answered when it exits (agent_pump).
+                    Some(t) => {
+                        t.waiting.push(request.id.clone());
+                        Ok(None)
+                    }
+                    None => Err(format!("no terminal {id}")),
+                }
+            }
+            "terminal/kill" | "terminal/release" => {
+                let id = id_of(p);
+                if let Some(buffer) = self.agent_terms.iter().find(|t| t.id == id).map(|t| t.buffer)
+                    && let Some(TermBackend::Local(pty)) =
+                        self.terminals.iter_mut().find(|t| t.buffer == buffer).map(|t| &mut t.backend)
+                {
+                    pty.kill();
+                }
+                if request.method == "terminal/release" {
+                    // Its buffer stays, to read; the agent can't use it again.
+                    self.agent_terms.retain(|t| t.id != id);
+                }
+                Ok(Some(json!({})))
+            }
+            other => Err(format!("vmac doesn't support {other}")),
+        };
+        let Some(agent) = self.agent.as_mut() else { return };
+        match result {
+            Ok(Some(value)) => agent.respond(request.id, value),
+            Ok(None) => {}
+            Err(e) => agent.respond_error(request.id, &e),
+        }
+    }
+
+    /// An agent terminal's text, exit status and output limit.
+    fn agent_term_state(&mut self, id: &str) -> Option<(String, Option<ExitStatus>, Option<usize>)> {
+        let t = self.agent_terms.iter().find(|t| t.id == id)?;
+        let (buffer, limit) = (t.buffer, t.limit);
+        match &mut self.terminals.iter_mut().find(|t| t.buffer == buffer)?.backend {
+            TermBackend::Local(pty) => Some((pty.text(), pty.exit_status(), limit)),
+            _ => None,
+        }
+    }
+
+    /// Stops what the agent's terminals run (their buffers stay).
+    fn agent_kill_terminals(&mut self) {
+        for t in std::mem::take(&mut self.agent_terms) {
+            if let Some(TermBackend::Local(pty)) = self.terminals.iter_mut().find(|x| x.buffer == t.buffer).map(|x| &mut x.backend) {
+                pty.kill();
+            }
+        }
+    }
+
+    /// Answers waits on terminals that exited, and shows their latest
+    /// lines in the conversation.
+    fn agent_terminals_pump(&mut self) {
+        let ids: Vec<(String, BufferId)> = self.agent_terms.iter().map(|t| (t.id.clone(), t.buffer)).collect();
+        for (id, buffer) in ids {
+            let Some((text, status, _)) = self.agent_term_state(&id) else { continue };
+            let name = self.buffer_by_id(buffer).map(|b| b.name().to_string()).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = lines[lines.len().saturating_sub(12)..].join("\n");
+            let waiting = match (status.as_ref(), self.agent_terms.iter_mut().find(|t| t.id == id)) {
+                (Some(_), Some(t)) => std::mem::take(&mut t.waiting),
+                _ => Vec::new(),
+            };
+            let Some(agent) = self.agent.as_mut() else { return };
+            agent.set_terminal(&id, &name, tail);
+            for w in waiting {
+                let (code, signal) = status.clone().unwrap_or((0, None));
+                agent.respond(w, json!({ "exitCode": code, "signal": signal }));
+            }
         }
     }
 
@@ -1586,6 +1808,16 @@ impl EditorState {
             Some(crate::agent::Target::File(path, line)) => {
                 self.agent_visit(&path, line);
             }
+            Some(crate::agent::Target::Buffer(name)) => {
+                let here = self.selected;
+                match self.window_order().into_iter().find(|&w| w != here && !self.is_sidebar(w)) {
+                    Some(w) => self.select_window(w),
+                    None => self.split_window(Axis::Column),
+                }
+                if !self.switch_to_buffer(&name) {
+                    self.message = format!("{name} is gone");
+                }
+            }
             _ => {}
         }
     }
@@ -1658,6 +1890,7 @@ impl EditorState {
 
     /// A new conversation: stops the agent and starts it again.
     pub fn agent_new_session(&mut self) {
+        self.agent_kill_terminals();
         self.agent = None;
         if let Err(e) = self.agent_start() {
             self.message = e;

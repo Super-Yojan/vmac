@@ -1507,6 +1507,10 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "agent-activate", |s| s.agent_activate());
     prim!(reg, editor, "agent-toggle-at-point", |s| s.agent_toggle_at_point());
     prim!(reg, editor, "agent-new-session", |s| s.agent_new_session());
+    prim!(reg, editor, "agent-root", |s| {
+        s.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| s.agent_root()).display().to_string()
+    });
+    prim!(reg, editor, "agent-ask-about-problems", |s, question: String| s.agent_ask_about_problems(&question));
     // Projects, recent files and the dashboard.
     pure!(reg, "file-exists?", |path: String| expand_home(&path).exists());
     prim!(reg, editor, "config-dir", |_s| config_dir().map(|d| d.display().to_string()).unwrap_or_default());
@@ -3105,6 +3109,84 @@ mod tests {
         // Not a folder: says so.
         lisp.eval("(project-switch-to \"/no/such/folder\")").unwrap();
         assert!(editor.lock().message.contains("not a folder"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_agent_gets_files_problems_and_runs_commands_in_terminals() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-context-{}", std::process::id()));
+        let config = crate::agent::tests::fake_config(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "saved\n").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().agent_config = config;
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, "ccunsaved");
+        lisp.dispatch_key("ESC", "");
+        let pump = |lisp: &mut Lisp, done: &dyn Fn(&mut EditorState) -> bool| {
+            for _ in 0..300 {
+                lisp.pump_terminals();
+                editor.lock().agent_pump();
+                lisp.run_events();
+                if done(&mut editor.lock()) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let said = |s: &mut EditorState, what: &str| {
+            s.agent.as_ref().is_some_and(|a| a.state == crate::agent::State::Idle && a.transcript().contains(what))
+        };
+
+        // @a.txt sends the buffer's text along.
+        editor.lock().agent_prompt("what is in @a.txt?");
+        assert!(pump(&mut lisp, &|s| said(s, "You said")), "{:?}", editor.lock().agent.as_ref().map(|a| a.transcript()));
+        assert!(editor.lock().agent.as_ref().unwrap().transcript().contains("Attached: a.txt=unsaved."));
+
+        // In the prompt, @ picks a file to attach.
+        typed(&mut lisp, " aa");
+        typed(&mut lisp, "see ");
+        lisp.dispatch_key("@", "@");
+        let title = editor.lock().picker.as_ref().map(|p| p.title().to_string());
+        assert_eq!(title.as_deref(), Some("Attach file"));
+        lisp.dispatch_key("RET", "");
+        assert!(text(&editor).ends_with("─\nsee @a.txt "), "{:?}", text(&editor));
+        typed(&mut lisp, "x@y");
+        assert!(editor.lock().picker.is_none(), "not at a word's start: just @");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "0D");
+
+        // SPC a e: the file's problems, with the file.
+        editor.lock().lsp.set_diagnostics(file.clone(), vec![crate::lsp::Diagnostic {
+            start: (0, 0), end: (0, 3), severity: 1, message: "boom".into(), source: None, raw: serde_json::Value::Null,
+        }]);
+        editor.lock().open_file(&file).unwrap();
+        typed(&mut lisp, " ae");
+        lisp.dispatch_key("RET", "");
+        assert!(pump(&mut lisp, &|s| said(s, "a.txt:1:1: error: boom")));
+        let t = editor.lock().agent.as_ref().unwrap().transcript();
+        assert!(t.contains("› Fix these problems.  [1 problem in a.txt]"), "{t}");
+
+        // A command runs in a vmac terminal the agent waits on and reads.
+        editor.lock().agent_prompt("run echo $GREETING; echo second; exit 3");
+        assert!(pump(&mut lisp, &|s| said(s, "exit 3")), "{:?}", editor.lock().agent.as_ref().map(|a| a.transcript()));
+        let t = editor.lock().agent.as_ref().unwrap().transcript();
+        assert!(t.contains("exit 3: hi there / second"), "{t}");
+        let names = editor.lock().buffer_names();
+        let term = names.iter().find(|n| n.starts_with("*agent: sh -c echo")).cloned().expect("a terminal buffer");
+        editor.lock().switch_to_buffer(&term);
+        assert!(text(&editor).contains("hi there\nsecond"), "{}", text(&editor));
+
+        // Opened, the tool call shows the terminal and its lines.
+        let id = editor.lock().agent.as_ref().unwrap().entries.iter().find_map(|e| match e {
+            crate::agent::Entry::Tool(t) if t.title == "Run it" => Some(t.id.clone()),
+            _ => None,
+        }).unwrap();
+        editor.lock().agent.as_mut().unwrap().toggle(&id);
+        let t = editor.lock().agent.as_ref().unwrap().transcript();
+        assert!(t.contains(&format!("    ⌁ {term}  (RET opens it)\n    hi there\n    second")), "{t}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

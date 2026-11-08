@@ -84,6 +84,8 @@ pub struct ToolCall {
     pub locations: Vec<(PathBuf, Option<u64>)>,
     /// What it produced, as text (output, diffs summarized).
     pub output: String,
+    /// Terminals it runs commands in (their ids).
+    pub terminals: Vec<String>,
 }
 
 impl ToolCall {
@@ -103,7 +105,18 @@ impl ToolCall {
                 list.iter().filter_map(|l| Some((PathBuf::from(l["path"].as_str()?), l["line"].as_u64()))).collect();
         }
         if let Some(content) = v["content"].as_array() {
-            self.output = content.iter().map(tool_content_text).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
+            self.output = content
+                .iter()
+                .filter(|c| c["type"] != "terminal")
+                .map(tool_content_text)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for id in content.iter().filter_map(|c| c["terminalId"].as_str()) {
+                if !self.terminals.iter().any(|t| t == id) {
+                    self.terminals.push(id.to_string());
+                }
+            }
         }
     }
 }
@@ -142,6 +155,9 @@ pub fn error_text(error: &Value) -> String {
         .unwrap_or(detail);
     if detail.is_empty() { message } else { format!("{message}: {detail}") }
 }
+
+/// A prompt's text and the files attached to it (path, text).
+type Prompt = (String, Vec<(PathBuf, String)>);
 
 /// A request from the agent that the editor answers.
 #[derive(Clone, Debug, PartialEq)]
@@ -190,7 +206,7 @@ pub struct Agent {
     pending: HashMap<i64, Pending>,
     session: Option<String>,
     /// Prompts sent before the session opened.
-    queued: Vec<String>,
+    queued: Vec<Prompt>,
     pub state: State,
     pub entries: Vec<Entry>,
     /// Requests for the editor to answer.
@@ -201,6 +217,10 @@ pub struct Agent {
     pub revision: u64,
     /// Tool calls shown open, by id.
     expanded: std::collections::HashSet<String>,
+    /// Whether it takes files' text in prompts (else links to them).
+    pub embedded_context: bool,
+    /// Terminals the editor runs for it: id -> (buffer name, last lines).
+    pub terminals: HashMap<String, (String, String)>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -269,6 +289,8 @@ impl Agent {
             permissions: Vec::new(),
             revision: 0,
             expanded: Default::default(),
+            embedded_context: false,
+            terminals: HashMap::new(),
         };
         agent.call(
             Pending::Initialize,
@@ -277,7 +299,7 @@ impl Agent {
                 "protocolVersion": PROTOCOL_VERSION,
                 "clientCapabilities": {
                     "fs": { "readTextFile": true, "writeTextFile": true },
-                    "terminal": false,
+                    "terminal": true,
                 },
                 "clientInfo": { "name": "vmac", "version": env!("CARGO_PKG_VERSION") },
             }),
@@ -320,6 +342,7 @@ impl Agent {
     }
 
     /// Sends a prompt; held until the session opens.
+    #[cfg(test)]
     pub fn prompt(&mut self, text: &str) {
         self.prompt_as(text, text);
     }
@@ -327,21 +350,44 @@ impl Agent {
     /// Sends `text`, showing `shown` in the conversation (a question about
     /// a selection shows the question, not the code sent with it).
     pub fn prompt_as(&mut self, shown: &str, text: &str) {
+        self.prompt_with(shown, text, &[]);
+    }
+
+    /// Sends `text` with files attached: their text when the agent takes
+    /// it, else links. `files` are (path, text).
+    pub fn prompt_with(&mut self, shown: &str, text: &str, files: &[(PathBuf, String)]) {
         self.entries.push(Entry::User(shown.to_string()));
         self.revision += 1;
+        let prompt = (text.to_string(), files.to_vec());
         match self.session.clone() {
-            Some(session) if self.state == State::Idle => self.send_prompt(&session, text),
-            _ => self.queued.push(text.to_string()),
+            Some(session) if self.state == State::Idle => self.send_prompt(&session, prompt),
+            _ => self.queued.push(prompt),
         }
     }
 
-    fn send_prompt(&mut self, session: &str, text: &str) {
+    /// Sends a prompt, built now that the agent said what it takes.
+    fn send_prompt(&mut self, session: &str, (text, files): Prompt) {
+        let mut blocks = vec![json!({ "type": "text", "text": text })];
+        for (path, content) in &files {
+            let uri = crate::lsp::path_to_uri(path);
+            let name = path.strip_prefix(&self.root).unwrap_or(path).display().to_string();
+            blocks.push(if self.embedded_context {
+                json!({ "type": "resource", "resource": { "uri": uri, "text": content, "mimeType": "text/plain" } })
+            } else {
+                json!({ "type": "resource_link", "uri": uri, "name": name })
+            });
+        }
         self.state = State::Running;
-        self.call(
-            Pending::Prompt,
-            "session/prompt",
-            json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] }),
-        );
+        self.call(Pending::Prompt, "session/prompt", json!({ "sessionId": session, "prompt": blocks }));
+    }
+
+    /// Shows a terminal's latest lines under the tool calls running in it.
+    pub fn set_terminal(&mut self, id: &str, buffer: &str, tail: String) {
+        let entry = (buffer.to_string(), tail);
+        if self.terminals.get(id) != Some(&entry) {
+            self.terminals.insert(id.to_string(), entry);
+            self.revision += 1;
+        }
     }
 
     /// Stops the running prompt. Permissions it was waiting on are cancelled,
@@ -444,6 +490,7 @@ impl Agent {
     fn on_result(&mut self, kind: Pending, result: &Value) {
         match kind {
             Pending::Initialize => {
+                self.embedded_context = result["agentCapabilities"]["promptCapabilities"]["embeddedContext"] == true;
                 let cwd = self.root.display().to_string();
                 self.call(Pending::NewSession, "session/new", json!({ "cwd": cwd, "mcpServers": [] }));
             }
@@ -458,7 +505,7 @@ impl Agent {
                 self.note(format!("{name} is ready"));
                 if !self.queued.is_empty() {
                     let text = self.queued.remove(0);
-                    self.send_prompt(&session, &text);
+                    self.send_prompt(&session, text);
                 }
             }
             Pending::Prompt => {
@@ -471,7 +518,7 @@ impl Agent {
                 }
                 if let (Some(session), false) = (self.session.clone(), self.queued.is_empty()) {
                     let text = self.queued.remove(0);
-                    self.send_prompt(&session, &text);
+                    self.send_prompt(&session, text);
                 }
             }
         }
@@ -635,6 +682,21 @@ impl Agent {
                     r.line(&format!("{fold} {mark} {}", shorten(&t.title)), Target::Tool(t.id.clone()));
                     r.faces.push((start, start + 1, "dim"));
                     r.faces.push((start + 2, start + 3, face));
+                    let running = matches!(t.status.as_str(), "pending" | "in_progress");
+                    for id in &t.terminals {
+                        let Some((buffer, tail)) = self.terminals.get(id) else { continue };
+                        if open {
+                            r.styled(&format!("    ⌁ {buffer}  (RET opens it)"), "cyan", Target::Buffer(buffer.clone()));
+                            let lines: Vec<&str> = tail.lines().collect();
+                            for line in &lines[lines.len().saturating_sub(MAX_TERMINAL_LINES)..] {
+                                r.styled(&format!("    {line}"), "agent-output", Target::Buffer(buffer.clone()));
+                            }
+                        } else if running && let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty()) {
+                            // Collapsed but running: its latest line.
+                            let last: String = last.trim().chars().take(width.saturating_sub(6)).collect();
+                            r.styled(&format!("    {last}"), "dim", Target::Buffer(buffer.clone()));
+                        }
+                    }
                     if open {
                         for (path, line) in &t.locations {
                             let shown = shorten(&path.display().to_string());
@@ -659,7 +721,7 @@ impl Agent {
                             let more = lines.len() - MAX_TOOL_LINES;
                             r.styled(&format!("    … {more} more lines"), "dim", Target::Tool(t.id.clone()));
                         }
-                        if t.locations.is_empty() && lines.is_empty() {
+                        if t.locations.is_empty() && lines.is_empty() && t.terminals.is_empty() {
                             r.styled("    (no output)", "dim", Target::Tool(t.id.clone()));
                         }
                     }
@@ -700,6 +762,9 @@ impl Agent {
 /// Tool output lines shown before "… N more lines".
 const MAX_TOOL_LINES: usize = 40;
 
+/// A terminal's last lines shown under its tool call.
+const MAX_TERMINAL_LINES: usize = 12;
+
 /// What a line of the agent buffer points at.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
@@ -708,6 +773,8 @@ pub enum Target {
     Tool(String),
     /// A file (and line) a tool touched: RET visits it.
     File(PathBuf, Option<u64>),
+    /// A buffer (the terminal a command runs in): RET shows it.
+    Buffer(String),
 }
 
 /// The agent buffer's text, its faces (character ranges) and each line's target.
@@ -841,7 +908,8 @@ while True:
     method = m.get("method")
     if method == "initialize":
         assert m["params"]["clientCapabilities"]["fs"]["readTextFile"]
-        send({"jsonrpc": "2.0", "id": m["id"], "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"protocolVersion": 1,
+              "agentCapabilities": {"promptCapabilities": {"embeddedContext": True}}}})
     elif method == "session/new":
         send({"jsonrpc": "2.0", "id": m["id"], "result": {"sessionId": "s1"}})
     elif method == "session/prompt":
@@ -881,6 +949,22 @@ while True:
                 reply_to(111)
             say(s, "Patched.")
             send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "end_turn"}})
+        elif text.startswith("run "):
+            # Runs a shell line in the editor's terminal, waits, reads it.
+            update(s, {"sessionUpdate": "tool_call", "toolCallId": "r1", "title": "Run it", "kind": "execute", "status": "in_progress"})
+            send({"jsonrpc": "2.0", "id": 120, "method": "terminal/create", "params": {"sessionId": s,
+                  "command": "sh", "args": ["-c", text[4:]], "env": [{"name": "GREETING", "value": "hi there"}], "outputByteLimit": 1000}})
+            tid = reply_to(120)["result"]["terminalId"]
+            update(s, {"sessionUpdate": "tool_call_update", "toolCallId": "r1", "content": [{"type": "terminal", "terminalId": tid}]})
+            send({"jsonrpc": "2.0", "id": 121, "method": "terminal/wait_for_exit", "params": {"sessionId": s, "terminalId": tid}})
+            code = reply_to(121)["result"]["exitCode"]
+            send({"jsonrpc": "2.0", "id": 122, "method": "terminal/output", "params": {"sessionId": s, "terminalId": tid}})
+            out = reply_to(122)["result"]["output"]
+            send({"jsonrpc": "2.0", "id": 123, "method": "terminal/release", "params": {"sessionId": s, "terminalId": tid}})
+            reply_to(123)
+            update(s, {"sessionUpdate": "tool_call_update", "toolCallId": "r1", "status": "completed"})
+            say(s, "exit %d: %s" % (code, out.replace("\n", " / ")))
+            send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "end_turn"}})
         elif text == "wait":
             say(s, "Thinking for a long time")
             while True:
@@ -888,6 +972,10 @@ while True:
                 if c.get("method") == "session/cancel": break
             send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "cancelled"}})
         else:
+            files = [b for b in m["params"]["prompt"][1:]]
+            if files:
+                names = ", ".join(b["resource"]["uri"].rsplit("/", 1)[-1] + "=" + b["resource"]["text"].strip() for b in files)
+                say(s, "Attached: " + names + ". ")
             say(s, "You said: " + text)
             send({"jsonrpc": "2.0", "id": m["id"], "result": {"stopReason": "end_turn"}})
 "#;

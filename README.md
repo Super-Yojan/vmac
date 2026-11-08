@@ -223,6 +223,16 @@ move through, search and yank the conversation, not change it; `i`, `a` or
   the other window at that line.
 - **`SPC a s`** asks about the current line, or the visual selection: it sends
   your question with the file, the line numbers and the code.
+- **`@` attaches a file.** Typing `@` at the start of a word in the prompt
+  opens the file picker; the chosen path goes in the prompt (`@src/lib.rs`),
+  and the file's text is sent along: your buffer's, saved or not. (Agents
+  that only take links to files get a link.)
+- **`SPC a e`** asks about the current file's problems: the language
+  server's errors and warnings, with the file. The question defaults to
+  "Fix these problems."
+- **Commands it runs show in vmac terminals** (`*agent: cargo test*`). A
+  running tool call shows the command's latest line; opened, its last lines,
+  and `RET` there opens the terminal. Stopping the agent stops them.
 - It reads files **through your buffers**, so it sees edits you haven't saved.
 - **Its edits wait for your review.** They're made at once and saved (so it
   can build and test them), in the file's buffer, which keeps the text from

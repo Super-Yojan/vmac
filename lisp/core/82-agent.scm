@@ -13,7 +13,12 @@
 ;; SPC a a: type to the agent      SPC a s: ask about the line or selection
 ;; SPC a c: cancel the run         SPC a p: answer a permission it waits on
 ;; SPC a n: a new conversation     SPC a k: stop the agent
-;; SPC a o: show *agent*
+;; SPC a o: show *agent*            SPC a e: ask about this file's problems
+;;
+;; In the prompt, @ at the start of a word picks a project file to attach:
+;; @src/lib.rs sends the file's text along (your buffer's, saved or not).
+;; Commands the agent runs show in terminals (*agent: cargo test*): the
+;; tool call shows their last lines; RET on it opens the terminal.
 ;;
 ;; Its edits are made at once (so it can build and test them) and saved,
 ;; and wait for your review: changed lines have a green band, deletions a
@@ -75,6 +80,22 @@
         (list "i" (agent-typing "i")) (list "a" (agent-typing "a"))
         (list "I" (agent-typing "I")) (list "A" (agent-typing "A"))
         (list "o" (agent-typing "o")) (list "O" (agent-typing "O"))))
+
+;; @ at the start of a word: pick a file to attach (ESC just types @).
+(defcommand (agent-attach)
+  (insert "@")
+  (let ((before (if (> (point) 1) (char-at (- (point) 2)) " ")))
+    (when (contains? '(" " "\n" "\t" "") before)
+      (let ((root (agent-root)))
+        (pick "Attach file" (project-files root) root
+              (lambda (path) (insert path) (insert " ")))))))
+
+(define-key agent-insert-map "@" 'agent-attach)
+
+;; SPC a e: the file's problems, with a question (default: fix them).
+(defcommand (agent-fix-problems)
+  (read-from-minibuffer "Ask about the problems: "
+    (lambda (question) (agent-ask-about-problems question))))
 
 (define-key agent-insert-map "C-RET" 'agent-send)
 (define-key agent-insert-map "s-RET" 'agent-send)
