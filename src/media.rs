@@ -55,6 +55,12 @@ pub struct PdfView {
     drawing: HashSet<usize>,
     failed: HashMap<usize, String>,
     list: ListState,
+    /// The theme's text and background colors (0xRRGGBB) pages are drawn
+    /// in, or None for black on white.
+    colors: Option<(u32, u32)>,
+    /// Bumped whenever drawn pages go stale (the file or the colors
+    /// changed), so pages still being drawn from before are thrown away.
+    generation: u64,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -73,6 +79,8 @@ impl PdfView {
             drawing: HashSet::new(),
             failed: HashMap::new(),
             list: ListState::new(count, ListAlignment::Top, px(1200.)),
+            colors: None,
+            generation: 0,
         }
     }
 
@@ -82,7 +90,12 @@ impl PdfView {
 
     /// Reads the file again if it changed since (a PDF rebuilt by LaTeX...),
     /// keeping the place.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh(&mut self, colors: Option<(u32, u32)>, cx: &mut Context<Self>) {
+        if colors != self.colors {
+            self.colors = colors;
+            self.forget_pages();
+            cx.notify();
+        }
         let now = modified(&self.path);
         if now == self.modified {
             return;
@@ -90,11 +103,17 @@ impl PdfView {
         let top = self.list.logical_scroll_top();
         self.modified = now;
         self.sizes = crate::pdf::page_sizes(&self.path);
-        self.pages.clear();
-        self.failed.clear();
+        self.forget_pages();
         self.list.reset(self.sizes.as_ref().map_or(0, Vec::len));
         self.list.scroll_to(top);
         cx.notify();
+    }
+
+    fn forget_pages(&mut self) {
+        self.generation += 1;
+        self.pages.clear();
+        self.failed.clear();
+        self.drawing.clear();
     }
 
     /// Draws page `ix` off the main thread, unless it is drawn or on its way.
@@ -106,15 +125,24 @@ impl PdfView {
         let points = sizes.get(ix).map_or(612., |s| s.0).min(PAGE_MAX_WIDTH);
         let width = (points * PAGE_PIXELS_PER_POINT).round() as u32;
         let path = self.path.clone();
-        let modified = self.modified;
+        let (generation, colors) = (self.generation, self.colors);
         cx.spawn(async move |this, cx| {
-            let drawn = cx.background_executor().spawn(async move { crate::pdf::render_page(&path, ix, width) }).await;
+            let drawn = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut drawn = crate::pdf::render_page(&path, ix, width)?;
+                    if let Some((foreground, background)) = colors {
+                        crate::pdf::recolor(&mut drawn.2, foreground, background);
+                    }
+                    Ok::<_, String>(drawn)
+                })
+                .await;
             let _ = this.update(cx, |view, cx| {
-                view.drawing.remove(&ix);
-                // The file changed while it was drawn: this page is stale.
-                if view.modified != modified {
+                // The file or the colors changed while it was drawn: it's stale.
+                if view.generation != generation {
                     return;
                 }
+                view.drawing.remove(&ix);
                 match drawn.and_then(|(w, h, pixels)| {
                     let buffer = image::RgbaImage::from_raw(w, h, pixels).ok_or("bad bitmap")?;
                     Ok(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
@@ -145,9 +173,13 @@ impl PdfView {
         let (w, h) = self.sizes.as_ref().ok().and_then(|s| s.get(ix)).copied().unwrap_or((612., 792.));
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
+        let (paper, ink) = match self.colors {
+            Some(_) => (theme.background, theme.foreground),
+            None => (gpui_kit::white(), gpui_kit::black()),
+        };
         let body = match (self.pages.get(&ix), self.failed.get(&ix)) {
             (Some(picture), _) => img(picture.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element(),
-            (None, Some(e)) => div().p(px(12.)).text_color(gpui_kit::black()).child(e.clone()).into_any_element(),
+            (None, Some(e)) => div().p(px(12.)).text_color(ink).child(e.clone()).into_any_element(),
             (None, None) => div().into_any_element(),
         };
         div()
@@ -163,7 +195,7 @@ impl PdfView {
                     .w_full()
                     .max_w(px(w.min(PAGE_MAX_WIDTH)))
                     .aspect_ratio(w / h.max(1.))
-                    .bg(gpui_kit::white())
+                    .bg(paper)
                     .border_1()
                     .border_color(border)
                     .shadow_sm()

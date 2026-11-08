@@ -149,8 +149,14 @@ pub enum Content {
     /// cursor's line, and the folder images are found from.
     Markdown { source: String, revision: u64, cursor_line: usize, folder: PathBuf },
     Review(ReviewView),
-    /// An image or a PDF, drawn by the window from the file.
-    Media { path: PathBuf, kind: MediaKind },
+    /// An image or a PDF, drawn by the window from the file; a PDF's pages
+    /// in the theme's colors when `themed`.
+    Media {
+        path: PathBuf,
+        kind: MediaKind,
+        #[serde(default)]
+        themed: bool,
+    },
 }
 
 /// Files shown as what they are rather than as text.

@@ -401,7 +401,7 @@ impl Session {
                 let content = if let Some(review) = review.as_ref().filter(|_| Some(w.buffer) == review_id) {
                     Content::Review(review.clone())
                 } else if let Some((path, kind)) = media {
-                    Content::Media { path, kind }
+                    Content::Media { path, kind, themed: st.pdf_themed }
                 } else if rendered.contains(id) {
                     Content::Markdown {
                         source: text.to_string(),
@@ -784,7 +784,7 @@ mod tests {
         s.editor.lock().open_file(&path).unwrap();
         let frame = s.frame(VIEW);
         match &frame.windows[0].content {
-            Content::Media { path: shown, kind } => {
+            Content::Media { path: shown, kind, .. } => {
                 assert_eq!((shown.as_path(), *kind), (std::path::absolute(&path).unwrap().as_path(), MediaKind::Pdf))
             }
             other => panic!("not media: {other:?}"),

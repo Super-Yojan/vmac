@@ -458,7 +458,10 @@ Opening an image (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.ico`)
 shows it, as large as the window allows and never larger than it is. A PDF
 shows its pages one under the other, to scroll through with the trackpad or
 wheel; pages are drawn as they come into view, and a PDF that changes on disk
-(rebuilt by LaTeX, say) reloads where you were. Both are read-only, and `:w`
+(rebuilt by LaTeX, say) reloads where you were. Pages take the theme's
+colors, paper as its background and ink as its text; `SPC t p` (or
+`vmac.set_pdf_themed(false)`) shows them black on white, as printed, for
+PDFs full of photos. Both are read-only, and `:w`
 won't write them. SVG files open as text. PDFs need macOS (CoreGraphics draws
 them), and both show only in a window on the machine that has the file.
 

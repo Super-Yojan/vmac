@@ -14,6 +14,26 @@ pub fn render_page(path: &Path, page: usize, width: u32) -> Result<(u32, u32, Ve
     imp::render_page(path, page, width)
 }
 
+/// Recolors drawn BGRA pixels to a theme: white paper becomes `background`,
+/// black ink `foreground` (both 0xRRGGBB), and the grays between them fall
+/// between the two. A color keeps how far it is from its own gray, so red
+/// stays reddish, only lighter or darker to suit.
+pub fn recolor(pixels: &mut [u8], foreground: u32, background: u32) {
+    let channel = |c: u32, shift: u32| ((c >> shift) & 0xff) as f32;
+    // B, G, R: the order the pixels are in.
+    let fg = [channel(foreground, 0), channel(foreground, 8), channel(foreground, 16)];
+    let bg = [channel(background, 0), channel(background, 8), channel(background, 16)];
+    for px in pixels.chunks_exact_mut(4) {
+        let (b, g, r) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let gray = 0.0722 * b + 0.7152 * g + 0.2126 * r;
+        let ink = 1. - gray / 255.;
+        for (i, c) in [b, g, r].into_iter().enumerate() {
+            let base = bg[i] + (fg[i] - bg[i]) * ink;
+            px[i] = (base + (c - gray)).round().clamp(0., 255.) as u8;
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2_core_foundation::{CFRetained, CFURL, CGPoint, CGRect, CGSize};
@@ -142,5 +162,20 @@ mod tests {
         assert!(render_page(&path, 1, 400).is_err(), "no second page");
         std::fs::remove_file(path).ok();
         assert!(page_sizes(Path::new("/nonexistent.pdf")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod recolor_tests {
+    #[test]
+    fn paper_takes_the_background_and_ink_the_foreground() {
+        // White, black, mid gray, red (BGRA), in a dark theme.
+        let mut px = [255, 255, 255, 255, 0, 0, 0, 255, 128, 128, 128, 255, 0, 0, 255, 255];
+        super::recolor(&mut px, 0xe0e0e0, 0x1e1e1e);
+        assert_eq!(px[0..4], [0x1e, 0x1e, 0x1e, 255], "paper");
+        assert_eq!(px[4..8], [0xe0, 0xe0, 0xe0, 255], "ink");
+        assert!((120..=135).contains(&px[8]), "gray between: {}", px[8]);
+        let (b, g, r) = (px[12], px[13], px[14]);
+        assert!(r > g + 100 && r > b + 100, "red stays red: {r} {g} {b}");
     }
 }

@@ -1262,6 +1262,9 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         };
     });
     prim!(reg, editor, "set-markdown-preview", |s, on: bool| s.markdown_preview = on);
+    // PDFs in the theme's colors (the default), or black on white.
+    prim!(reg, editor, "set-pdf-themed", |s, on: bool| s.pdf_themed = on);
+    prim!(reg, editor, "pdf-themed", |s| s.pdf_themed);
     prim!(reg, editor, "set-markdown-conceal", |s, on: bool| s.markdown_conceal = on);
     // SPC t m: markup hidden (the default) -> as typed -> rendered, like the preview.
     prim!(reg, editor, "markdown-view-cycle", |s| {
@@ -3564,6 +3567,16 @@ for line in sys.stdin:
         assert_eq!(editor.lock().line_numbers, "off");
         lisp.eval_lua("vmac.set_line_numbers('sideways')").unwrap();
         assert_eq!(editor.lock().line_numbers, "off", "unknown modes are refused");
+    }
+
+    #[test]
+    fn pdfs_follow_the_theme_until_toggled() {
+        let (mut lisp, editor) = lisp_with("");
+        assert!(editor.lock().pdf_themed, "on by default");
+        typed(&mut lisp, " tp");
+        assert!(!editor.lock().pdf_themed);
+        lisp.eval_lua("vmac.set_pdf_themed(not vmac.pdf_themed())").unwrap();
+        assert!(editor.lock().pdf_themed);
     }
 
     /// vmac on a file served by the fake language server (lsp.rs's tests).

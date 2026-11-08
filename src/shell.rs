@@ -244,10 +244,6 @@ impl Shell {
         }
         Theme::change(wanted, Some(window), cx);
         // Terminal programs that ask for the colors get the theme's.
-        let hex = |c: gpui_kit::Hsla| {
-            let c = c.to_rgb();
-            ((c.r * 255.).round() as u32) << 16 | ((c.g * 255.).round() as u32) << 8 | (c.b * 255.).round() as u32
-        };
         let t = cx.theme();
         let (foreground, background) = (hex(t.foreground), hex(t.background));
         self.session.handle(Input::TerminalColors { foreground, background });
@@ -376,8 +372,13 @@ impl Shell {
         &mut self,
         buffer: crate::frame::BufferId,
         path: &std::path::Path,
+        themed: bool,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Entity<crate::media::PdfView> {
+        let colors = themed.then(|| {
+            let t = cx.theme();
+            (hex(t.foreground), hex(t.background))
+        });
         let stale = self.pdf_views.get(&buffer).is_some_and(|v| v.read(cx).path() != path);
         if stale {
             self.pdf_views.remove(&buffer);
@@ -387,7 +388,7 @@ impl Shell {
             .entry(buffer)
             .or_insert_with(|| gpui_kit::AppContext::new(cx, |_| crate::media::PdfView::new(path.to_path_buf())))
             .clone();
-        view.update(cx, |v, cx| v.refresh(cx));
+        view.update(cx, |v, cx| v.refresh(colors, cx));
         view
     }
 
@@ -891,6 +892,12 @@ fn picker_element(picker: &PickerView, bar: bool, cx: &App) -> gpui_kit::AnyElem
     .into_any_element()
 }
 
+/// A color as 0xRRGGBB.
+fn hex(c: Hsla) -> u32 {
+    let c = c.to_rgb();
+    ((c.r * 255.).round() as u32) << 16 | ((c.g * 255.).round() as u32) << 8 | (c.b * 255.).round() as u32
+}
+
 /// Where a Markdown image is on disk: a path (relative to the file's
 /// folder, or absolute, or file://). None for web addresses and data.
 fn local_image(folder: &std::path::Path, url: &str) -> Option<std::path::PathBuf> {
@@ -1009,9 +1016,9 @@ impl Render for Shell {
                             )
                             .into_any_element()
                     }
-                    Content::Media { path, kind: MediaKind::Image } => crate::media::image_element(path, cx),
-                    Content::Media { path, kind: MediaKind::Pdf } => {
-                        let view = self.pdf_view(w.buffer, path, cx);
+                    Content::Media { path, kind: MediaKind::Image, .. } => crate::media::image_element(path, cx),
+                    Content::Media { path, kind: MediaKind::Pdf, themed } => {
+                        let view = self.pdf_view(w.buffer, path, *themed, cx);
                         div().flex_1().overflow_hidden().child(view).into_any_element()
                     }
                     Content::Text(lines) => v_flex()

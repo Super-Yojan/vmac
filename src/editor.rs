@@ -332,6 +332,8 @@ pub struct EditorState {
     /// the cursor's line).
     pub line_numbers: String,
     pub markdown_preview: bool,
+    /// PDF pages drawn in the theme's colors rather than black on white.
+    pub pdf_themed: bool,
     pub preview_last: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The coding agent (ACP), how to start it, its buffer, and the
@@ -547,6 +549,7 @@ impl EditorState {
             markdown_rendered: false,
             line_numbers: "off".into(),
             markdown_preview: false,
+            pdf_themed: true,
             preview_last: None,
             terminals_to_kill: Vec::new(),
             agent: None,
