@@ -8,9 +8,56 @@
 use crate::editor::SessionRequest;
 use crate::frame::{Frame, Input, Segment, Viewport};
 use crate::session::Session;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub type SessionId = u64;
+
+/// How often config files are checked for changes, language servers are
+/// synced and read, and terminals' screens are read.
+pub const RELOAD_POLL: Duration = Duration::from_millis(400);
+pub const LSP_POLL: Duration = Duration::from_millis(100);
+pub const TERMINAL_POLL: Duration = Duration::from_millis(30);
+
+/// What a window draws from: the sessions in this process (`Server`), or
+/// in a server it's attached to (`daemon::Client`).
+pub trait Host {
+    fn handle(&mut self, input: Input);
+    fn frame(&mut self, viewport: Viewport) -> Frame;
+    /// The window should close.
+    fn quit_requested(&self) -> bool;
+    /// Work done on timers; each says whether the screen changed.
+    fn reload_if_changed(&mut self) -> bool {
+        false
+    }
+    fn pump_terminals(&mut self) -> bool {
+        false
+    }
+    fn pump_servers(&mut self) -> bool {
+        false
+    }
+}
+
+impl Host for Server {
+    fn handle(&mut self, input: Input) {
+        Server::handle(self, input)
+    }
+    fn frame(&mut self, viewport: Viewport) -> Frame {
+        Server::frame(self, viewport)
+    }
+    fn quit_requested(&self) -> bool {
+        Server::quit_requested(self)
+    }
+    fn reload_if_changed(&mut self) -> bool {
+        Server::reload_if_changed(self)
+    }
+    fn pump_terminals(&mut self) -> bool {
+        Server::pump_terminals(self)
+    }
+    fn pump_servers(&mut self) -> bool {
+        Server::pump_servers(self)
+    }
+}
 
 /// Makes a session: a fresh editor with the config loaded.
 pub type Factory = Box<dyn FnMut() -> Session>;
@@ -278,6 +325,45 @@ impl Server {
 
     pub fn quit_requested(&self) -> bool {
         self.list.iter().find(|e| e.id == self.active).is_some_and(|e| e.session.quit_requested())
+    }
+
+    /// Whether the active session asked to quit, forgetting that it did (a
+    /// daemon detaches its windows instead).
+    pub fn take_quit(&mut self) -> bool {
+        std::mem::take(&mut self.active_session().editor().lock().quit_requested)
+    }
+
+    /// A window attaching: to the session named `target`, or the session
+    /// of the project in that folder (relative to `cwd`), made when there's
+    /// none such; None stays on the active one.
+    pub fn attach(&mut self, target: Option<&str>, cwd: &Path) {
+        let Some(target) = target.filter(|t| !t.is_empty()) else { return };
+        let path = cwd.join(target);
+        if path.is_dir() {
+            let root = std::path::absolute(&path).unwrap_or(path);
+            let fresh = self.active_session().editor().lock().project.is_none()
+                && !self.list.iter().any(|e| e.session.editor().lock().project.as_ref() == Some(&root));
+            if fresh {
+                // The session it's on has no project yet: this one is its.
+                let session = self.active_session();
+                let opened = session.editor().lock().project_open(&root);
+                match opened {
+                    Ok(_) => session.run_command("find-file-command"),
+                    Err(e) => session.editor().lock().message = e,
+                }
+            } else {
+                let from = self.active;
+                self.serve(from, SessionRequest::Project(root));
+            }
+        } else {
+            let request = match self.by_name(target) {
+                Some(_) => SessionRequest::Switch(target.to_string()),
+                None => SessionRequest::New { name: target.to_string(), root: None },
+            };
+            let from = self.active;
+            self.serve(from, request);
+        }
+        self.serve_requests();
     }
 
     // ---- Work on timers: every session's, so background ones keep up

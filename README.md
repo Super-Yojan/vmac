@@ -206,11 +206,43 @@ files you open (in `~/.local/state/vmac`).
 
 - `SPC p p` switches project: pick one (those you opened, then repositories
   it finds in `~/git`, `~/code`, `~/projects`, `~/src`, `~/dev`, `~/work`),
-  and the file picker opens in it. It becomes the working folder, for `:e`,
-  terminals and the agent.
+  and the file picker opens in it, in a session of its own (below). It
+  becomes that session's working folder, for `:e`, terminals and the agent.
 - `SPC p a` (or `:project PATH`) opens any folder by path; `SPC p d` forgets
   one.
 - `SPC f r` reopens a recent file; `SPC f P` opens your config.
+
+### Sessions
+
+Like tmux sessions: each project opens in its own, with its own buffers,
+windows, terminals, language servers and agent, so one project's files
+never show up in another's buffer list. The first project a session opens
+names it; with several, the modeline starts with `[name]`.
+
+- `SPC S s` switches session, `SPC S l` goes back to the last one.
+- `SPC S n` makes one (it asks a name), `SPC S r` renames this one.
+- `SPC S k` kills one (not with unsaved files: `SPC S K` kills it anyway).
+- `vmac.set_session_per_project(false)` opens projects in the session
+  you're in instead.
+
+### The server
+
+The sessions can live in a server that keeps running when the window
+closes, the way tmux does:
+
+```
+vmac attach            # a window on the server (started if none runs)
+vmac attach ~/git/app  # ... on that project's session (made the first time)
+vmac attach notes      # ... on the session named notes (made if none)
+vmac ls                # the server's sessions
+vmac kill-server       # stop it, and everything running in it
+```
+
+Closing an attached window, or `:q`, only detaches: terminals, language
+servers and agents carry on, and the next `vmac attach` finds everything
+as it was. Plain `vmac FILE` still runs on its own, without a server. The
+server listens on a socket only you can reach (`$VMAC_SOCKET` to choose
+another) and logs to `~/.local/state/vmac/server.log`.
 
 The dashboard is Scheme: redefine `dashboard-banner` or `dashboard-items`
 in your config, e.g.

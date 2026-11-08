@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
@@ -273,10 +273,7 @@ pub enum State {
 pub struct Agent {
     pub config: AgentConfig,
     pub root: PathBuf,
-    child: Child,
-    stdin: ChildStdin,
-    incoming: Receiver<Value>,
-    last_error: Arc<Mutex<String>>,
+    pipe: Pipe,
     next_id: i64,
     pending: HashMap<i64, Pending>,
     session: Option<String>,
@@ -323,53 +320,17 @@ impl std::fmt::Debug for Agent {
 impl Agent {
     /// Starts the agent in `root` and opens a session.
     pub fn start(config: AgentConfig, root: &Path) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt;
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
-            .current_dir(root)
-            // Its own process group, so stopping it stops what it started
-            // (npx runs the adapter as a child).
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let last_error = Arc::new(Mutex::new(String::new()));
-        if let Some(stderr) = child.stderr.take() {
-            let last = last_error.clone();
-            std::thread::spawn(move || {
-                // The first line that says "Error: why", else the last line.
-                let mut named = false;
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let line = line.trim().to_string();
-                    if line.is_empty() || named {
-                        continue;
-                    }
-                    named = line.starts_with("Error:") || line.contains("error:");
-                    *last.lock().unwrap_or_else(|e| e.into_inner()) = line;
-                }
-            });
-        }
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, incoming) = channel();
-        let label = config.name.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
-                log_traffic("<-", &label, &message);
-                if tx.send(message).is_err() {
-                    break;
-                }
-            }
-        });
+        let pipe = Pipe::spawn(&config, root)?;
+        Ok(Self::over(config, root, pipe))
+    }
+
+    /// Talks to an agent over `pipe` (a program started here, or one on
+    /// another machine) as if it ran in `root`, and opens a session.
+    pub fn over(config: AgentConfig, root: &Path, pipe: Pipe) -> Self {
         let mut agent = Self {
             config,
             root: root.to_path_buf(),
-            child,
-            stdin,
-            incoming,
-            last_error,
+            pipe,
             next_id: 0,
             pending: HashMap::new(),
             session: None,
@@ -405,14 +366,14 @@ impl Agent {
         );
         let name = agent.config.name.clone();
         agent.note(format!("Starting {name} in {}", root.display()));
-        Ok(agent)
+        agent
     }
 
     fn write(&mut self, message: &Value) {
         log_traffic("->", &self.config.name, message);
         let mut line = message.to_string();
         line.push('\n');
-        let _ = self.stdin.write_all(line.as_bytes()).and_then(|()| self.stdin.flush());
+        let _ = self.pipe.send.write_all(line.as_bytes()).and_then(|()| self.pipe.send.flush());
     }
 
     fn call(&mut self, kind: Pending, method: &str, params: Value) {
@@ -552,7 +513,7 @@ impl Agent {
         let before = self.revision;
         let mut gone = false;
         loop {
-            match self.incoming.try_recv() {
+            match self.pipe.incoming.try_recv() {
                 Ok(message) => self.handle(message),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -564,7 +525,7 @@ impl Agent {
         if gone && self.state != State::Exited {
             self.state = State::Exited;
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let why = self.last_error.lock().map(|l| l.clone()).unwrap_or_default();
+            let why = self.pipe.last_error.lock().map(|l| l.clone()).unwrap_or_default();
             let name = self.config.name.clone();
             self.note(if why.is_empty() { format!("{name} stopped") } else { format!("{name} stopped: {why}") });
         }
@@ -723,10 +684,10 @@ impl Agent {
                 // Nothing more will work; stop it so the next prompt starts afresh.
                 self.state = State::Exited;
                 self.queued.clear();
-                kill_tree(&mut self.child);
+                (self.pipe.stop)();
                 // The protocol's error is often generic; what it printed says why.
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                let why = self.last_error.lock().map(|l| l.clone()).unwrap_or_default();
+                let why = self.pipe.last_error.lock().map(|l| l.clone()).unwrap_or_default();
                 let text = if why.is_empty() { text } else { format!("{text} ({why})") };
                 self.note(format!("{} couldn't start: {text}", self.config.name));
             }
@@ -1104,8 +1065,80 @@ pub fn line_diff(old: &str, new: &str) -> String {
 
 impl Drop for Agent {
     fn drop(&mut self) {
-        kill_tree(&mut self.child);
-        let _ = self.child.wait();
+        (self.pipe.stop)();
+    }
+}
+
+/// How the agent's messages travel: lines of JSON written to `send`, and
+/// the ones it sends back on `incoming`. Usually a program's stdin and
+/// stdout; it can as well be lines carried from the machine a client runs
+/// on, so an agent you're logged into there edits files here.
+pub struct Pipe {
+    send: Box<dyn Write + Send>,
+    incoming: Receiver<Value>,
+    /// What it printed on stderr that says why it failed.
+    last_error: Arc<Mutex<String>>,
+    /// Stops it (called again on drop: must not mind).
+    stop: Box<dyn FnMut() + Send>,
+}
+
+impl Pipe {
+    /// For agents on a client's machine (not wired up yet).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(send: Box<dyn Write + Send>, incoming: Receiver<Value>, stop: Box<dyn FnMut() + Send>) -> Self {
+        Self { send, incoming, last_error: Default::default(), stop }
+    }
+
+    /// Runs the agent's program in `root`.
+    fn spawn(config: &AgentConfig, root: &Path) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new(&config.command)
+            .args(&config.args)
+            .current_dir(root)
+            // Its own process group, so stopping it stops what it started
+            // (npx runs the adapter as a child).
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let last_error = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let last = last_error.clone();
+            std::thread::spawn(move || {
+                // The first line that says "Error: why", else the last line.
+                let mut named = false;
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let line = line.trim().to_string();
+                    if line.is_empty() || named {
+                        continue;
+                    }
+                    named = line.starts_with("Error:") || line.contains("error:");
+                    *last.lock().unwrap_or_else(|e| e.into_inner()) = line;
+                }
+            });
+        }
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, incoming) = channel();
+        let label = config.name.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+                log_traffic("<-", &label, &message);
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut child = Some(child);
+        let stop = Box::new(move || {
+            if let Some(mut child) = child.take() {
+                kill_tree(&mut child);
+                let _ = child.wait();
+            }
+        });
+        Ok(Self { send: Box::new(stdin), incoming, last_error, stop })
     }
 }
 
@@ -1279,6 +1312,32 @@ while True:
         agent.cancel();
         assert!(wait_until(&mut agent, |a| a.state == State::Idle), "{:?}", agent.entries);
         assert!(agent.transcript().contains("— Cancelled"), "{}", agent.transcript());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent whose lines come from elsewhere (as they will from a
+    /// client's machine): a channel in, a writer out.
+    #[test]
+    fn an_agent_over_a_carried_pipe() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-pipe-{}", std::process::id()));
+        let config = fake_config(&dir);
+        let mut child = Command::new(&config.command)
+            .args(&config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = tx.send(serde_json::from_str(&line).unwrap());
+            }
+        });
+        let pipe = Pipe::new(Box::new(stdin), rx, Box::new(move || drop(child.kill())));
+        let mut agent = Agent::over(config, &dir, pipe);
+        agent.prompt("hello");
+        assert!(wait_until(&mut agent, |a| a.entries.contains(&Entry::Agent("You said: hello".into()))), "{:?}", agent.entries);
         std::fs::remove_dir_all(&dir).ok();
     }
 

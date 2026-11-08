@@ -7,7 +7,7 @@ use crate::frame::{
     CHAR_WIDTH, Content, Echo, FONT_SIZE, Face, Frame, FrameLine, FrameWindow, Input, Mods, PickerView, ROW_HEIGHT,
     ThemeRequest, Viewport, WindowId,
 };
-use crate::server::Server;
+use crate::server::{Host, LSP_POLL, RELOAD_POLL, TERMINAL_POLL};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
@@ -17,11 +17,6 @@ use gpui_kit::{
 };
 use std::time::Duration;
 
-const RELOAD_POLL: Duration = Duration::from_millis(400);
-/// How often language servers are synced and read.
-const LSP_POLL: Duration = Duration::from_millis(100);
-/// How often terminals' screens are read.
-const TERMINAL_POLL: Duration = Duration::from_millis(30);
 /// The documentation popup K shows.
 const HOVER_WIDTH: f32 = 560.;
 const HOVER_MAX_HEIGHT: f32 = 320.;
@@ -29,7 +24,8 @@ const HOVER_MAX_HEIGHT: f32 = 320.;
 const COMPLETION_WIDTH: f32 = 460.;
 
 pub struct Shell {
-    session: Server,
+    /// The sessions in this process, or a server's (`vmac attach`).
+    session: Box<dyn Host>,
     focus: FocusHandle,
     /// The light/dark mode last applied, the system appearance last told
     /// to the session, and the subscription that hears it change.
@@ -124,7 +120,7 @@ struct MdView {
 }
 
 impl Shell {
-    pub fn new(mut session: Server, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(mut session: Box<dyn Host>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         // What this machine has: its fonts, and the themes (built in, then
@@ -220,13 +216,17 @@ impl Shell {
 
     /// Calls `work` on the session every `every`, drawing again when it says
     /// something changed.
-    fn every(cx: &mut Context<Self>, every: Duration, work: fn(&mut Server) -> bool) {
+    fn every(cx: &mut Context<Self>, every: Duration, work: fn(&mut dyn Host) -> bool) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(every).await;
                 let alive = this.update(cx, |shell, cx| {
-                    if work(&mut shell.session) {
+                    if work(shell.session.as_mut()) {
                         cx.notify();
+                    }
+                    // A server we're attached to can let go of us any time.
+                    if shell.session.quit_requested() {
+                        cx.quit();
                     }
                 });
                 if alive.is_err() {
@@ -239,18 +239,18 @@ impl Shell {
 
     /// Reloads lisp/core/ and init.scm when they change on disk.
     fn watch_sources(cx: &mut Context<Self>) {
-        Self::every(cx, RELOAD_POLL, Server::reload_if_changed);
+        Self::every(cx, RELOAD_POLL, |host| host.reload_if_changed());
     }
 
     /// Reads terminals' screens into their buffers, often enough that typing
     /// into one feels immediate.
     fn drive_terminals(cx: &mut Context<Self>) {
-        Self::every(cx, TERMINAL_POLL, Server::pump_terminals);
+        Self::every(cx, TERMINAL_POLL, |host| host.pump_terminals());
     }
 
     /// Syncs files with their language servers and reads what they report.
     fn drive_language_servers(cx: &mut Context<Self>) {
-        Self::every(cx, LSP_POLL, Server::pump_servers);
+        Self::every(cx, LSP_POLL, |host| host.pump_servers());
     }
 
     /// Hands the session an input, then draws again (or quits).
