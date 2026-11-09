@@ -384,6 +384,9 @@ pub struct EditorState {
     review_shown: u64,
     /// Git: the signs in files' gutters, blame (see git.rs).
     pub git: crate::git::Git,
+    /// Buffers holding a unified diff (a commit, *git-show*) drawn with
+    /// gpui-kit's Diff, like *agent-review*.
+    pub diff_buffers: std::collections::HashSet<BufferId>,
     /// Recent files and projects (in memory only until `set_state_dir`).
     pub history: crate::projects::History,
     /// The project opened last (SPC p p), for buffers without a file.
@@ -591,6 +594,7 @@ impl EditorState {
             review_comments: Vec::new(),
             review_shown: 0,
             git: crate::git::Git::new(),
+            diff_buffers: Default::default(),
             history: Default::default(),
             project: None,
             dashboard_buffer: None,
@@ -2648,9 +2652,31 @@ impl EditorState {
     /// Puts the review buffer's cursor on the row for a file line (a click
     /// in the Diff).
     pub fn review_select(&mut self, rel: &str, modified: bool, line: usize) {
-        let Some(row) = self.review_rows.iter().position(|r| r.as_ref().is_some_and(|r| r.rel == rel && r.modified == modified && r.line == line)) else { return };
+        let Some(row) = self.review_rows.iter().position(|r| r.as_ref().is_some_and(|r| r.rel == rel && r.modified == modified && r.line == line)) else {
+            return self.diff_select(rel, modified, line);
+        };
         let Some(id) = self.review_buffer_id() else { return };
         let Some(w) = self.windows.iter().find(|w| w.buffer == id).map(|w| w.id) else { return };
+        self.select_window(w);
+        let pos = self.buffer().line_to_pos(row);
+        self.buffer_mut().goto_char(pos);
+        self.window_mut().point = pos;
+    }
+
+    /// A click in a diff buffer's Diff: the cursor to that row (in the
+    /// selected window's diff buffer, else the first one shown).
+    fn diff_select(&mut self, rel: &str, modified: bool, line: usize) {
+        let shown: Vec<(WindowId, BufferId)> = self
+            .windows
+            .iter()
+            .filter(|w| self.diff_buffers.contains(&w.buffer))
+            .map(|w| (w.id, w.buffer))
+            .collect();
+        let selected = self.selected_window();
+        let Some(&(w, id)) = shown.iter().find(|(w, _)| *w == selected).or(shown.first()) else { return };
+        let Some(text) = self.buffer_by_id(id).map(|b| b.text().to_string()) else { return };
+        let target = (rel.to_string(), modified, line);
+        let Some(row) = crate::git::diff_rows(&text).iter().position(|r| r.as_ref() == Some(&target)) else { return };
         self.select_window(w);
         let pos = self.buffer().line_to_pos(row);
         self.buffer_mut().goto_char(pos);

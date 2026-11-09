@@ -171,16 +171,15 @@ function core.terminal_normal()
 end
 
 -- Buffers with keymaps of their own, by name: { name, normal state's
--- keymap, insert state's (optional) }, e.g. { "*git-status*", "git_status" }.
+-- keymap, insert state's, visual state's } (the last two optional), e.g.
+-- { "*git-status*", "git_status" }.
 core.buffer_keymaps = core.buffer_keymaps or {}
 
-function core.buffer_keymap(insert)
+function core.buffer_keymap(mode)
   local name = V.buffer_name()
+  local slot = ({ normal = 2, insert = 3, visual = 4 })[mode or "normal"]
   for _, e in ipairs(core.buffer_keymaps) do
-    if e[1] == name then
-      local map = core.keymaps[insert and e[3] or e[2]]
-      if map and (e[3] or not insert) then return map end
-    end
+    if e[1] == name and e[slot] then return core.keymaps[e[slot]] end
   end
 end
 
@@ -195,8 +194,10 @@ function core.current_keymaps()
   if normal and V.dashboard_here() then return { k.dashboard, k.normal } end
   if normal and V.review_here() then return { k.review, k.normal } end
   if normal and V.media_here() then return { k.media, k.normal } end
-  local own = (normal or (core.state == "insert" and plain)) and core.buffer_keymap(core.state == "insert")
+  local own = (normal and core.buffer_keymap("normal")) or (core.state == "insert" and plain and core.buffer_keymap("insert"))
   if own then return { own, core.state == "insert" and k.insert or k.normal } end
+  local own_visual = plain and core.visual() and core.buffer_keymap("visual")
+  if own_visual then return { own_visual, k.visual } end
   if normal and V.agent_here() then return { k.agent, k.normal } end
   if core.state == "insert" and plain and V.agent_here() then return { k.agent_insert, k.insert } end
   if core.picker_normal() then

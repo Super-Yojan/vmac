@@ -19,11 +19,25 @@
 --                                     a commit, a stash: show it)
 --   s    stage it                u    unstage it
 --   x    discard it (asks)       S / U  stage / unstage everything
+--        (in visual state, on lines of a hunk: s, u and x do just those)
 --   c c  commit  c a  amend  c e  amend without editing the message
 --   b b  switch branch  b c  new branch  b k  delete a branch
 --   P p  push  F p  pull  f f  fetch    (in the background)
 --   z z  stash  z p  pop  z a  apply  z k  drop (the stash under the cursor)
 --   l l  log  l a  all branches' log    g r  refresh    q  close
+--   m m  merge a branch           r u  rebase onto the upstream
+--
+-- On a commit (here, in the log, a commit's page, the blame):
+--   A    cherry-pick it          _    revert it (a new commit undoing it)
+--   X s / X m / X h   reset to it: soft, mixed, hard (asks)
+--   r i  rebase interactively from it: *git-rebase* lists the commits,
+--        p r e s f d pick / reword / edit / squash / fixup / drop the one
+--        under the cursor, C-j / C-k move it, C-c C-c rebases.
+-- When git stops (conflicts, an edit), the status says so: fix and stage,
+-- then r r continues, r s skips, r a aborts (a merge: commit with c c).
+--
+-- A commit's page (*git-show*) is drawn with gpui-kit's Diff, its message
+-- above; RET on a change visits it. :git-diff-view-toggle draws it as text.
 --
 -- The commit message is a buffer (*git-commit*): write it, then C-c C-c
 -- (or Z Z) commits and C-c C-k cancels. Lines starting with # are left out.
@@ -34,7 +48,7 @@
 --   ] c  [ c the next / previous change     SPC g s  stage the change here
 --   SPC g r  reset the change here (u undoes it)
 --   The cursor's line says who last changed it, and when (SPC g B turns
---   that off); SPC g b shows that commit.
+--   that off); SPC g v shows that commit, SPC g b the whole file's blame.
 --   SPC g l  this file's history    SPC g L  the history of this line (or
 --            of the selected lines)
 --   SPC g o  open the line (or selection) on GitHub/GitLab; SPC g y copies
@@ -52,11 +66,22 @@ G.status_buffer = "*git-status*"
 G.commit_buffer = "*git-commit*"
 G.log_buffer = "*git-log*"
 G.show_buffer = "*git-show*"
+G.blame_buffer = "*git-blame*"
+G.rebase_buffer = "*git-rebase*"
+-- A commit's changes drawn with gpui-kit's Diff (side by side or unified,
+-- word-level); false: as colored text.
+G.diff_view = true
 
 ---- Running git
 
--- The repository of the current file (or of the session's folder).
+-- The repository of the current file (or of the session's folder); in a
+-- git buffer, the one it shows.
 function G.root()
+  local shown = ({
+    [G.status_buffer] = G.status_root, [G.log_buffer] = G.log_root, [G.show_buffer] = G.show_root,
+    [G.blame_buffer] = G.blame_root, [G.rebase_buffer] = G.rebase_root, [G.commit_buffer] = G.commit_root,
+  })[V.buffer_name()]
+  if shown then return shown end
   local root = V.git_root()
   if root == "" then
     V.message("Not in a git repository")
@@ -250,6 +275,11 @@ function G.refresh(keep)
     local state = #where > 0 and table.concat(where, " ") or "up to date"
     add(pieces({ { "Upstream: ", "git-label" }, { s.upstream, "git-ref" }, { "  " .. state, "dim" } }))
   end
+  G.op = G.operation(root)
+  if G.op then
+    local keys = G.op.kind == "merge" and "  c c commit · r a abort" or "  r r continue · r s skip · r a abort"
+    add(pieces({ { "Doing:    ", "git-label" }, { G.op.title, "yellow" }, { keys, "dim" } }))
+  end
   add(line(""))
 
   local function section(key, title, n)
@@ -401,6 +431,53 @@ local function with_paths(args, paths)
   for _, p in ipairs(paths) do all[#all + 1] = p end
   return all
 end
+
+-- The first and last lines of the visual selection (leaving visual state).
+function G.selected_lines()
+  local b = core.visual_bounds()
+  local save = V.point()
+  V.goto_char(b[1])
+  local from = V.line_number()
+  V.goto_char(math.max(b[1], b[2] - 1))
+  local to = V.line_number()
+  V.goto_char(save)
+  core.state = "normal"
+  return from, to
+end
+
+-- The selected rows of one hunk in the status buffer: its item and the rows
+-- (1-based, after its @@ line); nil after saying why not.
+local function selected_rows()
+  local from, to = G.selected_lines()
+  local first, rows = nil, {}
+  for i = from, to do
+    local it = G.items[i]
+    if not it or it.kind ~= "hunk" or (first and (it.path ~= first.path or it.hunk ~= first.hunk or it.section ~= first.section)) then
+      V.message("Select lines inside one hunk (TAB on a file shows its hunks)")
+      return nil
+    end
+    first = first or it
+    if it.row > 1 then rows[#rows + 1] = it.row - 1 end
+  end
+  return first, rows
+end
+
+-- s, u or x on selected lines of a hunk: just those lines.
+local function on_lines(action)
+  local it, rows = selected_rows()
+  if not it then return end
+  local wrong = (action == "unstage") ~= (it.section == "staged")
+  if wrong then return V.message(action == "unstage" and "Not staged" or "Those lines are staged (u unstages them)") end
+  local function go()
+    local err = V.git_hunk_apply(G.status_root, it.path, it.hunk, action, rows)
+    if err ~= "" then V.message(err) end
+    changed()
+  end
+  if action == "discard" then core.confirm("Discard the selected lines?", go) else go() end
+end
+G.stage_lines = function() on_lines("stage") end
+G.unstage_lines = function() on_lines("unstage") end
+G.discard_lines = function() on_lines("discard") end
 
 function G.stage()
   local it, root = G.item(), G.status_root
@@ -775,11 +852,13 @@ function G.show(root, rev, stash)
     or { "show", "--stat", "--patch", "--format=fuller", "--color=never", rev }
   local out = G.run(root, args)
   if not out then return end
-  G.show_text(root, out, rev)
+  G.show_text(root, out, rev, true)
 end
 
--- Draws diff-ish text (git show, git log -L) into *git-show*.
-function G.show_text(root, out, title)
+-- Draws diff-ish text (git show, git log -L) into *git-show*; `as_diff`:
+-- drawn with gpui-kit's Diff (one commit's changes), else as text.
+function G.show_text(root, out, title, as_diff)
+  V.set_buffer_diff(G.show_buffer, as_diff and G.diff_view and out:find("diff %-%-git") ~= nil or false)
   local lines = {}
   for _, l in ipairs(lines_of(out)) do
     if l:match("^commit ") then
@@ -957,6 +1036,337 @@ function G.copy_url()
   end
 end
 
+---- Operations in progress: rebase, merge, cherry-pick, revert
+
+local git_dirs = {}
+function G.git_dir(root)
+  if not git_dirs[root] then
+    local out = G.ask(root, { "rev-parse", "--absolute-git-dir" })
+    git_dirs[root] = out and out:gsub("%s+$", "") or (root .. "/.git")
+  end
+  return git_dirs[root]
+end
+
+local function read_file(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local text = f:read("a")
+  f:close()
+  return (text:gsub("%s+$", ""))
+end
+
+-- What git is in the middle of: { kind, title }, or nil.
+function G.operation(root)
+  local dir = G.git_dir(root)
+  local function short(ref) return (ref or ""):gsub("^refs/heads/", ""):sub(1, 40) end
+  for _, sub in ipairs({ "rebase-merge", "rebase-apply" }) do
+    if V.file_exists(dir .. "/" .. sub) then
+      local head = short(read_file(dir .. "/" .. sub .. "/head-name"))
+      local onto = (read_file(dir .. "/" .. sub .. "/onto") or ""):sub(1, 7)
+      local step, total = read_file(dir .. "/" .. sub .. "/msgnum"), read_file(dir .. "/" .. sub .. "/end")
+      local where = step and total and (" (" .. step .. "/" .. total .. ")") or ""
+      return { kind = "rebase", title = "Rebasing " .. head .. " onto " .. onto .. where }
+    end
+  end
+  if V.file_exists(dir .. "/MERGE_HEAD") then
+    return { kind = "merge", title = "Merging " .. (read_file(dir .. "/MERGE_HEAD") or ""):sub(1, 7) }
+  end
+  if V.file_exists(dir .. "/CHERRY_PICK_HEAD") then
+    return { kind = "cherry-pick", title = "Cherry-picking " .. (read_file(dir .. "/CHERRY_PICK_HEAD") or ""):sub(1, 7) }
+  end
+  if V.file_exists(dir .. "/REVERT_HEAD") then
+    return { kind = "revert", title = "Reverting " .. (read_file(dir .. "/REVERT_HEAD") or ""):sub(1, 7) }
+  end
+  return nil
+end
+
+-- After something that may stop on conflicts: say what to do next.
+local function after_operation(root, ok, err, done)
+  changed()
+  if ok then return V.message(done) end
+  local op = G.operation(root)
+  if op then
+    V.message(op.title .. ": " .. (err:match("CONFLICT[^\n]*") or "stopped") .. " — fix, stage (s), then r r")
+  else
+    V.message(last_line(err))
+  end
+end
+
+-- Runs git without an editor (messages are kept as git prepares them).
+local function quiet(root, args)
+  local all = { "-c", "core.editor=true" }
+  for _, a in ipairs(args) do all[#all + 1] = a end
+  local ok, out, err = V.git(root, all, nil)
+  return ok, (err ~= "" and err or out)
+end
+
+-- r r, r s, r a: continue, skip or abort what's in progress.
+local function operation_step(step)
+  local root = G.status_root or G.root()
+  if not root then return end
+  local op = G.operation(root)
+  if not op then return V.message("Nothing in progress") end
+  if op.kind == "merge" then
+    if step == "abort" then
+      local ok, err = quiet(root, { "merge", "--abort" })
+      return after_operation(root, ok, err, "Merge aborted")
+    end
+    return V.message("Finish the merge by committing (c c), or abort it (r a)")
+  end
+  local ok, err = quiet(root, { op.kind, "--" .. step })
+  after_operation(root, ok, err, ({ continue = "Done: ", skip = "Skipped: ", abort = "Aborted: " })[step] .. op.title:lower())
+end
+G.continue = function() operation_step("continue") end
+G.skip = function() operation_step("skip") end
+G.abort = function() operation_step("abort") end
+
+---- Commits: cherry-pick, revert, reset, merge
+
+-- The commit under the cursor: in the status buffer, the log, *git-show*
+-- or *git-blame*.
+function G.commit_at()
+  local name = V.buffer_name()
+  if name == G.status_buffer then
+    local it = G.item()
+    return it and it.kind == "commit" and it.hash or nil, G.status_root
+  elseif name == G.log_buffer then
+    return G.log_items[V.line_number()], G.log_root
+  elseif name == G.show_buffer then
+    return V.buffer_string():match("^commit (%x+)"), G.show_root
+  elseif name == G.blame_buffer then
+    local h = G.blame_items[V.line_number()]
+    return h and not h:match("^0+$") and h or nil, G.blame_root
+  end
+end
+
+local function with_commit(what, fn)
+  return function()
+    local hash, root = G.commit_at()
+    if not hash then return V.message("Put the cursor on a commit to " .. what) end
+    fn(root, hash)
+  end
+end
+
+G.cherry_pick = with_commit("cherry-pick", function(root, hash)
+  local ok, err = quiet(root, { "cherry-pick", hash })
+  after_operation(root, ok, err, "Picked " .. hash)
+end)
+
+G.revert = with_commit("revert", function(root, hash)
+  core.confirm("Revert " .. hash .. " (a new commit undoing it)?", function()
+    local ok, err = quiet(root, { "revert", "--no-edit", hash })
+    after_operation(root, ok, err, "Reverted " .. hash)
+  end)
+end)
+
+local function reset(mode)
+  return with_commit("reset to", function(root, hash)
+    local go = function()
+      local ok, err = quiet(root, { "reset", "-q", "--" .. mode, hash })
+      after_operation(root, ok, err, "Reset (" .. mode .. ") to " .. hash)
+    end
+    if mode == "hard" then
+      core.confirm("Reset hard to " .. hash .. "? Uncommitted changes are lost", go)
+    else
+      go()
+    end
+  end)
+end
+G.reset_soft, G.reset_mixed, G.reset_hard = reset("soft"), reset("mixed"), reset("hard")
+
+function G.merge()
+  local root = G.status_root or G.root()
+  if not root then return end
+  local current = V.git_branch(root)
+  local list = {}
+  for _, b in ipairs(branches(root, true)) do if b ~= current then list[#list + 1] = b end end
+  core.pick("Merge into " .. current, list, "", function(b)
+    local ok, err = quiet(root, { "merge", "--no-edit", b })
+    after_operation(root, ok, err, "Merged " .. b)
+  end)
+end
+
+-- r u: rebase onto the upstream.
+function G.rebase_upstream()
+  local root = G.status_root or G.root()
+  if not root then return end
+  local ok, err = quiet(root, { "rebase", "@{upstream}" })
+  after_operation(root, ok, err, "Rebased onto the upstream")
+end
+
+---- Interactive rebase: *git-rebase*
+
+local actions = { p = "pick", r = "reword", e = "edit", s = "squash", f = "fixup", d = "drop" }
+local action_faces = { pick = "default", reword = "blue", edit = "yellow", squash = "magenta", fixup = "magenta", drop = "red" }
+
+function G.rebase_draw()
+  local out = {}
+  for _, t in ipairs(G.todo) do
+    local parts = { { string.format("%-7s", t.action), action_faces[t.action] }, { t.hash, "git-hash" }, { " " .. (t.message or t.subject), t.action == "drop" and "dim" or nil } }
+    out[#out + 1] = pieces(parts)
+  end
+  out[#out + 1] = line("")
+  out[#out + 1] = line("Rebasing " .. #G.todo .. " commits onto " .. G.rebase_base_label .. ", oldest first.", "dim")
+  out[#out + 1] = line("p pick · r reword · e edit (stop there) · s squash · f fixup · d drop", "dim")
+  out[#out + 1] = line("C-j / C-k move a commit down / up · C-c C-c (or Z Z) rebases · C-c C-k cancels", "dim")
+  draw(G.rebase_buffer, out, V.buffer_name() == G.rebase_buffer and V.line_number() or nil)
+end
+
+-- r i: the commits from the one under the cursor to HEAD, to reorder,
+-- squash, reword, edit or drop.
+G.rebase_interactive = with_commit("rebase from", function(root, hash)
+  if not V.git(root, { "merge-base", "--is-ancestor", hash, "HEAD" }, nil) then
+    return V.message(hash .. " isn't in the current branch")
+  end
+  local parent = G.ask(root, { "rev-parse", "--verify", "-q", hash .. "^" })
+  local range = parent and (hash .. "^..HEAD") or "HEAD"
+  G.rebase_root, G.rebase_onto = root, parent and parent:gsub("%s+$", "") or nil
+  G.rebase_base_label = parent and parent:sub(1, 7) or "the root"
+  G.todo = {}
+  for _, l in ipairs(lines_of(G.ask(root, { "log", "--reverse", "--format=%h%x1f%s", range }))) do
+    local h, subject = l:match("^([^\31]*)\31(.*)$")
+    if h then G.todo[#G.todo + 1] = { action = "pick", hash = h, subject = subject } end
+  end
+  if #G.todo == 0 then return V.message("Nothing to rebase") end
+  if not core.contains({ G.log_buffer, G.show_buffer, G.status_buffer, G.rebase_buffer }, V.buffer_name()) then G.return_to = V.buffer_name() end
+  G.rebase_draw()
+  V.switch_to_buffer(G.rebase_buffer)
+  V.goto_line_column(1, 1)
+end)
+
+local function todo_here()
+  local n = V.line_number()
+  return G.todo[n] and n or nil
+end
+
+local function set_action(key)
+  return function()
+    local n = todo_here()
+    if not n then return end
+    local t = G.todo[n]
+    t.action = actions[key]
+    if key == "r" then
+      V.prompt("New message: ", function(msg)
+        t.message = msg ~= "" and msg or nil
+        if not t.message then t.action = "pick" end
+        G.rebase_draw()
+      end, t.message or t.subject)
+    elseif key == "s" and n == 1 or key == "f" and n == 1 then
+      t.action = "pick"
+      V.message("The first commit has nothing above it to squash into")
+    end
+    G.rebase_draw()
+    if key ~= "r" then V.goto_line_column(math.min(n + 1, #G.todo), 1) end
+  end
+end
+
+local function move(by)
+  return function()
+    local n = todo_here()
+    if not n or not G.todo[n + by] then return end
+    G.todo[n], G.todo[n + by] = G.todo[n + by], G.todo[n]
+    G.rebase_draw()
+    V.goto_line_column(n + by, 1)
+  end
+end
+
+local function temp_file(text)
+  local path = os.tmpname()
+  local f = io.open(path, "w")
+  f:write(text)
+  f:close()
+  return path
+end
+
+local function shell_quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+
+function G.rebase_start()
+  local root = G.rebase_root
+  local todo = {}
+  for _, t in ipairs(G.todo) do
+    if t.action == "reword" and t.message then
+      -- Reworded without an editor: picked, then amended with the message.
+      todo[#todo + 1] = "pick " .. t.hash .. " " .. t.subject
+      todo[#todo + 1] = "exec git commit --amend -q -F " .. shell_quote(temp_file(t.message .. "\n"))
+    else
+      todo[#todo + 1] = t.action .. " " .. t.hash .. " " .. t.subject
+    end
+  end
+  local file = temp_file(table.concat(todo, "\n") .. "\n")
+  local args = { "-c", "sequence.editor=cp " .. shell_quote(file), "-c", "core.editor=true", "rebase", "-i" }
+  args[#args + 1] = G.rebase_onto or "--root"
+  local ok, out, err = V.git(root, args, nil)
+  V.set_buffer_text(G.rebase_buffer, "")
+  if not (G.status_root == root and V.switch_to_buffer(G.status_buffer)) then G.close() end
+  G.status_root = G.status_root or root
+  after_operation(root, ok, err ~= "" and err or out, "Rebased " .. #G.todo .. " commits")
+  if V.buffer_name() == G.status_buffer then G.refresh(true) end
+end
+
+function G.rebase_cancel()
+  V.set_buffer_text(G.rebase_buffer, "")
+  if not (G.status_root and V.switch_to_buffer(G.status_buffer)) then G.close() end
+  V.message("Not rebased")
+end
+
+---- Blame, the whole file: *git-blame*
+
+G.blame_items = {}
+
+-- SPC g b: each line with the commit that last changed it.
+function G.blame_view()
+  local root, rel = here()
+  if not root then return end
+  local text = V.buffer_string()
+  local blame, err = V.git_blame(root, rel, text)
+  if err ~= "" then return V.message("git blame: " .. last_line(err)) end
+  local out, items, previous = {}, {}, nil
+  local width = 0
+  for _, b in ipairs(blame) do if b[2] then width = math.max(width, math.min(18, core.length(b[2]))) end end
+  local pad = function(s, n)
+    s = core.length(s) > n and (s:sub(1, n - 1) .. "…") or s
+    return s .. string.rep(" ", n - core.length(s))
+  end
+  for i, code in ipairs(lines_of(text)) do
+    local b = blame[i] or {}
+    local parts
+    if b[1] and b[1] ~= previous then
+      if b[1]:match("^0+$") then
+        parts = { { pad("Not committed yet", 8 + width + 15), "dim" } }
+      else
+        parts = { { b[1]:sub(1, 7), "git-hash" }, { " " .. pad(b[2], width) }, { " " .. pad(b[3], 14), "dim" } }
+      end
+    else
+      parts = { { string.rep(" ", 8 + width + 15) } }
+    end
+    parts[#parts + 1] = { " │ ", "dim" }
+    parts[#parts + 1] = { code }
+    out[#out + 1] = pieces(parts)
+    items[#out] = b[1]
+    previous = b[1]
+  end
+  local line_now = V.line_number()
+  G.blame_file, G.blame_root, G.blame_items = V.buffer_file_name(), root, items
+  G.return_to = V.buffer_name()
+  draw(G.blame_buffer, out)
+  V.switch_to_buffer(G.blame_buffer)
+  V.goto_line_column(line_now, 1)
+  V.message("RET shows a line's commit · q goes back")
+end
+
+function G.blame_visit()
+  local hash = G.blame_items[V.line_number()]
+  if not hash or hash:match("^0+$") then return V.message("Not committed yet") end
+  G.show(G.blame_root, hash)
+end
+
+-- q in *git-blame*: back to the file, on the same line.
+function G.blame_close()
+  local n = V.line_number()
+  V.find_file(G.blame_file)
+  V.goto_line_column(n, 1)
+end
+
 ---- Commands and keys
 
 local commands = {
@@ -1000,7 +1410,35 @@ local commands = {
   ["git-hunk-previous"] = function() V.git_hunk_here("previous") end,
   ["git-browse"] = G.browse,
   ["git-copy-link"] = G.copy_url,
+  ["git-stage-lines"] = G.stage_lines,
+  ["git-unstage-lines"] = G.unstage_lines,
+  ["git-discard-lines"] = G.discard_lines,
+  ["git-continue"] = G.continue,
+  ["git-skip"] = G.skip,
+  ["git-abort"] = G.abort,
+  ["git-cherry-pick"] = G.cherry_pick,
+  ["git-revert"] = G.revert,
+  ["git-reset-soft"] = G.reset_soft,
+  ["git-reset-mixed"] = G.reset_mixed,
+  ["git-reset-hard"] = G.reset_hard,
+  ["git-merge"] = G.merge,
+  ["git-rebase-upstream"] = G.rebase_upstream,
+  ["git-rebase-interactive"] = G.rebase_interactive,
+  ["git-rebase-start"] = G.rebase_start,
+  ["git-rebase-cancel"] = G.rebase_cancel,
+  ["git-rebase-down"] = move(1),
+  ["git-rebase-up"] = move(-1),
+  ["git-blame"] = G.blame_view,
+  ["git-blame-visit"] = G.blame_visit,
+  ["git-blame-close"] = G.blame_close,
+  ["git-diff-view-toggle"] = function()
+    G.diff_view = not G.diff_view
+    V.message(G.diff_view and "Commits drawn as diffs" or "Commits drawn as text")
+  end,
 }
+for key, action in pairs(actions) do
+  commands["git-rebase-" .. action] = set_action(key)
+end
 for name, fn in pairs(commands) do V.command(name, fn) end
 
 -- Keys like c and x are Vim's in normal state; in git buffers they start
@@ -1025,17 +1463,43 @@ for key, cmd in pairs({
   ["l l"] = "git-log", ["l a"] = "git-log-all",
   ["g r"] = "git-status-refresh", q = "git-close",
 }) do status[key] = cmd end
-for _, key in ipairs({ "c", "b", "P", "F", "f", "z", "l" }) do status[key] = prefix(key) end
+-- On a commit (here, in the log, *git-show*, *git-blame*): pick, revert,
+-- reset to it, rebase from it; and what's in progress.
+local on_commits = {
+  A = "git-cherry-pick", _ = "git-revert",
+  ["X s"] = "git-reset-soft", ["X m"] = "git-reset-mixed", ["X h"] = "git-reset-hard",
+  ["r i"] = "git-rebase-interactive", ["r u"] = "git-rebase-upstream",
+  ["r r"] = "git-continue", ["r s"] = "git-skip", ["r a"] = "git-abort",
+  ["m m"] = "git-merge",
+}
+for key, cmd in pairs(on_commits) do status[key] = cmd end
+for _, key in ipairs({ "c", "b", "P", "F", "f", "z", "l", "X", "r", "m" }) do status[key] = prefix(key) end
+core.keymaps.git_status_visual = { s = "git-stage-lines", u = "git-unstage-lines", x = "git-discard-lines" }
 
 local log = { RET = "git-log-visit", q = "git-close", ["l l"] = "git-log", ["l a"] = "git-log-all", l = prefix("l") }
+local show = { RET = "git-show-visit", q = "git-close" }
+local blame = { RET = "git-blame-visit", q = "git-blame-close" }
+for _, map in ipairs({ log, show, blame }) do
+  for key, cmd in pairs(on_commits) do map[key] = cmd end
+  for _, key in ipairs({ "X", "r", "m" }) do map[key] = prefix(key) end
+end
 core.keymaps.git_log = log
-core.keymaps.git_show = { RET = "git-show-visit", q = "git-close" }
+core.keymaps.git_show = show
+core.keymaps.git_blame = blame
+local rebase = {
+  ["C-j"] = "git-rebase-down", ["C-k"] = "git-rebase-up",
+  ["C-c C-c"] = "git-rebase-start", ["Z Z"] = "git-rebase-start", ["C-c C-k"] = "git-rebase-cancel", q = "git-rebase-cancel",
+}
+for key, action in pairs(actions) do rebase[key] = "git-rebase-" .. action end
+core.keymaps.git_rebase = rebase
 core.keymaps.git_commit = { ["C-c C-c"] = "git-commit-finish", ["C-c C-k"] = "git-commit-cancel", ["Z Z"] = "git-commit-finish" }
 core.keymaps.git_commit_insert = { ["C-c C-c"] = "git-commit-finish", ["C-c C-k"] = "git-commit-cancel" }
 
 core.buffer_keymaps = core.buffer_keymaps or {}
 for _, e in ipairs({
-  { G.status_buffer, "git_status" },
+  { G.status_buffer, "git_status", nil, "git_status_visual" },
+  { G.blame_buffer, "git_blame" },
+  { G.rebase_buffer, "git_rebase" },
   { G.log_buffer, "git_log" },
   { G.show_buffer, "git_show" },
   { G.commit_buffer, "git_commit", "git_commit_insert" },
@@ -1044,7 +1508,7 @@ for _, e in ipairs({
 end
 
 for key, cmd in pairs({
-  ["SPC g g"] = "git-status", ["SPC g c"] = "git-commit", ["SPC g b"] = "git-blame-show",
+  ["SPC g g"] = "git-status", ["SPC g c"] = "git-commit", ["SPC g b"] = "git-blame", ["SPC g v"] = "git-blame-show",
   ["SPC g B"] = "git-blame-toggle", ["SPC g l"] = "git-file-log", ["SPC g L"] = "git-line-log",
   ["SPC g s"] = "git-hunk-stage", ["SPC g r"] = "git-hunk-reset", ["SPC g S"] = "git-stage-file",
   ["SPC g o"] = "git-browse", ["SPC g y"] = "git-copy-link", ["SPC g C"] = "git-branch-switch",

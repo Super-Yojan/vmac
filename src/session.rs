@@ -9,7 +9,7 @@ use crate::editor::{Editor, Rect};
 use crate::frame::*;
 use crate::lisp::{FaceSpec, Lisp};
 use crate::syntax::{Syntax, face_for, language_for_path};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct Session {
     editor: Editor,
@@ -299,8 +299,34 @@ impl Session {
                     text: c.text.clone(),
                 })
                 .collect();
-            ReviewView { patch, revision: buffer.revision(), cursor_line, row, comments }
+            ReviewView { header: String::new(), patch, revision: buffer.revision(), cursor_line, row, comments }
         });
+        // Every buffer drawn as a Diff, by buffer: *agent-review*, and the
+        // diff buffers (a commit: its header above, the diff below).
+        let mut diffs: HashMap<BufferId, ReviewView> = HashMap::new();
+        if let (Some(id), Some(view)) = (review_id, review) {
+            diffs.insert(id, view);
+        }
+        for (wid, _) in &rects {
+            let Some(w) = st.window_by_id(*wid) else { continue };
+            if !st.diff_buffers.contains(&w.buffer) || diffs.contains_key(&w.buffer) {
+                continue;
+            }
+            let Some(buffer) = st.buffer_by_id(w.buffer) else { continue };
+            let text = buffer.text().to_string();
+            let (header, patch) = match text.find("diff --git ") {
+                Some(0) => (String::new(), text.clone()),
+                Some(at) => (text[..at].trim_end().to_string(), text[at..].to_string()),
+                None => (text.trim_end().to_string(), String::new()),
+            };
+            let cursor_line = buffer.text().char_to_line(st.window_point(*wid).min(buffer.len()));
+            let row = crate::git::diff_rows(&text)
+                .get(cursor_line)
+                .cloned()
+                .flatten()
+                .map(|(rel, modified, line)| DiffRow { rel, modified, line });
+            diffs.insert(w.buffer, ReviewView { header, patch, revision: buffer.revision(), cursor_line, row, comments: Vec::new() });
+        }
 
         // Lines the agent changed and nobody reviewed yet, and lines with
         // your comments on them, per window.
@@ -418,7 +444,7 @@ impl Session {
                 let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
                 let media = buffer.file().and_then(|f| crate::frame::media_kind(f).map(|k| (f.clone(), k)));
                 let is_custom =
-                    rendered.contains(id) || media.is_some() || (review_id.is_some() && Some(w.buffer) == review_id);
+                    rendered.contains(id) || media.is_some() || diffs.contains_key(&w.buffer);
                 // Line numbers, in a gutter: for files, when they're on.
                 let numbers = match st.line_numbers.as_str() {
                     "on" | "relative" if buffer.file().is_some() && !is_sidebar && !is_custom => {
@@ -444,7 +470,7 @@ impl Session {
                     cursor_at = Some((x, y, height_of(cur_line)));
                 }
 
-                let content = if let Some(review) = review.as_ref().filter(|_| Some(w.buffer) == review_id) {
+                let content = if let Some(review) = diffs.get(&w.buffer) {
                     Content::Review(review.clone())
                 } else if let Some((path, kind)) = media {
                     Content::Media { path, kind, themed: st.pdf_themed, scroll: st.media_scroll.get(&w.buffer).cloned().unwrap_or_default(),

@@ -467,12 +467,22 @@ unstaged and staged files, stashes, unpushed commits and recent ones.
   upstream the first time), `F p` pulls, `f f` fetches, all in the
   background. `z z` stashes, `z p` / `z a` / `z k` pop, apply or drop one.
 - `l l` is the log with its graph (`l a`: all branches); `RET` shows a
-  commit, and `RET` on one of its changes visits that line. `g r`
-  refreshes, `q` goes back.
+  commit, drawn with gpui-kit's Diff under its message, and `RET` on one of
+  its changes visits that line. `g r` refreshes, `q` goes back.
+- In visual state, `s`, `u` and `x` on some lines of a hunk stage,
+  unstage or discard just those lines.
+- On a commit (in the status, the log, a commit or the blame): `A`
+  cherry-picks it, `_` reverts it, `X s` / `X m` / `X h` reset to it, and
+  `r i` rebases interactively from it: `*git-rebase*` lists the commits,
+  `p r e s f d` pick, reword, edit, squash, fixup or drop one, `C-j` /
+  `C-k` move it, `C-c C-c` rebases. `m m` merges a branch, `r u` rebases
+  onto the upstream. When git stops on conflicts, the status says so:
+  fix and stage, then `r r` continues, `r s` skips, `r a` aborts.
 
 In files, the gutter marks lines that differ from the index (green added,
 blue changed, a red notch where lines went), and the cursor's line says who
-changed it last and when (`SPC g B` hides that; `SPC g b` shows the commit).
+changed it last and when (`SPC g B` hides that; `SPC g v` shows the commit,
+`SPC g b` blames the whole file, `RET` there showing a line's commit).
 `]c` / `[c` move between changes, `SPC g s` stages the one under the
 cursor (as the buffer has it, saved or not), `SPC g r` puts the index's
 lines back. `SPC g l` is the file's history, `SPC g L` the line's (or the

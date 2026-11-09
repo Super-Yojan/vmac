@@ -206,16 +206,104 @@ pub enum HunkAction {
 }
 
 /// Stages, unstages or discards hunk `n` of a file (counted as `file_hunks`
-/// lists them: unstaged for Stage and Discard, staged for Unstage).
-pub fn hunk_action(root: &Path, rel: &str, n: usize, action: HunkAction) -> Result<(), String> {
+/// lists them: unstaged for Stage and Discard, staged for Unstage). With
+/// `rows`, only those of its lines (rows of `hunk_lines` after the "@@"
+/// line, from 0; context rows are ignored).
+pub fn hunk_action(root: &Path, rel: &str, n: usize, action: HunkAction, rows: Option<&[usize]>) -> Result<(), String> {
     let staged = action == HunkAction::Unstage;
     let (old, new, list) = file_hunks(root, rel, staged);
-    let hunk = list.get(n).ok_or("That change is gone (refresh with g r)")?;
+    let whole = list.get(n).ok_or("That change is gone (refresh with g r)")?;
+    let forward = action == HunkAction::Stage;
+    let hunk = match rows {
+        Some(rows) => narrow(whole, rows, whole.new.start - whole.new.start.saturating_sub(HUNK_CONTEXT), forward),
+        None => whole.clone(),
+    };
     match action {
-        HunkAction::Stage => write_index(root, rel, &apply(&old, hunk)),
-        HunkAction::Unstage => write_index(root, rel, &revert(&new, hunk)),
-        HunkAction::Discard => std::fs::write(root.join(rel), revert(&new, hunk)).map_err(|e| format!("{rel}: {e}")),
+        HunkAction::Stage => write_index(root, rel, &apply(&old, &hunk)),
+        HunkAction::Unstage => write_index(root, rel, &revert(&new, &hunk)),
+        HunkAction::Discard => std::fs::write(root.join(rel), revert(&new, &hunk)).map_err(|e| format!("{rel}: {e}")),
     }
+}
+
+/// The context lines a hunk is shown with.
+pub const HUNK_CONTEXT: usize = 3;
+
+/// A hunk cut down to the selected rows (`lead` context rows come first):
+/// going forward (staging), its new text keeps the old lines not selected
+/// and takes the new lines selected; going back (unstaging, discarding),
+/// its old text is the old lines selected and the new lines not selected,
+/// so reverting it undoes just those.
+fn narrow(hunk: &Hunk, rows: &[usize], lead: usize, forward: bool) -> Hunk {
+    let old = lines(&hunk.old_text);
+    let new = lines(&hunk.new_text);
+    let picked_old = |i: usize| rows.contains(&(lead + i));
+    let picked_new = |j: usize| rows.contains(&(lead + old.len() + j));
+    let keep_old: String = old.iter().enumerate().filter(|(i, _)| picked_old(*i) != forward).map(|(_, l)| *l).collect();
+    let keep_new: String = new.iter().enumerate().filter(|(j, _)| picked_new(*j) == forward).map(|(_, l)| *l).collect();
+    let mut cut = hunk.clone();
+    if forward {
+        cut.new_text = keep_old + &keep_new;
+    } else {
+        cut.old_text = old.iter().enumerate().filter(|(i, _)| picked_old(*i)).map(|(_, l)| *l).collect::<String>()
+            + &new.iter().enumerate().filter(|(j, _)| !picked_new(*j)).map(|(_, l)| *l).collect::<String>();
+    }
+    cut
+}
+
+/// Each line of a unified diff's place in its file: (path, on the new
+/// side, 1-based line), or None for headers and anything outside a hunk.
+pub fn diff_rows(text: &str) -> Vec<Option<(String, bool, usize)>> {
+    let mut out = Vec::new();
+    let (mut file, mut old, mut new, mut in_hunk) = (String::new(), 0usize, 0usize, false);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            file = rest.rsplit(" b/").next().unwrap_or("").to_string();
+            in_hunk = false;
+            out.push(None);
+            continue;
+        }
+        if !in_hunk && let Some(path) = line.strip_prefix("+++ b/") {
+            file = path.to_string();
+            out.push(None);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            let start = |sign: char| {
+                rest.split_whitespace()
+                    .find(|w| w.starts_with(sign))
+                    .and_then(|w| w[1..].split(',').next()?.parse::<usize>().ok())
+                    .unwrap_or(1)
+            };
+            (old, new, in_hunk) = (start('-'), start('+'), true);
+            out.push(None);
+            continue;
+        }
+        if !in_hunk || file.is_empty() {
+            out.push(None);
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => {
+                out.push(Some((file.clone(), true, new)));
+                new += 1;
+            }
+            Some('-') => {
+                out.push(Some((file.clone(), false, old)));
+                old += 1;
+            }
+            Some(' ') | None => {
+                out.push(Some((file.clone(), true, new)));
+                old += 1;
+                new += 1;
+            }
+            Some('\\') => out.push(None),
+            _ => {
+                in_hunk = false;
+                out.push(None);
+            }
+        }
+    }
+    out
 }
 
 // ---- Signs in the gutter
@@ -521,8 +609,10 @@ mod tests {
         dir
     }
 
-    fn rand_suffix() -> u128 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+    /// A different folder for each test (they run at once).
+    fn rand_suffix() -> usize {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]
@@ -537,16 +627,39 @@ mod tests {
         let (_, _, unstaged) = file_hunks(&dir, "f.txt", false);
         assert_eq!(unstaged.len(), 2);
 
-        hunk_action(&dir, "f.txt", 1, HunkAction::Stage).unwrap();
+        hunk_action(&dir, "f.txt", 1, HunkAction::Stage, None).unwrap();
         assert_eq!(read(&dir, "f.txt", Side::Index).unwrap(), format!("{base}m\n"), "only the second change staged");
         assert_eq!(file_hunks(&dir, "f.txt", false).2.len(), 1);
         assert_eq!(file_hunks(&dir, "f.txt", true).2.len(), 1);
 
-        hunk_action(&dir, "f.txt", 0, HunkAction::Unstage).unwrap();
+        hunk_action(&dir, "f.txt", 0, HunkAction::Unstage, None).unwrap();
         assert_eq!(read(&dir, "f.txt", Side::Index).unwrap(), base, "unstaged again");
 
-        hunk_action(&dir, "f.txt", 0, HunkAction::Discard).unwrap();
+        hunk_action(&dir, "f.txt", 0, HunkAction::Discard, None).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\n", "the A thrown away");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn some_lines_of_a_hunk_are_staged_unstaged_and_discarded() {
+        let dir = repo();
+        std::fs::write(dir.join("f.txt"), "a\nb\nc\n").unwrap();
+        assert!(run(&dir, &["add", "."], None).0);
+        assert!(run(&dir, &["commit", "-qm", "first"], None).0);
+        // One hunk: b becomes B1 and B2.
+        std::fs::write(dir.join("f.txt"), "a\nB1\nB2\nc\n").unwrap();
+        let (_, new, list) = file_hunks(&dir, "f.txt", false);
+        let rows = hunk_lines(&new, &list[0], HUNK_CONTEXT);
+        assert_eq!(rows, vec!["@@ -1,3 +1,4 @@", " a", "-b", "+B1", "+B2", " c"]);
+        // Rows after the @@ line: 0 " a", 1 "-b", 2 "+B1", 3 "+B2". Stage +B1 only.
+        hunk_action(&dir, "f.txt", 0, HunkAction::Stage, Some(&[2])).unwrap();
+        assert_eq!(read(&dir, "f.txt", Side::Index).unwrap(), "a\nb\nB1\nc\n");
+        // Unstage it again (staged: "@@", " a", " b", "+B1", " c" -> row 2).
+        hunk_action(&dir, "f.txt", 0, HunkAction::Unstage, Some(&[2])).unwrap();
+        assert_eq!(read(&dir, "f.txt", Side::Index).unwrap(), "a\nb\nc\n");
+        // Discard just +B2 from the file.
+        hunk_action(&dir, "f.txt", 0, HunkAction::Discard, Some(&[3])).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "a\nB1\nc\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -554,7 +667,7 @@ mod tests {
     fn a_new_file_is_staged_whole() {
         let dir = repo();
         std::fs::write(dir.join("new.sh"), "echo hi\n").unwrap();
-        hunk_action(&dir, "new.sh", 0, HunkAction::Stage).unwrap();
+        hunk_action(&dir, "new.sh", 0, HunkAction::Stage, None).unwrap();
         assert_eq!(read(&dir, "new.sh", Side::Index).as_deref(), Some("echo hi\n"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -603,6 +716,16 @@ mod tests {
         assert_eq!(lines[0].as_ref().unwrap().summary, "the first line");
         assert!(lines[1].as_ref().unwrap().uncommitted());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn diff_rows_know_their_file_lines() {
+        let text = "commit abc\n\ndiff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -3,3 +3,3 @@\n same\n-old\n+new\n";
+        let rows = diff_rows(text);
+        assert_eq!(rows[..6], [None, None, None, None, None, None]);
+        assert_eq!(rows[6], Some(("x.rs".into(), true, 3)));
+        assert_eq!(rows[7], Some(("x.rs".into(), false, 4)));
+        assert_eq!(rows[8], Some(("x.rs".into(), true, 4)));
     }
 
     #[test]

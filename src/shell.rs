@@ -44,7 +44,7 @@ pub struct Shell {
     image_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::media::ImageView>>,
     /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
     /// parsed from, and the cursor line it last selected.
-    review_view: Option<ReviewView>,
+    review_view: std::collections::HashMap<crate::frame::BufferId, ReviewView>,
     /// Where the last frame drew each window's lines, for the mouse, and
     /// whether a prompt or the picker had the screen.
     hits: Vec<WindowHit>,
@@ -172,7 +172,7 @@ impl Shell {
             md_views: Default::default(),
             pdf_views: Default::default(),
             image_views: Default::default(),
-            review_view: None,
+            review_view: Default::default(),
             hits: Vec::new(),
             modal: false,
             dragging: None,
@@ -514,13 +514,14 @@ impl Shell {
     /// Keeps *agent-review*'s diff in step with the frame, the cursor's row selected.
     fn review_state(
         &mut self,
+        buffer: crate::frame::BufferId,
         review: &crate::frame::ReviewView,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Entity<gpui_kit::component::diff::DiffState> {
         use gpui_kit::component::diff::{DiffFile, DiffLinePosition, DiffLineRange, DiffSide, DiffState};
         let files = DiffFile::parse(&review.patch).unwrap_or_default();
         let revision = review.revision;
-        let view = self.review_view.get_or_insert_with(|| {
+        let view = self.review_view.entry(buffer).or_insert_with(|| {
             let files = files.clone();
             let state = gpui_kit::AppContext::new(cx, |cx| DiffState::new(files, cx));
             ReviewView { state, revision, selected: None }
@@ -1065,7 +1066,7 @@ impl Render for Shell {
                 let body = match &w.content {
                     Content::Review(review) => {
                         use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffLinePosition, DiffSide};
-                        let state = self.review_state(review, cx);
+                        let state = self.review_state(w.buffer, review, cx);
                         let annotations: Vec<DiffAnnotation> = review
                             .comments
                             .iter()
@@ -1080,10 +1081,34 @@ impl Render for Shell {
                         let texts: std::collections::HashMap<String, String> =
                             review.comments.iter().map(|c| (format!("comment-{}", c.id), c.text.clone())).collect();
                         let (on_add, on_click) = (this.clone(), this.clone());
-                        div()
+                        // A commit's message and stats, above its diff.
+                        let header = (!review.header.is_empty()).then(|| {
+                            let t = cx.theme();
+                            div()
+                                .flex_shrink_0()
+                                .max_h(px(ROW_HEIGHT * 14.))
+                                .overflow_hidden()
+                                .px(px(12.))
+                                .py(px(8.))
+                                .border_b_1()
+                                .border_color(t.border)
+                                .children(review.header.lines().map(|l| {
+                                    let label = l.split_once(':').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(char::is_alphanumeric));
+                                    let commit = l.starts_with("commit ");
+                                    div()
+                                        .h(px(ROW_HEIGHT))
+                                        .whitespace_nowrap()
+                                        .when(commit, |d| d.text_color(t.yellow))
+                                        .when(label && !commit, |d| d.text_color(t.muted_foreground))
+                                        .when(l.starts_with("    "), |d| d.text_color(t.foreground).font_weight(gpui_kit::FontWeight::SEMIBOLD))
+                                        .child(if l.is_empty() { " ".to_string() } else { l.to_string() })
+                                }))
+                        });
+                        v_flex()
                             .flex_1()
                             .overflow_hidden()
-                            .child(
+                            .children(header)
+                            .child(div().flex_1().min_h_0().child(
                                 Diff::new(&state)
                                     .size_full()
                                     .annotations(annotations)
@@ -1118,7 +1143,7 @@ impl Render for Shell {
                                         };
                                         let _ = on_click.update(cx, |shell, cx| shell.send(input, cx));
                                     }),
-                            )
+                            ))
                             .into_any_element()
                     }
                     Content::Markdown { source, revision, cursor_line, folder } => {

@@ -1587,15 +1587,17 @@ fn register_git(reg: &mut Registry, editor: &Editor) {
         let (_, new, hunks) = git::file_hunks(Path::new(&root), &rel, staged);
         hunks.iter().map(|h| git::hunk_lines(&new, h, 3)).collect::<Vec<_>>()
     });
-    // Stages, unstages or discards a file's hunk n (1-based): "" or why not.
-    prim!(reg, editor, "git-hunk-apply", |s, root: String, rel: String, n: isize, action: String| {
+    // Stages, unstages or discards a file's hunk n (1-based), or some of
+    // its rows (1-based, after its "@@" line): "" or why not.
+    prim!(reg, editor, "git-hunk-apply", |s, root: String, rel: String, n: isize, action: String, rows: Option<Vec<usize>>| {
         let action = match action.as_str() {
             "stage" => git::HunkAction::Stage,
             "unstage" => git::HunkAction::Unstage,
             "discard" => git::HunkAction::Discard,
             other => return format!("{other}: stage, unstage or discard"),
         };
-        let result = git::hunk_action(Path::new(&root), &rel, (n.max(1) - 1) as usize, action);
+        let rows: Option<Vec<usize>> = rows.map(|r| r.into_iter().filter(|&r| r > 0).map(|r| r - 1).collect());
+        let result = git::hunk_action(Path::new(&root), &rel, (n.max(1) - 1) as usize, action, rows.as_deref());
         s.git.forget(&Path::new(&root).join(&rel));
         result.err().unwrap_or_default()
     });
@@ -1606,8 +1608,34 @@ fn register_git(reg: &mut Registry, editor: &Editor) {
             s.message = message;
         }
     });
+    // Blame for a whole text (a buffer's, saved or not): per line, { hash,
+    // author, time ago, summary }, or nothing for lines it doesn't know;
+    // and git's complaint, if it failed.
+    pure!(reg, "git-blame", |root: String, rel: String, text: String| {
+        let (ok, out, err) =
+            git::run(Path::new(&root), &["blame", "--porcelain", "--contents", "-", "--", &rel], Some(&text));
+        let now = git::now();
+        let lines = git::parse_blame(if ok { &out } else { "" })
+            .into_iter()
+            .map(|l| match l {
+                Some(b) => vec![b.hash.clone(), b.author.clone(), git::ago(now - b.time), b.summary.clone()],
+                None => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        (lines, if ok { String::new() } else { err })
+    });
     // After git changed things (commit, checkout...): read them again.
     prim!(reg, editor, "git-forget", |s| s.git.forget_all());
+    // Draws a buffer holding a unified diff (after any header) with
+    // gpui-kit's Diff, or as text again.
+    prim!(reg, editor, "set-buffer-diff", |s, name: String, on: bool| {
+        let id = s.ensure_buffer(&name);
+        if on {
+            s.diff_buffers.insert(id);
+        } else {
+            s.diff_buffers.remove(&id);
+        }
+    });
     prim!(reg, editor, "set-git-blame-inline", |s, on: bool| s.git.blame_inline = on);
     prim!(reg, editor, "git-blame-inline?", |s| s.git.blame_inline);
     // The line under the cursor's commit: hash, author, time ago, summary
@@ -1780,6 +1808,135 @@ mod tests {
         assert_eq!(git(&["log", "-1", "--format=%s"]), "Shout two\n", "{}", editor.lock().message);
         assert_eq!(editor.lock().buffer().name(), "*git-status*");
         assert!(text(&editor).contains("Head:     main  Shout two"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_lines_blame_reset_and_interactive_rebase() {
+        let dir = std::env::temp_dir().join(format!("vmac-git-phase2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let (ok, out, err) = crate::git::run(&dir, args, None);
+            assert!(ok, "git {args:?}: {err}");
+            out
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Tester"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "a\nb\nc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        std::fs::write(dir.join("a.txt"), "a\nB1\nB2\nc\n").unwrap();
+
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&dir.join("a.txt")).unwrap();
+        let goto = |line: usize| {
+            let mut st = editor.lock();
+            let pos = st.buffer().line_to_pos(line);
+            st.buffer_mut().goto_char(pos);
+        };
+        let find = |needle: &str| text(&editor).lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {}", text(&editor)));
+
+        // Select +B1 in the hunk (V on its line), s stages just it.
+        lisp.run_command("git-status");
+        goto(find("modified   a.txt"));
+        lisp.dispatch_key("TAB", "");
+        goto(find("+B1"));
+        lisp.dispatch_key("V", "");
+        lisp.dispatch_key("s", "");
+        assert_eq!(crate::git::read(&dir, "a.txt", crate::git::Side::Index).unwrap(), "a\nb\nB1\nc\n", "{}", editor.lock().message);
+        git(&["commit", "-qm", "B1"]);
+        git(&["commit", "-qam", "B2"]);
+
+        // The whole file's blame, then RET: the commit, drawn as a diff.
+        editor.lock().open_file(&dir.join("a.txt")).unwrap();
+        goto(2);
+        lisp.run_command("git-blame");
+        assert_eq!(editor.lock().buffer().name(), "*git-blame*");
+        let blame = text(&editor);
+        assert!(blame.lines().nth(2).unwrap().ends_with("│ B2") && blame.contains("Tester"), "{blame}");
+        lisp.dispatch_key("RET", "");
+        assert_eq!(editor.lock().buffer().name(), "*git-show*");
+        assert!(text(&editor).contains("    B2"), "{}", text(&editor));
+        let show = editor.lock().window().buffer;
+        assert!(editor.lock().diff_buffers.contains(&show), "drawn with the Diff");
+
+        // r i on the oldest of the three: squash B1 into first, reword B2.
+        lisp.run_command("git-log");
+        goto(find(" first"));
+        lisp.dispatch_key("r", "");
+        lisp.dispatch_key("i", "");
+        assert_eq!(editor.lock().buffer().name(), "*git-rebase*");
+        assert!(text(&editor).starts_with("pick   "), "{}", text(&editor));
+        goto(1);
+        lisp.dispatch_key("s", "");
+        goto(2);
+        lisp.dispatch_key("r", "");
+        // The prompt starts with the old subject: replace it.
+        for _ in 0..2 {
+            lisp.dispatch_key("DEL", "");
+        }
+        typed(&mut lisp, "Two\n");
+        assert!(text(&editor).contains("squash ") && text(&editor).contains("reword ") && text(&editor).contains(" Two"), "{}", text(&editor));
+        lisp.dispatch_key("C-c", "");
+        lisp.dispatch_key("C-c", "");
+        assert_eq!(git(&["log", "--format=%s"]), "Two\nfirst\n", "{}", editor.lock().message);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nB1\nB2\nc\n");
+
+        // X s on the first commit: a soft reset, its changes staged.
+        lisp.run_command("git-log");
+        goto(find(" first"));
+        lisp.dispatch_key("X", "");
+        lisp.dispatch_key("s", "");
+        assert_eq!(git(&["log", "--format=%s"]), "first\n");
+        assert_eq!(git(&["diff", "--cached", "--name-only"]), "a.txt\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_conflicts_show_in_the_status_and_abort() {
+        let dir = std::env::temp_dir().join(format!("vmac-git-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let (ok, out, err) = crate::git::run(&dir, args, None);
+            assert!(ok, "git {args:?}: {err}");
+            out
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Tester"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "other"]);
+        std::fs::write(dir.join("a.txt"), "theirs\n").unwrap();
+        git(&["commit", "-qam", "theirs"]);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(dir.join("a.txt"), "ours\n").unwrap();
+        git(&["commit", "-qam", "ours"]);
+
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&dir.join("a.txt")).unwrap();
+        lisp.run_command("git-log-all");
+        let line = text(&editor).lines().position(|l| l.contains(" theirs")).unwrap();
+        {
+            let mut st = editor.lock();
+            let pos = st.buffer().line_to_pos(line);
+            st.buffer_mut().goto_char(pos);
+        }
+        lisp.dispatch_key("A", "");
+        assert!(editor.lock().message.contains("Cherry-picking"), "{}", editor.lock().message);
+        lisp.run_command("git-status");
+        let status = text(&editor);
+        assert!(status.contains("Doing:    Cherry-picking") && status.contains("Unmerged"), "{status}");
+        lisp.dispatch_key("r", "");
+        lisp.dispatch_key("a", "");
+        assert!(!text(&editor).contains("Doing:"), "{}", text(&editor));
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "ours\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

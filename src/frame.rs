@@ -211,6 +211,9 @@ pub fn media_kind(path: &std::path::Path) -> Option<MediaKind> {
 /// *agent-review*, drawn as a diff.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ReviewView {
+    /// What's above the diff (a commit's message and stats).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header: String,
     pub patch: String,
     pub revision: u64,
     /// The cursor's line, and the diff row it is on.
