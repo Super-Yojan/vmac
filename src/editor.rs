@@ -387,6 +387,8 @@ pub struct EditorState {
     /// Buffers holding a unified diff (a commit, *git-show*) drawn with
     /// gpui-kit's Diff, like *agent-review*.
     pub diff_buffers: std::collections::HashSet<BufferId>,
+    /// Comments shown in diff buffers' Diffs.
+    pub diff_comments: std::collections::HashMap<BufferId, Vec<DiffNote>>,
     /// Recent files and projects (in memory only until `set_state_dir`).
     pub history: crate::projects::History,
     /// The project opened last (SPC p p), for buffers without a file.
@@ -443,6 +445,10 @@ pub enum SessionRequest {
     CheckMachines,
     ForgetMachine(String),
 }
+
+/// A comment shown in a diff buffer: (path, on the new side, line, label,
+/// text).
+pub type DiffNote = (String, bool, usize, String, String);
 
 /// A line of the review: its file, on the new (modified) or old side, 1-based.
 #[derive(Clone, Debug, PartialEq)]
@@ -595,6 +601,7 @@ impl EditorState {
             review_shown: 0,
             git: crate::git::Git::new(),
             diff_buffers: Default::default(),
+            diff_comments: Default::default(),
             history: Default::default(),
             project: None,
             dashboard_buffer: None,

@@ -25,6 +25,8 @@
 --   P p  push  F p  pull  f f  fetch    (in the background)
 --   z z  stash  z p  pop  z a  apply  z k  drop (the stash under the cursor)
 --   l l  log  l a  all branches' log    g r  refresh    q  close
+--   @ p  pull requests  @ i  issues  @ n  new pull request  @ v  this
+--        branch's pull request (see github.lua)
 --   m m  merge a branch           r u  rebase onto the upstream
 --
 -- On a commit (here, in the log, a commit's page, the blame):
@@ -77,17 +79,22 @@ G.diff_view = true
 -- The repository of the current file (or of the session's folder); in a
 -- git buffer, the one it shows.
 function G.root()
-  local shown = ({
-    [G.status_buffer] = G.status_root, [G.log_buffer] = G.log_root, [G.show_buffer] = G.show_root,
-    [G.blame_buffer] = G.blame_root, [G.rebase_buffer] = G.rebase_root, [G.commit_buffer] = G.commit_root,
-  })[V.buffer_name()]
-  if shown then return shown end
-  local root = V.git_root()
+  local root = G.root_here()
   if root == "" then
     V.message("Not in a git repository")
     return nil
   end
   return root
+end
+
+-- The same, quietly: "" outside a repository (for the modeline).
+function G.root_here()
+  local shown = ({
+    [G.status_buffer] = G.status_root, [G.log_buffer] = G.log_root, [G.show_buffer] = G.show_root,
+    [G.blame_buffer] = G.blame_root, [G.rebase_buffer] = G.rebase_root, [G.commit_buffer] = G.commit_root,
+  })[V.buffer_name()]
+  if not shown and core.github and core.github.repo_root and core.github.in_buffer() then shown = core.github.repo_root end
+  return shown or V.git_root()
 end
 
 -- Runs git: its output, or nil after saying what went wrong.
@@ -275,6 +282,8 @@ function G.refresh(keep)
     local state = #where > 0 and table.concat(where, " ") or "up to date"
     add(pieces({ { "Upstream: ", "git-label" }, { s.upstream, "git-ref" }, { "  " .. state, "dim" } }))
   end
+  local pr = core.github and core.github.status_line(root, s.branch)
+  if pr then add(pr) end
   G.op = G.operation(root)
   if G.op then
     local keys = G.op.kind == "merge" and "  c c commit · r a abort" or "  r r continue · r s skip · r a abort"
@@ -738,6 +747,8 @@ local function remote_job(args, busy, done_message)
   G.async(root, args, busy, function(ok, out, err)
     if ok then
       V.message(done_message)
+      -- The branch's pull request may have changed (pushed, new checks).
+      if core.github then core.github.branch_prs = {} end
     else
       V.message(args[1] .. " failed: " .. last_line(err ~= "" and err or out))
     end
@@ -1520,3 +1531,6 @@ end
 for key, cmd in pairs({ ["SPC g L"] = "git-line-log", ["SPC g o"] = "git-browse", ["SPC g y"] = "git-copy-link" }) do
   core.define_key("visual", key, cmd)
 end
+
+-- For github.lua and plugins: drawing buffers, reading output, menus.
+G.draw, G.pieces, G.line, G.lines_of, G.diff_line, G.prefix, G.last_line = draw, pieces, line, lines_of, diff_line, prefix, last_line

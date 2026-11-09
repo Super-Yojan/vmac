@@ -134,11 +134,11 @@ impl Session {
                 self.lisp.run_events();
             }
             Input::ReviewSelect { path, modified, line } => self.editor.lock().review_select(&path, modified, line),
-            Input::ReviewCommentAt { path, modified, line } => {
+            Input::ReviewCommentAt { path, modified, line, buffer } => {
                 let side = if modified { "modified" } else { "original" };
-                self.editor
-                    .lock()
-                    .push_event("lua-event", vec!["review_comment_at".into(), path, side.into(), line.to_string()]);
+                let mut st = self.editor.lock();
+                let name = st.buffer_by_id(buffer).map(|b| b.name().to_string()).unwrap_or_default();
+                st.push_event("lua-event", vec!["review_comment_at".into(), path, side.into(), line.to_string(), name]);
             }
             Input::Client { fonts, themes, errors } => {
                 let mut st = self.editor.lock();
@@ -297,6 +297,7 @@ impl Session {
                     id: c.id,
                     at: DiffRow { rel: c.at.rel.clone(), modified: c.at.modified, line: c.at.line },
                     text: c.text.clone(),
+                    label: String::new(),
                 })
                 .collect();
             ReviewView { header: String::new(), patch, revision: buffer.revision(), cursor_line, row, comments }
@@ -325,7 +326,22 @@ impl Session {
                 .cloned()
                 .flatten()
                 .map(|(rel, modified, line)| DiffRow { rel, modified, line });
-            diffs.insert(w.buffer, ReviewView { header, patch, revision: buffer.revision(), cursor_line, row, comments: Vec::new() });
+            let comments = st
+                .diff_comments
+                .get(&w.buffer)
+                .map(|list| {
+                    list.iter()
+                        .enumerate()
+                        .map(|(i, (rel, modified, line, label, text))| DiffComment {
+                            id: i as u64,
+                            at: DiffRow { rel: rel.clone(), modified: *modified, line: *line },
+                            text: text.clone(),
+                            label: label.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            diffs.insert(w.buffer, ReviewView { header, patch, revision: buffer.revision(), cursor_line, row, comments });
         }
 
         // Lines the agent changed and nobody reviewed yet, and lines with

@@ -28,6 +28,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("90-bindings.lua", include_str!("../lua/core/90-bindings.lua")),
     ("agents.lua", include_str!("../lua/core/agents.lua")),
     ("git.lua", include_str!("../lua/core/git.lua")),
+    ("github.lua", include_str!("../lua/core/github.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
     ("sessions.lua", include_str!("../lua/core/sessions.lua")),
@@ -1569,6 +1570,67 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "quit-editor", |s| s.quit_requested = true);
 }
 
+/// JSON's value as Lua's: objects and arrays become tables, null nil.
+fn json_to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<mlua::Value> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::Null => mlua::Value::Nil,
+        J::Bool(b) => mlua::Value::Boolean(*b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => mlua::Value::Integer(i),
+            None => mlua::Value::Number(n.as_f64().unwrap_or(0.)),
+        },
+        J::String(s) => mlua::Value::String(lua.create_string(s)?),
+        J::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.set(i + 1, json_to_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        J::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, item) in map {
+                t.set(k.as_str(), json_to_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+    })
+}
+
+/// Lua's value as JSON: a table with keys 1..n (or empty) is an array, any
+/// other an object.
+fn lua_to_json(v: &mlua::Value) -> mlua::Result<serde_json::Value> {
+    use serde_json::Value as J;
+    Ok(match v {
+        mlua::Value::Nil => J::Null,
+        mlua::Value::Boolean(b) => J::Bool(*b),
+        mlua::Value::Integer(i) => J::from(*i),
+        mlua::Value::Number(n) => serde_json::Number::from_f64(*n).map_or(J::Null, J::Number),
+        mlua::Value::String(s) => J::String(s.to_str()?.to_string()),
+        mlua::Value::Table(t) => {
+            let n = t.raw_len();
+            let pairs = t.clone().pairs::<mlua::Value, mlua::Value>().count();
+            if pairs == n {
+                J::Array((1..=n).map(|i| lua_to_json(&t.raw_get::<mlua::Value>(i)?)).collect::<mlua::Result<_>>()?)
+            } else {
+                let mut map = serde_json::Map::new();
+                for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+                    let (k, item) = pair?;
+                    let key = match &k {
+                        mlua::Value::String(s) => s.to_str()?.to_string(),
+                        mlua::Value::Integer(i) => i.to_string(),
+                        _ => continue,
+                    };
+                    map.insert(key, lua_to_json(&item)?);
+                }
+                J::Object(map)
+            }
+        }
+        _ => J::Null,
+    })
+}
+
 /// Git, for lua/core/git.lua (see git.rs).
 fn register_git(reg: &mut Registry, editor: &Editor) {
     use crate::git;
@@ -1662,6 +1724,88 @@ fn register_git(reg: &mut Registry, editor: &Editor) {
         })
         .expect("a Lua function");
     reg.vmac.set("git_async", f).expect("set in vmac");
+
+    // vmac.json_decode(text): the value, or nil and why not.
+    let f = reg
+        .lua
+        .create_function(|lua, text: String| match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => Ok((json_to_lua(lua, &v)?, mlua::Value::Nil)),
+            Err(e) => Ok((mlua::Value::Nil, mlua::Value::String(lua.create_string(e.to_string())?))),
+        })
+        .expect("a Lua function");
+    reg.vmac.set("json_decode", f).expect("set in vmac");
+    let f = reg
+        .lua
+        .create_function(|_, v: mlua::Value| Ok(lua_to_json(&v)?.to_string()))
+        .expect("a Lua function");
+    reg.vmac.set("json_encode", f).expect("set in vmac");
+
+    // vmac.spawn(folder, program, args, stdin, tag): runs a program off the
+    // UI thread (gh, ...); when it's done, core.events["spawn-done"] gets
+    // { tag, "ok" or "failed", output, errors }.
+    let ed = editor.clone();
+    let f = reg
+        .lua
+        .create_function(move |_, (dir, program, args, stdin, tag): (String, String, Vec<String>, Option<String>, String)| {
+            let ed = ed.clone();
+            std::thread::spawn(move || {
+                let mut cmd = std::process::Command::new(&program);
+                cmd.args(&args)
+                    .current_dir(&dir)
+                    .env("GH_PROMPT_DISABLED", "1")
+                    .env("NO_COLOR", "1")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let (ok, out, err) = match cmd.spawn() {
+                    Err(e) => (false, String::new(), format!("{program}: {e}")),
+                    Ok(mut child) => {
+                        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+                            std::thread::spawn(move || {
+                                use std::io::Write;
+                                let _ = pipe.write_all(text.as_bytes());
+                            });
+                        }
+                        match child.wait_with_output() {
+                            Ok(o) => (
+                                o.status.success(),
+                                String::from_utf8_lossy(&o.stdout).into_owned(),
+                                String::from_utf8_lossy(&o.stderr).trim_end().to_string(),
+                            ),
+                            Err(e) => (false, String::new(), format!("{program}: {e}")),
+                        }
+                    }
+                };
+                ed.lock().push_event("spawn-done", vec![tag, if ok { "ok" } else { "failed" }.into(), out, err]);
+            });
+            Ok(())
+        })
+        .expect("a Lua function");
+    reg.vmac.set("spawn", f).expect("set in vmac");
+
+    // In a buffer holding a diff, the cursor's place in its file: path,
+    // "modified" or "original", line; nothing off a change.
+    prim!(reg, editor, "diff-row-here", |s| {
+        let b = s.buffer();
+        match git::diff_rows(&b.text().to_string()).get(b.line()).cloned().flatten() {
+            Some((rel, modified, line)) => vec![rel, if modified { "modified" } else { "original" }.to_string(), line.to_string()],
+            None => Vec::new(),
+        }
+    });
+    // Comments shown in a diff buffer's Diff: { path, "modified" or
+    // "original", line, label, text } each (replacing those it had).
+    prim!(reg, editor, "set-buffer-diff-comments", |s, name: String, list: Vec<Vec<String>>| {
+        let id = s.ensure_buffer(&name);
+        let notes = list
+            .into_iter()
+            .filter_map(|c| {
+                let line = c.get(2)?.parse().ok()?;
+                Some((c.first()?.clone(), c.get(1)? != "original", line, c.get(3).cloned().unwrap_or_default(), c.get(4).cloned().unwrap_or_default()))
+            })
+            .collect();
+        s.diff_comments.insert(id, notes);
+    });
 }
 
 /// Aligns the table around the point (its rows are the lines around it that
@@ -1937,6 +2081,167 @@ mod tests {
         lisp.dispatch_key("a", "");
         assert!(!text(&editor).contains("Doing:"), "{}", text(&editor));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "ours\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn github_lists_views_reviews_and_submits_through_gh() {
+        let dir = std::env::temp_dir().join(format!("vmac-github-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(crate::git::run(&dir, &["init", "-q", "-b", "main"], None).0);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        // A stand-in for gh: canned answers, and what's posted kept.
+        let gh = dir.join("fake-gh");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" >> '{log}'
+case "$*" in
+  "pr list"*) echo '[{{"number":7,"title":"Add widgets","author":{{"login":"alice"}},"headRefName":"widgets","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[{{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"}}],"updatedAt":"2026-11-01T00:00:00Z","state":"OPEN"}}]' ;;
+  "pr view 7"*) echo '{{"number":7,"title":"Add widgets","body":"Widgets, at last.","author":{{"login":"alice"}},"state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"widgets","url":"https://github.com/o/r/pull/7","additions":3,"deletions":1,"changedFiles":1,"reviewDecision":"APPROVED","statusCheckRollup":[{{"name":"build","status":"COMPLETED","conclusion":"FAILURE"}}],"comments":[{{"author":{{"login":"bob"}},"body":"Nice!","createdAt":"2026-11-02T00:00:00Z"}}],"reviews":[],"mergeable":"MERGEABLE","headRefOid":"abc123","createdAt":"2026-11-01T00:00:00Z"}}' ;;
+  "pr view"*) exit 1 ;;
+  "pr diff"*) printf 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-one\n+uno\n' ;;
+  "api repos/{{owner}}/{{repo}}/pulls/7/comments"*) echo '[{{"path":"a.txt","line":1,"side":"RIGHT","body":"Spanish?","user":{{"login":"bob"}}}}]' ;;
+  "api -X POST"*) cat > '{posted}'; echo '{{}}' ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#,
+            log = dir.join("log").display(),
+            posted = dir.join("posted.json").display()
+        );
+        std::fs::write(&gh, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&dir.join("a.txt")).unwrap();
+        lisp.eval_lua(&format!("core.github.program = {:?}", gh.display().to_string())).unwrap();
+        let wait = |lisp: &mut Lisp, done: &dyn Fn(&str) -> bool| {
+            let start = std::time::Instant::now();
+            while !done(&text(&editor)) && start.elapsed().as_secs() < 10 {
+                lisp.run_events();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            text(&editor)
+        };
+
+        lisp.run_command("github-prs");
+        let list = wait(&mut lisp, &|t| t.contains("Add widgets"));
+        assert!(list.contains("#7    ✓ Add widgets  @alice  widgets  approved"), "{list}");
+
+        // The cursor starts on the first one.
+        lisp.dispatch_key("RET", "");
+        let view = wait(&mut lisp, &|t| t.contains("Widgets, at last."));
+        assert_eq!(editor.lock().buffer().name(), "*github-pr*");
+        assert!(view.contains("Open · @alice wants to merge widgets into main"), "{view}");
+        assert!(view.contains("Checks ✗ 1 failing") && view.contains("  ✗ build"), "{view}");
+        assert!(view.contains("  @bob · ") && view.contains("    Nice!"), "{view}");
+
+        // d: the changes as a diff, bob's comment beside its line.
+        lisp.dispatch_key("d", "");
+        wait(&mut lisp, &|t| t.contains("+uno"));
+        assert_eq!(editor.lock().buffer().name(), "*github-pr-diff*");
+        let id = editor.lock().window().buffer;
+        assert!(editor.lock().diff_buffers.contains(&id));
+        let start = std::time::Instant::now();
+        while editor.lock().diff_comments.get(&id).is_none_or(|c| c.is_empty()) && start.elapsed().as_secs() < 10 {
+            lisp.run_events();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(editor.lock().diff_comments[&id], vec![("a.txt".into(), true, 1, "@bob".into(), "Spanish?".into())]);
+
+        // c on +uno: a pending comment; S: a review requesting changes.
+        let row = text(&editor).lines().position(|l| l == "+uno").unwrap();
+        {
+            let mut st = editor.lock();
+            let pos = st.buffer().line_to_pos(row);
+            st.buffer_mut().goto_char(pos);
+        }
+        lisp.dispatch_key("c", "");
+        typed(&mut lisp, "Keep it English\n");
+        assert_eq!(editor.lock().diff_comments[&id].len(), 2, "bob's and the pending one");
+        lisp.dispatch_key("S", "");
+        // The picker: the third kind.
+        typed(&mut lisp, "Request\n");
+        typed(&mut lisp, "Please fix\n");
+        let posted = dir.join("posted.json");
+        let start = std::time::Instant::now();
+        while !posted.exists() && start.elapsed().as_secs() < 10 {
+            lisp.run_events();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let body: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&posted).unwrap()).unwrap();
+        assert_eq!(body["event"], "REQUEST_CHANGES");
+        assert_eq!(body["body"], "Please fix");
+        assert_eq!(body["commit_id"], "abc123");
+        assert_eq!(body["comments"][0], serde_json::json!({"path": "a.txt", "line": 1, "side": "RIGHT", "body": "Keep it English"}));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn github_shows_the_branch_pr_in_the_status_and_creates_issues() {
+        let dir = std::env::temp_dir().join(format!("vmac-github-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| assert!(crate::git::run(&dir, args, None).0, "git {args:?}");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Tester"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let gh = dir.join("fake-gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  "pr view main"*) echo '{{"number":3,"title":"Main things","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","statusCheckRollup":[{{"name":"ci","status":"IN_PROGRESS","conclusion":""}}],"url":"u"}}' ;;
+  "issue create"*) cat > '{body}'; echo "$*" > '{args}'; echo 'https://github.com/o/r/issues/9' ;;
+  "issue view 9"*) echo '{{"number":9,"title":"Broken","body":"It broke.","author":{{"login":"me"}},"state":"OPEN","labels":[],"comments":[],"url":"u","assignees":[],"createdAt":"2026-11-01T00:00:00Z"}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+                body = dir.join("body").display(),
+                args = dir.join("args").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&dir.join("a.txt")).unwrap();
+        lisp.eval_lua(&format!("core.github.program = {:?}", gh.display().to_string())).unwrap();
+        let wait = |lisp: &mut Lisp, done: &dyn Fn(&str) -> bool| {
+            let start = std::time::Instant::now();
+            while !done(&text(&editor)) && start.elapsed().as_secs() < 10 {
+                lisp.run_events();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            text(&editor)
+        };
+
+        lisp.run_command("git-status");
+        let status = wait(&mut lisp, &|t| t.contains("PR:"));
+        assert!(status.contains("PR:       #3 Main things  • 1 running · changes requested"), "{status}");
+        assert_eq!(lisp.eval_lua("return core.github.modeline_segment()").unwrap(), "PR #3 •");
+
+        lisp.run_command("github-issue-new");
+        assert_eq!(editor.lock().buffer().name(), "*github-new*");
+        typed(&mut lisp, "Broken\n\nIt broke.");
+        lisp.dispatch_key("C-c", "");
+        lisp.dispatch_key("C-c", "");
+        let issue = wait(&mut lisp, &|t| t.contains("#9 Broken"));
+        assert_eq!(editor.lock().buffer().name(), "*github-issue*", "{issue}");
+        assert_eq!(std::fs::read_to_string(dir.join("body")).unwrap(), "It broke.");
+        assert!(std::fs::read_to_string(dir.join("args")).unwrap().contains("--title Broken"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

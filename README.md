@@ -489,8 +489,30 @@ lines back. `SPC g l` is the file's history, `SPC g L` the line's (or the
 selection's), `SPC g o` opens the line on GitHub, GitLab or Bitbucket, and
 `SPC g y` copies the link. The branch is in the modeline.
 
+**GitHub**, through the [gh](https://cli.github.com) CLI (`gh auth login`
+once), in the background:
+
+- `SPC g p` lists pull requests, with their checks (✓ ✗ •) and review;
+  `SPC g i` lists issues (`a` shows closed ones too). `RET` opens one, `b`
+  opens it in the browser, `C` checks a pull request out.
+- A pull request shows its description, checks, reviews and conversation:
+  `c` comments, `a` approves, `r` requests changes, `m` merges (squash,
+  merge commit or rebase, deleting the branch).
+- `d` reviews its changes in gpui-kit's Diff, with the comments already
+  on it beside their lines. `c` (or the `+` beside a line) writes a
+  comment on a line, kept until you submit; `S` submits the review, as a
+  comment, an approval or a request for changes, with your line comments.
+- `SPC g n` writes a pull request for the branch (the title and
+  description start from its commits; it's pushed first if it isn't yet),
+  `SPC g I` an issue: the first line is the title, `C-c C-c` creates it
+  (`C-c C-d` as a draft).
+- `*git-status*` shows the branch's pull request under its head, with its
+  checks and review, and so does the modeline (`PR #12 ✓`); `@ p`, `@ i`,
+  `@ n` and `@ v` there do the above.
+
 It's git underneath: `vmac.git(root, args, stdin)` runs it (ok, output,
-errors) and `lua/core/git.lua` is the rest, to change like any other core file.
+errors), `vmac.spawn` runs gh, and `lua/core/git.lua` and `lua/core/github.lua`
+are the rest, to change like any other core file.
 
 ## Plugins
 

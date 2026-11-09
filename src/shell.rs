@@ -1078,8 +1078,15 @@ impl Render for Shell {
                                 )
                             })
                             .collect();
-                        let texts: std::collections::HashMap<String, String> =
-                            review.comments.iter().map(|c| (format!("comment-{}", c.id), c.text.clone())).collect();
+                        let texts: std::collections::HashMap<String, (String, String)> = review
+                            .comments
+                            .iter()
+                            .map(|c| {
+                                let label = if c.label.is_empty() { "comment".to_string() } else { c.label.clone() };
+                                (format!("comment-{}", c.id), (label, c.text.clone()))
+                            })
+                            .collect();
+                        let buffer = w.buffer;
                         let (on_add, on_click) = (this.clone(), this.clone());
                         // A commit's message and stats, above its diff.
                         let header = (!review.header.is_empty()).then(|| {
@@ -1114,7 +1121,7 @@ impl Render for Shell {
                                     .annotations(annotations)
                                     .render_annotation(move |a, _, cx| {
                                         let t = cx.theme();
-                                        let text = texts.get(&a.id().to_string()).cloned().unwrap_or_default();
+                                        let (label, text) = texts.get(&a.id().to_string()).cloned().unwrap_or_default();
                                         h_flex()
                                             .gap(px(8.))
                                             .px(px(10.))
@@ -1122,7 +1129,7 @@ impl Render for Shell {
                                             .border_l_2()
                                             .border_color(t.yellow)
                                             .bg(t.yellow.opacity(0.08))
-                                            .child(div().text_color(t.yellow).child("comment"))
+                                            .child(div().flex_shrink_0().text_color(t.yellow).child(label))
                                             .child(div().child(text))
                                     })
                                     // The + beside a hovered line: a comment on it.
@@ -1131,6 +1138,7 @@ impl Render for Shell {
                                             path: range.path().to_string(),
                                             modified: range.side() == DiffSide::Modified,
                                             line: range.start(),
+                                            buffer,
                                         };
                                         let _ = on_add.update(cx, |shell, cx| shell.send(input, cx));
                                     })

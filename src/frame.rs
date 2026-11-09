@@ -54,7 +54,14 @@ pub enum Input {
     Wheel { window: WindowId, lines: isize, line: usize, col: usize, mods: Mods },
     /// A click on a row of the review's diff, and its + (a comment on it).
     ReviewSelect { path: String, modified: bool, line: usize },
-    ReviewCommentAt { path: String, modified: bool, line: usize },
+    /// The Diff's + beside a line, in the window on `buffer`.
+    ReviewCommentAt {
+        path: String,
+        modified: bool,
+        line: usize,
+        #[serde(default)]
+        buffer: BufferId,
+    },
     /// What the window's machine has: its fonts, the themes it loaded
     /// (name, dark?), and theme files that didn't load.
     Client { fonts: Vec<String>, themes: Vec<(String, bool)>, errors: Vec<String> },
@@ -235,6 +242,9 @@ pub struct DiffComment {
     pub id: u64,
     pub at: DiffRow,
     pub text: String,
+    /// Who or what it is ("comment" when empty): an author, "pending".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 /// One line of a window, in screen columns.

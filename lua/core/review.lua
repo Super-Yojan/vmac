@@ -32,8 +32,12 @@ vmac.map("review", "c", "review-comment")
 vmac.map("review", "C", "review-comment-delete-here")
 vmac.map("review", "S", "review-send")
 
--- The Diff's comment button: a comment on the line it was beside.
-vmac.hooks.review_comment_at = function(rel, side, line)
+-- The Diff's comment button: a comment on the line it was beside (in a
+-- pull request's diff, a comment for its review).
+vmac.hooks.review_comment_at = function(rel, side, line, buffer)
+  if core.github and buffer == core.github.diff_buffer then
+    return core.github.comment_at(rel, side, tonumber(line))
+  end
   vmac.prompt("Comment on " .. rel .. ":" .. line .. ": ", function(text)
     vmac.review_comment_at_line(rel, side == "modified", tonumber(line), text)
   end)

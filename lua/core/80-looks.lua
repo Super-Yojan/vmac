@@ -168,7 +168,7 @@ end
 
 -- "main": the branch of the current file's repository ("" outside one).
 function core.git_branch_segment()
-  local root = V.git_root()
+  local root = core.git and core.git.root_here() or V.git_root()
   if root == "" then return "" end
   local branch = V.git_branch(root)
   return branch
@@ -181,6 +181,7 @@ function core.modeline()
     { V.line_number() .. ":" .. V.column_number(), "dim" },
     { V.buffer_language(), "dim" },
     { core.git_branch_segment(), "dim" },
+    { core.github and core.github.modeline_segment() or "", "dim" },
     { V.diagnostic_summary(), "error" },
     { V.lsp_status(), "dim" },
     { core.pending_count .. core.pending_keys, "dim" },
