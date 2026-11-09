@@ -27,6 +27,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("80-looks.lua", include_str!("../lua/core/80-looks.lua")),
     ("90-bindings.lua", include_str!("../lua/core/90-bindings.lua")),
     ("agents.lua", include_str!("../lua/core/agents.lua")),
+    ("git.lua", include_str!("../lua/core/git.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
     ("sessions.lua", include_str!("../lua/core/sessions.lua")),
@@ -1563,7 +1564,76 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
             .unwrap_or_default()
     });
 
+    register_git(reg, editor);
+
     prim!(reg, editor, "quit-editor", |s| s.quit_requested = true);
+}
+
+/// Git, for lua/core/git.lua (see git.rs).
+fn register_git(reg: &mut Registry, editor: &Editor) {
+    use crate::git;
+    // The repository of the current file (else the session's folder), or "".
+    prim!(reg, editor, "git-root", |s| s.git_root_here().map(|p| p.display().to_string()).unwrap_or_default());
+    // Runs git in a repository: ok, what it printed, its errors.
+    pure!(reg, "git", |root: String, args: Vec<String>, stdin: Option<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        git::run(Path::new(&root), &args, stdin.as_deref())
+    });
+    // The checked-out branch (or short hash), read without running git.
+    pure!(reg, "git-branch", |root: String| git::branch(Path::new(&root)));
+    // A file's hunks, staged (HEAD to index) or not (index to file): each a
+    // list of lines, its "@@" line first.
+    pure!(reg, "git-hunks", |root: String, rel: String, staged: bool| {
+        let (_, new, hunks) = git::file_hunks(Path::new(&root), &rel, staged);
+        hunks.iter().map(|h| git::hunk_lines(&new, h, 3)).collect::<Vec<_>>()
+    });
+    // Stages, unstages or discards a file's hunk n (1-based): "" or why not.
+    prim!(reg, editor, "git-hunk-apply", |s, root: String, rel: String, n: isize, action: String| {
+        let action = match action.as_str() {
+            "stage" => git::HunkAction::Stage,
+            "unstage" => git::HunkAction::Unstage,
+            "discard" => git::HunkAction::Discard,
+            other => return format!("{other}: stage, unstage or discard"),
+        };
+        let result = git::hunk_action(Path::new(&root), &rel, (n.max(1) - 1) as usize, action);
+        s.git.forget(&Path::new(&root).join(&rel));
+        result.err().unwrap_or_default()
+    });
+    // In a file: next, previous, stage, reset its change at the cursor.
+    prim!(reg, editor, "git-hunk-here", |s, action: String| {
+        let message = s.git_hunk_here(&action);
+        if !message.is_empty() {
+            s.message = message;
+        }
+    });
+    // After git changed things (commit, checkout...): read them again.
+    prim!(reg, editor, "git-forget", |s| s.git.forget_all());
+    prim!(reg, editor, "set-git-blame-inline", |s, on: bool| s.git.blame_inline = on);
+    prim!(reg, editor, "git-blame-inline?", |s| s.git.blame_inline);
+    // The line under the cursor's commit: hash, author, time ago, summary
+    // (empty when not known yet).
+    prim!(reg, editor, "git-blame-here", |s| match s.git_blame_here() {
+        Some(b) => vec![b.hash.clone(), b.author.clone(), git::ago(git::now() - b.time), b.summary.clone()],
+        None => Vec::new(),
+    });
+    // Runs git off the UI thread (push, pull, fetch); when it's done,
+    // core.events["git-done"] gets { tag, "ok" or "failed", output, errors }.
+    let ed = editor.clone();
+    let f = reg
+        .lua
+        .create_function(move |_, (root, args, tag): (String, Vec<String>, String)| {
+            let ed = ed.clone();
+            std::thread::spawn(move || {
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                let (ok, out, err) = git::run(Path::new(&root), &argv, None);
+                let mut st = ed.lock();
+                st.git.forget_all();
+                st.push_event("git-done", vec![tag, if ok { "ok" } else { "failed" }.into(), out, err]);
+            });
+            Ok(())
+        })
+        .expect("a Lua function");
+    reg.vmac.set("git_async", f).expect("set in vmac");
 }
 
 /// Aligns the table around the point (its rows are the lines around it that
@@ -1645,6 +1715,72 @@ mod tests {
 
     fn text(editor: &Editor) -> String {
         editor.lock().buffer().text().to_string()
+    }
+
+    #[test]
+    fn git_status_stages_commits_and_shows_signs() {
+        let dir = std::env::temp_dir().join(format!("vmac-git-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let (ok, out, err) = crate::git::run(&dir, args, None);
+            assert!(ok, "git {args:?}: {err}");
+            out
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Tester"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+
+        let (mut lisp, editor) = lisp_with("");
+        let file = dir.join("a.txt");
+        editor.lock().open_file(&file).unwrap();
+        // The changed line has a sign.
+        let id = editor.lock().window().buffer;
+        let signs = editor.lock().git_signs(id);
+        assert_eq!(*signs, vec![(1, crate::git::Sign::Changed)]);
+
+        lisp.run_command("git-status");
+        let status = text(&editor);
+        assert_eq!(editor.lock().buffer().name(), "*git-status*");
+        assert!(status.contains("Head:     main  first"), "{status}");
+        assert!(status.contains("Untracked files (1)") && status.contains("Unstaged changes (1)"), "{status}");
+        assert!(status.contains("modified   a.txt"), "{status}");
+
+        // TAB on the file shows its hunk; s on the hunk stages it.
+        let line = status.lines().position(|l| l.contains("modified   a.txt")).unwrap();
+        let goto = |line: usize| {
+            let mut st = editor.lock();
+            let pos = st.buffer().line_to_pos(line);
+            st.buffer_mut().goto_char(pos);
+        };
+        goto(line);
+        lisp.dispatch_key("TAB", "");
+        let status = text(&editor);
+        assert!(status.contains("    -two\n    +TWO"), "{status}");
+        let hunk = status.lines().position(|l| l.contains("+TWO")).unwrap();
+        goto(hunk);
+        lisp.dispatch_key("s", "");
+        let status = text(&editor);
+        assert!(status.contains("Staged changes (1)") && !status.contains("Unstaged changes"), "{status}");
+        assert_eq!(git(&["diff", "--cached", "--name-only"]), "a.txt\n");
+
+        // c c: the message in a buffer, C-c C-c commits.
+        lisp.dispatch_key("c", "");
+        lisp.dispatch_key("c", "");
+        assert_eq!(editor.lock().buffer().name(), "*git-commit*");
+        typed(&mut lisp, "Shout two");
+        lisp.dispatch_key("C-c", "");
+        lisp.dispatch_key("C-c", "");
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "Shout two\n", "{}", editor.lock().message);
+        assert_eq!(editor.lock().buffer().name(), "*git-status*");
+        assert!(text(&editor).contains("Head:     main  Shout two"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

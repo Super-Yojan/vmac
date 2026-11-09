@@ -110,6 +110,12 @@ function core.default_face_specs()
     { "agent-ask", bold = true, color = "yellow" },
     { "agent-thought", italic = true, color = "dim" },
     { "agent-output", color = "dim" },
+    -- Git's buffers
+    { "git-section", bold = true, color = "accent" },
+    { "git-label", color = "dim" },
+    { "git-hash", color = "yellow" },
+    { "git-ref", color = "magenta" },
+    { "git-branch", bold = true, color = "magenta" },
   }) do
     specs[#specs + 1] = spec
   end
@@ -160,12 +166,21 @@ function core.state_name()
   return state_names[core.state] or "NORMAL"
 end
 
+-- "main": the branch of the current file's repository ("" outside one).
+function core.git_branch_segment()
+  local root = V.git_root()
+  if root == "" then return "" end
+  local branch = V.git_branch(root)
+  return branch
+end
+
 function core.modeline()
   return {
     { core.state_name(), core.inserting() and "strong" or "accent" },
     { V.buffer_name() .. (V.buffer_modified() and " ●" or ""), "strong" },
     { V.line_number() .. ":" .. V.column_number(), "dim" },
     { V.buffer_language(), "dim" },
+    { core.git_branch_segment(), "dim" },
     { V.diagnostic_summary(), "error" },
     { V.lsp_status(), "dim" },
     { core.pending_count .. core.pending_keys, "dim" },

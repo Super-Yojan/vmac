@@ -75,7 +75,7 @@ impl Session {
         let configs = self.lisp.lsp_servers();
         let changed = {
             let mut editor = self.editor.lock();
-            editor.lsp_pump(configs) | editor.agent_pump() | editor.dashboard_refresh()
+            editor.lsp_pump(configs) | editor.agent_pump() | editor.dashboard_refresh() | editor.git_pump()
         };
         let ran = self.lisp.run_events();
         self.lisp.tick() || ran || changed
@@ -306,6 +306,10 @@ impl Session {
         // your comments on them, per window.
         let mut review_marks: std::collections::HashMap<WindowId, Vec<(usize, bool)>> = Default::default();
         let mut comment_marks: std::collections::HashMap<WindowId, Vec<usize>> = Default::default();
+        // Lines that differ from git's index, and who last changed the
+        // cursor's line (the selected window's).
+        let mut git_marks: std::collections::HashMap<WindowId, std::collections::HashMap<usize, u8>> = Default::default();
+        let mut blame_at: Option<(WindowId, usize, String)> = None;
         let mut band_marks: std::collections::HashMap<WindowId, std::collections::HashMap<usize, (usize, usize, String)>> =
             Default::default();
         for (id, _) in &rects {
@@ -317,6 +321,22 @@ impl Session {
             let lines = st.comment_lines(buffer);
             if !lines.is_empty() {
                 comment_marks.insert(*id, lines);
+            }
+            let signs = st.git_signs(buffer);
+            if !signs.is_empty() {
+                use crate::git::Sign;
+                let code = |s: &Sign| match s {
+                    Sign::Added => 1,
+                    Sign::Changed => 2,
+                    Sign::Deleted => 3,
+                };
+                git_marks.insert(*id, signs.iter().map(|(l, s)| (*l, code(s))).collect());
+            }
+            if st.git.blame_inline && *id == st.selected_window() {
+                let line = st.buffer_by_id(buffer).map(|b| b.line()).unwrap_or(0);
+                if let Some(text) = st.git_blame_text(buffer, line) {
+                    blame_at = Some((*id, line, text));
+                }
             }
             let bands = st.line_bands(buffer);
             if !bands.is_empty() {
@@ -440,6 +460,8 @@ impl Session {
                 } else {
                     let marks = review_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
                     let comments = comment_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                    let git_signs = git_marks.get(id);
+                    let blame = blame_at.as_ref().filter(|(w, _, _)| w == id && !minibuffer_open);
                     let bands = band_marks.get(id);
                     // A line's box, joined with the same box on the lines around it.
                     let band_of = |i: usize| {
@@ -502,6 +524,8 @@ impl Session {
                                 added: marks.contains(&(i, true)),
                                 deleted_above: marks.contains(&(i, false)),
                                 comment: comments.contains(&i),
+                                git_sign: git_signs.and_then(|g| g.get(&i)).copied().unwrap_or(0),
+                                annotation: blame.filter(|(_, l, _)| *l == i).map(|(_, _, t)| t.clone()),
                                 // Markdown code blocks: a band across the window.
                                 code_block: language == Some("markdown")
                                     && spans
@@ -841,6 +865,42 @@ mod tests {
         assert_eq!((top.kind.as_str(), top.first, top.last), ("input", true, false));
         assert_eq!((bottom.kind.as_str(), bottom.first, bottom.last), ("input", false, true));
         assert!(lines.iter().filter(|l| l.band.is_none()).any(|l| l.text.contains("SPC a s")), "the keys to start with");
+    }
+
+    #[test]
+    fn git_signs_and_blame_reach_the_frame() {
+        let dir = std::env::temp_dir().join(format!("vmac-session-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@example.com"],
+            &["config", "user.name", "Jane"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(crate::git::run(&dir, args, None).0);
+        }
+        std::fs::write(dir.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        assert!(crate::git::run(&dir, &["add", "."], None).0);
+        assert!(crate::git::run(&dir, &["commit", "-qm", "Count to three"], None).0);
+        std::fs::write(dir.join("f.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+
+        let mut s = session_with("");
+        s.editor.lock().open_file(&dir.join("f.txt")).unwrap();
+        // Blame waits for the buffer to sit still, then runs in the background.
+        let start = std::time::Instant::now();
+        while s.editor.lock().git_blame_here().is_none() && start.elapsed().as_secs() < 10 {
+            s.editor.lock().git_pump();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let frame = s.frame(VIEW);
+        let lines = lines(&frame);
+        let signs: Vec<u8> = lines.iter().take(4).map(|l| l.git_sign).collect();
+        assert_eq!(signs, vec![0, 2, 0, 1], "unchanged, changed, unchanged, added");
+        let note = lines[0].annotation.as_deref().unwrap_or("");
+        assert!(note.starts_with("Jane, just now · Count to three"), "{note:?}");
+        assert!(lines[1].annotation.is_none(), "only the cursor's line");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod packages;
 mod patch;
 mod picker;
 mod frame;
+mod git;
 mod hosts;
 mod review;
 mod server;

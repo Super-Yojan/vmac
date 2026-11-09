@@ -170,6 +170,20 @@ function core.terminal_normal()
   return core.state == "normal" and not V.minibuffer_active() and V.terminal_here()
 end
 
+-- Buffers with keymaps of their own, by name: { name, normal state's
+-- keymap, insert state's (optional) }, e.g. { "*git-status*", "git_status" }.
+core.buffer_keymaps = core.buffer_keymaps or {}
+
+function core.buffer_keymap(insert)
+  local name = V.buffer_name()
+  for _, e in ipairs(core.buffer_keymaps) do
+    if e[1] == name then
+      local map = core.keymaps[insert and e[3] or e[2]]
+      if map and (e[3] or not insert) then return map end
+    end
+  end
+end
+
 -- The keymaps in effect, first match winning.
 function core.current_keymaps()
   local k = core.keymaps
@@ -181,6 +195,8 @@ function core.current_keymaps()
   if normal and V.dashboard_here() then return { k.dashboard, k.normal } end
   if normal and V.review_here() then return { k.review, k.normal } end
   if normal and V.media_here() then return { k.media, k.normal } end
+  local own = (normal or (core.state == "insert" and plain)) and core.buffer_keymap(core.state == "insert")
+  if own then return { own, core.state == "insert" and k.insert or k.normal } end
   if normal and V.agent_here() then return { k.agent, k.normal } end
   if core.state == "insert" and plain and V.agent_here() then return { k.agent_insert, k.insert } end
   if core.picker_normal() then

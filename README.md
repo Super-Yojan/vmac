@@ -449,6 +449,39 @@ end
 from a vmac launched inside a Claude Code session (it refuses to nest); start
 vmac from a plain terminal.
 
+## Git
+
+`SPC g g` opens `*git-status*` for the current file's repository, magit's
+way: the branch and how far it is from its upstream, then untracked,
+unstaged and staged files, stashes, unpushed commits and recent ones.
+
+- `TAB` folds a section or unfolds a file into its hunks; `RET` visits the
+  file at that hunk's line (or shows a commit or stash).
+- `s` stages and `u` unstages what's under the cursor: a section, a file or
+  one hunk. `x` discards it (it asks first). `S` and `U` do everything.
+- `c c` commits: the message is written in `*git-commit*`, and `C-c C-c`
+  (or `Z Z`) commits, `C-c C-k` cancels. `c a` amends, `c e` amends without
+  editing the message. With nothing staged, it offers to stage everything.
+- `b b` switches branch (a remote one gets a local branch tracking it),
+  `b c` makes a new one, `b k` deletes one. `P p` pushes (setting the
+  upstream the first time), `F p` pulls, `f f` fetches, all in the
+  background. `z z` stashes, `z p` / `z a` / `z k` pop, apply or drop one.
+- `l l` is the log with its graph (`l a`: all branches); `RET` shows a
+  commit, and `RET` on one of its changes visits that line. `g r`
+  refreshes, `q` goes back.
+
+In files, the gutter marks lines that differ from the index (green added,
+blue changed, a red notch where lines went), and the cursor's line says who
+changed it last and when (`SPC g B` hides that; `SPC g b` shows the commit).
+`]c` / `[c` move between changes, `SPC g s` stages the one under the
+cursor (as the buffer has it, saved or not), `SPC g r` puts the index's
+lines back. `SPC g l` is the file's history, `SPC g L` the line's (or the
+selection's), `SPC g o` opens the line on GitHub, GitLab or Bitbucket, and
+`SPC g y` copies the link. The branch is in the modeline.
+
+It's git underneath: `vmac.git(root, args, stdin)` runs it (ok, output,
+errors) and `lua/core/git.lua` is the rest, to change like any other core file.
+
 ## Plugins
 
 Plugins live in `~/.config/vmac/plugins/`: a folder with an `init.lua`

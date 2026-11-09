@@ -276,6 +276,13 @@ pub struct FrameLine {
     /// One of your comments is on it.
     #[serde(default, skip_serializing_if = "no")]
     pub comment: bool,
+    /// How it differs from git's index: 0 not, 1 added, 2 changed, 3
+    /// lines deleted above it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub git_sign: u8,
+    /// Dim text after the line's end (who last changed it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
     /// Inside a Markdown code block.
     #[serde(default, skip_serializing_if = "no")]
     pub code_block: bool,
@@ -318,6 +325,10 @@ pub struct Face {
 
 fn no(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 fn one(x: &f32) -> bool {

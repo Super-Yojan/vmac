@@ -808,6 +808,23 @@ fn window_line_element(line: &FrameLine, selected: bool, bar: bool, cx: &App) ->
             .into_any_element(),
         None => row.into_any_element(),
     };
+    // Who last changed it, dim after its end.
+    let row = match &line.annotation {
+        Some(note) => h_flex()
+            .items_end()
+            .child(row)
+            .child(
+                div()
+                    .h(px(line.height))
+                    .pl(px(FONT_SIZE * CHAR_WIDTH * 4.))
+                    .whitespace_nowrap()
+                    .italic()
+                    .text_color(theme.muted_foreground.opacity(0.75))
+                    .child(note.clone()),
+            )
+            .into_any_element(),
+        None => row,
+    };
     div()
         .relative()
         .when(line.code_block, |d| d.bg(theme.foreground.opacity(0.06)))
@@ -846,6 +863,17 @@ fn window_line_element(line: &FrameLine, selected: bool, bar: bool, cx: &App) ->
         })
         .when(line.deleted_above, |d| {
             d.child(div().absolute().left(px(-6.)).right_0().top_0().h(px(2.)).bg(theme.red))
+        })
+        // Git: a bar where it differs from the index (green added, blue
+        // changed), a red notch where lines were deleted. The agent's
+        // marks, when there are some, say more.
+        .when(line.git_sign != 0 && !line.added && !line.deleted_above, |d| {
+            let mark = div().absolute().left(px(-6.));
+            d.child(match line.git_sign {
+                1 => mark.top_0().bottom_0().w(px(3.)).bg(theme.green.opacity(0.8)),
+                2 => mark.top_0().bottom_0().w(px(3.)).bg(theme.blue.opacity(0.8)),
+                _ => mark.top(px(-2.)).w(px(6.)).h(px(4.)).rounded(px(1.)).bg(theme.red.opacity(0.9)),
+            })
         })
         // A comment on this line: a yellow mark in the margin.
         .when(line.comment, |d| {

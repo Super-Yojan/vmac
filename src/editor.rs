@@ -382,6 +382,8 @@ pub struct EditorState {
     /// Your comments on lines (of changes, or any file), to send the agent.
     pub review_comments: Vec<ReviewComment>,
     review_shown: u64,
+    /// Git: the signs in files' gutters, blame (see git.rs).
+    pub git: crate::git::Git,
     /// Recent files and projects (in memory only until `set_state_dir`).
     pub history: crate::projects::History,
     /// The project opened last (SPC p p), for buffers without a file.
@@ -588,6 +590,7 @@ impl EditorState {
             review_rows: Vec::new(),
             review_comments: Vec::new(),
             review_shown: 0,
+            git: crate::git::Git::new(),
             history: Default::default(),
             project: None,
             dashboard_buffer: None,
@@ -2115,6 +2118,90 @@ impl EditorState {
             changed = true;
         }
         changed
+    }
+
+    // ---- Git (the status buffer and the rest are Lua: lua/core/git.lua)
+
+    /// The repository of the current file, else of the session's folder.
+    pub fn git_root_here(&self) -> Option<PathBuf> {
+        let from_file = self.buffer().file().and_then(|f| crate::git::root_of(f.parent()?));
+        from_file.or_else(|| crate::git::root_of(&self.cwd))
+    }
+
+    /// The gutter signs of a buffer visiting a file in a repository.
+    pub fn git_signs(&mut self, id: BufferId) -> std::sync::Arc<Vec<(usize, crate::git::Sign)>> {
+        let Some(b) = self.buffer_by_id(id) else { return Default::default() };
+        let Some(path) = b.file().cloned() else { return Default::default() };
+        let (text, revision) = (b.text().clone(), b.revision());
+        self.git.signs(&path, &text, revision)
+    }
+
+    /// Starts blaming the current file when it's due; whether a blame
+    /// came in (so redraw).
+    pub fn git_pump(&mut self) -> bool {
+        let b = self.buffer();
+        let file = b.file().cloned().map(|f| (f, b.text().clone(), b.revision()));
+        self.git.pump(file.as_ref().map(|(f, t, r)| (f.as_path(), t, *r)))
+    }
+
+    /// Who last changed a line of a buffer, as drawn after it (when known).
+    pub fn git_blame_text(&self, id: BufferId, line: usize) -> Option<String> {
+        let b = self.buffer_by_id(id)?;
+        let blame = self.git.blame_line(b.file()?, b.revision(), line)?;
+        Some(blame.describe(crate::git::now()))
+    }
+
+    /// The blame of the line under the cursor: hash, author, time, summary.
+    pub fn git_blame_here(&self) -> Option<crate::git::BlameLine> {
+        let b = self.buffer();
+        self.git.blame_line(b.file()?, b.revision(), b.line()).map(|l| (*l).clone())
+    }
+
+    /// In a file, on its changes against the index: "next" and "previous"
+    /// move to one, "stage" stages the one under the cursor (as the buffer
+    /// has it, saved or not), "reset" puts the index's lines back (one undo
+    /// step). Says what happened.
+    pub fn git_hunk_here(&mut self, action: &str) -> String {
+        let Some(path) = self.buffer().file().cloned() else { return "Not a file".into() };
+        let text = self.buffer().text().to_string();
+        let Some((base, hunks)) = self.git.buffer_hunks(&path, &text) else { return "Not in a git repository".into() };
+        let line = self.buffer().line();
+        if action == "next" || action == "previous" {
+            let starts: Vec<usize> = hunks.iter().map(|h| h.new.start).collect();
+            let target = if action == "next" {
+                starts.iter().copied().find(|&l| l > line).or(starts.first().copied())
+            } else {
+                starts.iter().rev().copied().find(|&l| l < line).or(starts.last().copied())
+            };
+            let Some(l) = target else { return "No changes".into() };
+            let pos = self.buffer().line_to_pos(l);
+            self.buffer_mut().goto_char(pos);
+            self.window_mut().point = pos;
+            return String::new();
+        }
+        let Some(hunk) = hunks.iter().find(|h| h.covers(line)).cloned() else { return "No change here".into() };
+        match action {
+            "stage" => {
+                let Some((root, rel)) = crate::git::locate(&path) else { return "Not in a git repository".into() };
+                let result = crate::git::write_index(&root, &rel, &crate::git::apply(&base, &hunk));
+                self.git.forget(&path);
+                match result {
+                    Ok(()) => format!("Staged the change at line {}", hunk.new.start + 1),
+                    Err(e) => e,
+                }
+            }
+            "reset" => {
+                let b = self.buffer_mut();
+                let rope = b.text();
+                let at = |line: usize| if line >= rope.len_lines() { rope.len_chars() } else { rope.line_to_char(line) };
+                let (start, end) = (at(hunk.new.start), at(hunk.new.end));
+                b.undo_boundary();
+                b.replace(start, end, &hunk.old_text);
+                b.undo_boundary();
+                "Reset the change (u undoes it)".into()
+            }
+            _ => format!("{action}: not a hunk action"),
+        }
     }
 
     // ---- Reviewing the agent's changes
