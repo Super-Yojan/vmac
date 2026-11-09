@@ -101,8 +101,8 @@ alias({ "b" }, function(arg)
 end)
 alias({ "sp", "split" }, split("below"))
 alias({ "vs", "vsplit" }, split("right"))
-alias({ "new" }, function() V.split_window("below") V.new_buffer("*scratch*") end)
-alias({ "vnew" }, function() V.split_window("right") V.new_buffer("*scratch*") end)
+alias({ "new" }, function() core.choose_new("below") end)
+alias({ "vnew" }, function() core.choose_new("right") end)
 alias({ "on", "only" }, function() V.delete_other_windows() end)
 alias({ "clo", "close" }, function() core.call_binding("window-close") end)
 alias({ "lua", "eval" }, function(arg) core.eval(arg) end)
@@ -261,7 +261,24 @@ V.command("buffer-next", function() V.next_buffer(1) end)
 V.command("buffer-previous", function() V.next_buffer(-1) end)
 V.command("buffer-kill", function() V.kill_buffer(false) end)
 V.command("buffer-kill-force", function() V.kill_buffer(true) end)
-V.command("buffer-new", function() V.new_buffer("*scratch*") end)
+V.command("buffer-new", function() core.choose_new() end)
+
+-- A new buffer asks what it's for: a terminal, an empty buffer to edit, or
+-- a file. `side` ("below", "right") splits the window first, once chosen.
+core.new_choices = { "Terminal", "Editor", "Open file" }
+function core.choose_new(side)
+  core.pick("New", core.new_choices, "", function(choice)
+    if side then V.split_window(side) end
+    if choice == "Terminal" then
+      if V.terminal_open("", "") then core.state = "insert" end
+    elseif choice == "Open file" then
+      core.call_binding("find-file-command")
+    else
+      V.new_buffer("*scratch*")
+      core.state = "normal"
+    end
+  end)
+end
 
 V.command("split-right", function() V.split_window("right") end)
 V.command("split-below", function() V.split_window("below") end)
@@ -336,14 +353,51 @@ V.command("terminal-toggle", function()
   core.state = "insert"
 end)
 
+-- Like tmux windows: open as many as you like and move between them in a
+-- window. SPC o T (s-t) opens another, SPC o n / SPC o N (s-] / s-[, or gt
+-- / gT in normal state) go to the next / previous, SPC o l picks one,
+-- SPC o k ends this one, :terminal-rename NAME names it. A shell's buffer
+-- closes when it exits; the mode line shows which terminal (2/3) it is.
+-- Going to another terminal keeps the state: typing stays typing.
+local function cycle(n)
+  if not V.next_terminal(n) then V.message("No terminals (SPC o T opens one)") end
+end
+V.command("terminal-next", function() cycle(1) end)
+V.command("terminal-previous", function() cycle(-1) end)
+V.command("terminal-pick", function()
+  local names = V.terminal_list()
+  if #names == 0 then
+    V.message("No terminals (SPC o T opens one)")
+    return
+  end
+  core.pick("Terminal", names, "", function(name)
+    V.switch_to_buffer(name)
+    core.state = "insert"
+  end)
+end)
+V.command("terminal-kill", function()
+  if not V.close_terminal() then V.message("Not a terminal") return end
+  if V.terminal_here() then core.state = "insert" else core.state = "normal" end
+end)
+alias({ "terminal-rename" }, function(name)
+  if not V.terminal_here() then V.message("Not a terminal") return end
+  if name == "" then V.message("Usage: :terminal-rename NAME") return end
+  if V.rename_buffer(name) then V.message("terminal named " .. name) else V.message(name .. " is taken") end
+end)
+
 V.command("terminal-type", function() core.state = "insert" end)
 V.command("terminal-paste", function() V.terminal_send("", V.register_get()) end)
 V.command("terminal-send-escape", function() V.terminal_send("ESC", "") end)
 V.command("terminal-paste-clipboard", function() V.terminal_send("", V.clipboard_get()) end)
 
-for key, command in pairs({ ESC = "normal-state", ["C-\\"] = "terminal-send-escape", ["s-v"] = "terminal-paste-clipboard" }) do
+for key, command in pairs({ ESC = "normal-state", ["C-\\"] = "terminal-send-escape", ["s-v"] = "terminal-paste-clipboard",
+    ["s-t"] = "terminal-new", ["s-]"] = "terminal-next", ["s-}"] = "terminal-next",
+    ["s-["] = "terminal-previous", ["s-{"] = "terminal-previous" }) do
   core.define_key("terminal", key, command)
+  if key:sub(1, 2) == "s-" and key ~= "s-v" then core.define_key("terminal_normal", key, command) end
 end
+core.define_key("terminal_normal", "g t", "terminal-next")
+core.define_key("terminal_normal", "g T", "terminal-previous")
 for _, key in ipairs({ "i", "a", "I", "A", "o", "O" }) do core.define_key("terminal_normal", key, "terminal-type") end
 core.define_key("terminal_normal", "p", "terminal-paste")
 core.define_key("terminal_normal", "P", "terminal-paste")

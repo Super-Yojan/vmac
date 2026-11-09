@@ -58,6 +58,9 @@ pub struct Terminal {
     pub buffer: BufferId,
     pub backend: TermBackend,
     pub exited: bool,
+    /// A shell opened with no command: like a tmux window, its buffer
+    /// closes when the shell exits.
+    pub shell: bool,
 }
 
 impl Terminal {
@@ -339,6 +342,8 @@ pub struct EditorState {
     /// Each image or PDF buffer's zoom (1 fits it to the window).
     pub media_zoom: std::collections::HashMap<BufferId, f32>,
     pub preview_last: Option<BufferId>,
+    /// The terminal shown last: SPC o t brings it back.
+    pub last_terminal: Option<BufferId>,
     pub terminals_to_kill: Vec<(String, String)>,
     /// The coding agent (ACP), how to start it, its buffer, and the
     /// conversation revision that buffer shows.
@@ -557,6 +562,7 @@ impl EditorState {
             media_scroll: Default::default(),
             media_zoom: Default::default(),
             preview_last: None,
+            last_terminal: None,
             terminals_to_kill: Vec::new(),
             agent: None,
             agent_config: crate::agent::AgentConfig::claude(),
@@ -680,6 +686,9 @@ impl EditorState {
         if self.buffer_by_id(id).and_then(|b| b.file()).and_then(|f| crate::syntax::language_for_path(f)) == Some("markdown") {
             self.preview_last = Some(id);
         }
+        if self.terminals.iter().any(|t| t.buffer == id) {
+            self.last_terminal = Some(id);
+        }
         let point = self.buffer().point();
         self.window_mut().point = point;
         let w = self.window_mut();
@@ -732,8 +741,14 @@ impl EditorState {
     /// buffer unless `force`.
     pub fn kill_buffer(&mut self, force: bool) -> Result<String, String> {
         let id = self.window().buffer;
-        let name = self.buffer().name().to_string();
-        if self.buffer().is_modified() && !force {
+        self.kill_buffer_id(id, force)
+    }
+
+    /// Closes a buffer; windows showing it show another one.
+    pub fn kill_buffer_id(&mut self, id: BufferId, force: bool) -> Result<String, String> {
+        let Some(b) = self.buffer_by_id(id) else { return Err("no such buffer".into()) };
+        let name = b.name().to_string();
+        if b.is_modified() && !force {
             return Err(format!("{name} has unsaved changes (:bd! to discard)"));
         }
         self.buffers.retain(|(b, _)| *b != id);
@@ -750,6 +765,9 @@ impl EditorState {
         }
         if self.buffers.is_empty() {
             self.add_buffer(Buffer::new("*scratch*"));
+        }
+        if self.last_terminal == Some(id) {
+            self.last_terminal = None;
         }
         let fallback = self.buffers[0].0;
         let point = self.buffer_by_id(fallback).map(Buffer::point).unwrap_or(0);
@@ -1845,7 +1863,7 @@ impl EditorState {
                         let mut buffer = Buffer::new(format!("*agent: {short}*"));
                         buffer.set_read_only(true);
                         let buffer = self.add_buffer(buffer);
-                        self.terminals.push(Terminal { buffer, backend: TermBackend::Local(pty), exited: false });
+                        self.terminals.push(Terminal { buffer, backend: TermBackend::Local(pty), exited: false, shell: false });
                         let id = format!("term-{buffer}");
                         let limit = p["outputByteLimit"].as_u64().map(|n| n as usize);
                         self.agent_terms.push(AgentTerm { id: id.clone(), buffer, limit, waiting: Vec::new() });
@@ -2005,7 +2023,7 @@ impl EditorState {
                         let mut buffer = Buffer::new(format!("*{}*", self.agent_config.name));
                         buffer.set_read_only(true);
                         let id = self.add_buffer(buffer);
-                        self.terminals.push(Terminal { buffer: id, backend: TermBackend::Local(pty), exited: false });
+                        self.terminals.push(Terminal { buffer: id, backend: TermBackend::Local(pty), exited: false, shell: false });
                         self.agent_cli = Some(id);
                         id
                     }
@@ -3302,6 +3320,61 @@ impl EditorState {
         self.terminal_for(id)
     }
 
+    /// The terminal to bring back: the one shown last while it runs, else
+    /// the newest running one.
+    pub fn recent_terminal(&self) -> Option<BufferId> {
+        let running = |id: BufferId| self.terminals.iter().any(|t| t.buffer == id && !t.exited);
+        self.last_terminal
+            .filter(|&id| running(id))
+            .or_else(|| self.terminals.iter().rev().find(|t| !t.exited).map(|t| t.buffer))
+    }
+
+    /// The terminals' buffer names, oldest first.
+    pub fn terminal_names(&self) -> Vec<String> {
+        self.terminals.iter().filter_map(|t| self.buffer_by_id(t.buffer)).map(|b| b.name().to_string()).collect()
+    }
+
+    /// Shows the terminal `n` places after this one (or after the one shown
+    /// last, from another buffer), as tmux's next-window does.
+    pub fn next_terminal(&mut self, n: isize) -> bool {
+        let ids: Vec<BufferId> = self.terminals.iter().map(|t| t.buffer).collect();
+        if ids.is_empty() {
+            return false;
+        }
+        let here = self.window().buffer;
+        let id = match ids.iter().position(|&id| id == here) {
+            Some(i) => ids[(i as isize + n).rem_euclid(ids.len() as isize) as usize],
+            None => self.recent_terminal().unwrap_or(ids[ids.len() - 1]),
+        };
+        self.show_buffer(id);
+        true
+    }
+
+    /// Ends a terminal and closes its buffer, the way tmux closes a window:
+    /// the windows showing it show another terminal, or close (the last
+    /// window shows another buffer).
+    pub fn close_terminal(&mut self, id: BufferId) {
+        self.last_terminal = self.last_terminal.filter(|&t| t != id);
+        let next = self.recent_terminal().filter(|&t| t != id).or_else(|| {
+            self.terminals.iter().rev().find(|t| t.buffer != id && !t.exited).map(|t| t.buffer)
+        });
+        let selected = self.selected;
+        let showing: Vec<WindowId> = self.windows.iter().filter(|w| w.buffer == id).map(|w| w.id).collect();
+        for w in showing {
+            self.select_window(w);
+            match next {
+                Some(n) => self.show_buffer(n),
+                None => {
+                    self.close_window();
+                }
+            }
+        }
+        if self.window_by_id(selected).is_some() {
+            self.select_window(selected);
+        }
+        let _ = self.kill_buffer_id(id, true);
+    }
+
     /// The size of the window showing a buffer (rows, columns); 24x80
     /// until the view has laid it out.
     pub fn size_for(&self, buffer: BufferId) -> (u16, u16) {
@@ -3320,7 +3393,7 @@ impl EditorState {
         let mut buffer = Buffer::new("*terminal*");
         buffer.set_read_only(true);
         let id = self.add_buffer(buffer);
-        self.terminals.push(Terminal { buffer: id, backend, exited: false });
+        self.terminals.push(Terminal { buffer: id, backend, exited: false, shell: false });
         self.show_buffer(id);
         id
     }
@@ -3347,6 +3420,7 @@ impl EditorState {
     /// any screen changed. `follow` is the buffer being typed into, if any.
     pub fn pump_local_terminals(&mut self, follow: Option<BufferId>) -> bool {
         let mut screens = Vec::new();
+        let mut ended = Vec::new();
         let sizes: Vec<(u16, u16)> = self.terminals.iter().map(|t| self.size_for(t.buffer)).collect();
         for (t, (rows, cols)) in self.terminals.iter_mut().zip(sizes) {
             if let TermBackend::Local(pty) | TermBackend::Attached { pty, .. } = &mut t.backend {
@@ -3356,12 +3430,18 @@ impl EditorState {
                 }
                 if !t.exited && !pty.alive() {
                     t.exited = true;
+                    if t.shell {
+                        ended.push(t.buffer);
+                    }
                 }
             }
         }
-        let changed = !screens.is_empty();
+        let changed = !screens.is_empty() || !ended.is_empty();
         for (buffer, screen) in screens {
             self.show_screen(buffer, &screen, follow == Some(buffer));
+        }
+        for id in ended {
+            self.close_terminal(id);
         }
         changed
     }

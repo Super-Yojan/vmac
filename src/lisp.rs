@@ -346,6 +346,10 @@ impl Lisp {
             _ => None,
         };
         let mut changed = self.editor.lock().pump_local_terminals(follow);
+        // Its shell exited and the window shows a file now: stop typing.
+        if follow.is_some() && self.editor.lock().terminal_here().is_none() {
+            let _ = self.lua.load("core.state = 'normal'").exec();
+        }
         if self.last_terminal_poll.elapsed() < std::time::Duration::from_millis(150) {
             return changed;
         }
@@ -586,6 +590,7 @@ fn register_terminals(reg: &mut Registry, editor: &Editor) {
     let open = reg
         .lua
         .create_function(move |lua, (backend, command): (String, String)| {
+            let shell = command.trim().is_empty();
             let (backend, cwd, rows, cols, command) = {
                 let st = ed.lock();
                 let backend = if backend.is_empty() { st.terminal_backend.clone() } else { backend };
@@ -607,7 +612,11 @@ fn register_terminals(reg: &mut Registry, editor: &Editor) {
             if backend == "local" {
                 return Ok(match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
                     Ok(pty) => {
-                        ed.lock().add_terminal(crate::editor::TermBackend::Local(pty));
+                        let mut st = ed.lock();
+                        let id = st.add_terminal(crate::editor::TermBackend::Local(pty));
+                        if let Some(t) = st.terminal_for(id) {
+                            t.shell = shell;
+                        }
                         true
                     }
                     Err(e) => {
@@ -853,7 +862,11 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "buffer-language", |s| {
         if let Some(t) = s.terminal_here() {
             let exited = if t.exited { ", exited" } else { "" };
-            return format!("terminal ({}{exited})", t.backend_name());
+            let (buffer, backend) = (t.buffer, t.backend_name());
+            let i = s.terminals.iter().position(|t| t.buffer == buffer).unwrap_or(0);
+            let n = s.terminals.len();
+            let count = if n > 1 { format!(" {}/{n}", i + 1) } else { String::new() };
+            return format!("terminal{count} ({backend}{exited})");
         }
         if s.agent_here() {
             return format!("agent ({})", s.agent_status());
@@ -1255,8 +1268,26 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // Terminals.
     prim!(reg, editor, "terminal-here?", |s| s.terminal_here().is_some());
     prim!(reg, editor, "terminal-buffer-name", |s| {
-        let id = s.terminals.iter().find(|t| !t.exited).map(|t| t.buffer);
+        let id = s.recent_terminal();
         id.and_then(|id| s.buffer_by_id(id)).map(|b| b.name().to_string()).unwrap_or_default()
+    });
+    prim!(reg, editor, "terminal-list", |s| s.terminal_names());
+    prim!(reg, editor, "next-terminal", |s, n: isize| s.next_terminal(n));
+    prim!(reg, editor, "close-terminal", |s| {
+        let id = s.window().buffer;
+        let here = s.terminal_for(id).is_some();
+        if here {
+            s.close_terminal(id);
+        }
+        here
+    });
+    // Renames the selected buffer; false when the name is taken.
+    prim!(reg, editor, "rename-buffer", |s, name: String| {
+        if name.is_empty() || s.buffer_names().contains(&name) {
+            return false;
+        }
+        s.buffer_mut().set_name(name);
+        true
     });
     prim!(reg, editor, "set-terminal-backend", |s, name: String| s.terminal_backend = name);
     prim!(reg, editor, "terminal-backend", |s| s.terminal_backend.clone());
@@ -4332,6 +4363,64 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
             pump_terminals_until(&mut lisp, &editor, |st| st.terminals.first().is_some_and(|t| t.exited)),
             "exit ends it"
         );
+    }
+
+    #[test]
+    fn terminals_work_like_tmux_windows() {
+        let (mut lisp, editor) = lisp_with("text");
+        lisp.eval_lua("vmac.set_terminal_shell('/bin/sh')").unwrap();
+        typed(&mut lisp, " oT");
+        let first = editor.lock().buffer().name().to_string();
+        lisp.dispatch_key("s-t", "");
+        let second = editor.lock().buffer().name().to_string();
+        lisp.dispatch_key("s-t", "");
+        let third = editor.lock().buffer().name().to_string();
+        assert_eq!(editor.lock().terminal_names(), vec![first.clone(), second.clone(), third.clone()]);
+        assert!(lisp.modeline().iter().any(|s| s.text == "terminal 3/3 (local)"));
+        lisp.dispatch_key("s-]", "");
+        assert_eq!(editor.lock().buffer().name(), first, "next wraps around");
+        lisp.dispatch_key("s-[", "");
+        assert_eq!(editor.lock().buffer().name(), third);
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "gT");
+        assert_eq!(editor.lock().buffer().name(), second, "gT in normal state");
+        typed(&mut lisp, ":terminal-rename build\n");
+        let (name, said) = { let st = editor.lock(); (st.buffer().name().to_string(), st.message.clone()) };
+        assert_eq!(name, "build", "{said}");
+        // SPC o t from a file brings back the terminal shown last.
+        typed(&mut lisp, ":b test\n");
+        typed(&mut lisp, " ot");
+        assert_eq!(editor.lock().buffer().name(), "build");
+        // exit closes its buffer and shows another terminal, as tmux does.
+        typed(&mut lisp, "exit\n");
+        assert!(pump_terminals_until(&mut lisp, &editor, |st| st.terminals.len() == 2), "exit closes it");
+        assert!(!editor.lock().buffer_names().contains(&"build".to_string()));
+        assert!(editor.lock().terminal_here().is_some(), "another terminal shows in its place");
+        // SPC o k ends this one; the last one gone, its window closes.
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " ok");
+        assert_eq!(editor.lock().terminals.len(), 1);
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " ok");
+        assert!(editor.lock().terminals.is_empty());
+        assert_eq!(editor.lock().window_count(), 1);
+        assert_eq!(editor.lock().buffer().name(), "test");
+        assert_eq!(lisp.cursor_shape(), "box", "back in normal state");
+    }
+
+    #[test]
+    fn a_new_buffer_asks_terminal_or_editor() {
+        let (mut lisp, editor) = lisp_with("text");
+        lisp.eval_lua("vmac.set_terminal_shell('/bin/sh')").unwrap();
+        typed(&mut lisp, " bN");
+        typed(&mut lisp, "Term\n");
+        assert!(editor.lock().terminal_here().is_some(), "Terminal opens one");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, ":vnew\n");
+        typed(&mut lisp, "Edit\n");
+        assert_eq!(editor.lock().window_count(), 2);
+        assert_eq!(editor.lock().buffer().name(), "*scratch*");
+        assert_eq!(lisp.cursor_shape(), "box");
     }
 
     #[test]

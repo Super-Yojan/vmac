@@ -1099,7 +1099,7 @@ mod tests {
                     let s = UnixStream::connect(&again)?;
                     Ok((Box::new(s.try_clone()?) as Box<dyn std::io::Read + Send>, Box::new(s) as Box<dyn Write + Send>, None))
                 }));
-                keys(&mut client, &["SPC", "b", "N", "i", "o", "n", "e", "ESC"]);
+                keys(&mut client, &["SPC", "b", "N", "E", "d", "i", "t", "RET", "i", "o", "n", "e", "ESC"]);
                 let _ = client.frame(VIEW);
                 cable.shutdown(std::net::Shutdown::Both).unwrap();
                 let mut lost_said = String::new();

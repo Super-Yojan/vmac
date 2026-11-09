@@ -175,6 +175,23 @@ into the program. Local terminals run on Ghostty's terminal engine
 true color), 2,000 lines of scrollback in the buffer (`gg`, `/` reach back
 through it), text re-wrapped on resize, and answers to programs' queries.
 
+Open as many terminals as you like and move between them like tmux windows:
+
+| Keys | |
+|---|---|
+| `SPC o T`, `s-t` | a new terminal (in this window) |
+| `SPC o n` / `SPC o N`, `s-]` / `s-[`, `gt` / `gT` | next / previous terminal |
+| `SPC o l` | pick a terminal from a list |
+| `SPC o k` | end this terminal |
+| `:terminal-rename NAME` | name it |
+
+`SPC o t` brings back the terminal you used last. A shell's buffer closes
+when it exits, and another terminal takes its place (the window closes when
+it was the last); the mode line shows which one you're in (`terminal 2/3`).
+
+A new buffer (`SPC b N`, `:new`, `:vnew`) asks what it's for: a
+**Terminal**, an empty **Editor** buffer, or **Open file**.
+
 Where the program runs is a **backend**. The built-in one is `local` (a
 PTY). Plugins add others in Lua:
 

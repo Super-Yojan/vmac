@@ -74,6 +74,8 @@ bind(K.normal, {
   { "SPC p d", "project-forget-command" }, { "SPC f P", "open-config" },
   { "SPC o p", "tree-toggle" }, { "SPC o P", "tree-open" },
   { "SPC o t", "terminal-toggle" }, { "SPC o T", "terminal-new" },
+  { "SPC o n", "terminal-next" }, { "SPC o N", "terminal-previous" },
+  { "SPC o l", "terminal-pick" }, { "SPC o k", "terminal-kill" },
   { "SPC h F", "font-picker" }, { "SPC h m", "package-manager" }, { "SPC h t", "theme-picker" },
   { "SPC h p", "plugin-manager" },
   { "SPC m a", "table-align" }, { "SPC m p", "preview" }, { "SPC m s", "pdf-forward-search" }, { "SPC t s", "toggle-pdf-follow" },
