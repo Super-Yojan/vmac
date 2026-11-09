@@ -407,6 +407,8 @@ impl Lisp {
         if let Err(e) = self.call::<()>("dispatch_key", (key, text)) {
             self.editor.lock().message = format!("{key}: {e}");
         }
+        // A jump into folded text (a search, G, a line number) opens it.
+        self.editor.lock().buffer_mut().reveal_point();
     }
 
     /// `core.tick()`, about ten times a second (with the language servers'
@@ -755,6 +757,18 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         .delete_forward(n.max(0) as usize));
     prim!(reg, editor, "forward-char", |s, n: isize| s.current().forward_char(n));
     prim!(reg, editor, "forward-line", |s, n: isize| s.current().forward_line(n));
+    // Folds, in the file buffer: lines are 1-based like goto-line-column.
+    prim!(reg, editor, "fold", |s, first: isize, last: isize| {
+        s.buffer_mut().fold((first - 1).max(0) as usize, (last - 1).max(0) as usize)
+    });
+    prim!(reg, editor, "unfold", |s, line: isize| s.buffer_mut().unfold_after((line - 1).max(0) as usize));
+    prim!(reg, editor, "folded?", |s, line: isize| s.buffer().folded_after((line - 1).max(0) as usize) > 0);
+    prim!(reg, editor, "unfold-all", |s| s.buffer_mut().unfold_all());
+    prim!(reg, editor, "has-folds?", |s| s.buffer().has_folds());
+    // The line n shown lines from a line (0-based, like pos->line), over folds.
+    prim!(reg, editor, "visible-line", |s, line: isize, n: isize| s
+        .current()
+        .visible_line(line.max(0) as usize, n) as isize);
     prim!(reg, editor, "beginning-of-line", |s| s.current().beginning_of_line());
     prim!(reg, editor, "end-of-line", |s| s.current().end_of_line());
     prim!(reg, editor, "goto-char", |s, pos: isize| s.current().goto_char(pos.max(0) as usize));
@@ -3261,6 +3275,30 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         let day = lisp.eval(r#"os.date("%Y-%m-%d")"#).unwrap();
         assert!(root.join(format!("daily/{day}.md")).exists());
         assert!(text(&editor).starts_with("# "), "a new day starts with its date");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_fold_with_tab_and_jumps_open_folds() {
+        let (mut lisp, editor, root) = notes_project("fold", "# A\n## A1\na text\n# B\nb text\n");
+        let hidden = |editor: &Editor| -> Vec<bool> { (0..5).map(|i| editor.lock().buffer().line_hidden(i)).collect() };
+        lisp.dispatch_key("TAB", "");
+        assert_eq!(hidden(&editor), vec![false, true, true, false, false], "TAB folds A's subtree");
+        typed(&mut lisp, "j");
+        assert_eq!(editor.lock().buffer().line(), 3, "j steps over it");
+        typed(&mut lisp, "kdj");
+        assert_eq!(text(&editor), "b text\n", "dj on a folded heading takes the fold and the next line");
+        typed(&mut lisp, "u");
+        typed(&mut lisp, "gg");
+        lisp.dispatch_key("S-TAB", "");
+        assert_eq!(hidden(&editor), vec![false, true, true, false, true], "S-TAB folds every heading");
+        lisp.dispatch_key("TAB", "");
+        assert_eq!(hidden(&editor), vec![false, false, true, false, true], "opening A shows A1, still folded");
+        lisp.dispatch_key("S-TAB", "");
+        assert_eq!(hidden(&editor), vec![false; 5], "S-TAB again opens everything");
+        typed(&mut lisp, "zM/text\n");
+        assert_eq!(editor.lock().buffer().line(), 2);
+        assert!(!editor.lock().buffer().line_hidden(2), "a search into a fold opens it");
         std::fs::remove_dir_all(&root).ok();
     }
 

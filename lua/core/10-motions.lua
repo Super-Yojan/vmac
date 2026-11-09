@@ -92,15 +92,16 @@ local function word_end(pos, big)
   return q
 end
 
+-- Lines down (or up), over folded lines as if they were one.
 local function line_down(pos, n)
-  return V.line_to_pos(math.min(V.line_count() - 1, V.pos_to_line(pos) + n))
+  return V.line_to_pos(V.visible_line(V.pos_to_line(pos), n))
 end
 
 local M = core.define_motion
 M("left", "exclusive", function(p) return p > core.line_start_at(p) and p - 1 or p end)
 M("right", "exclusive", function(p) return p < core.line_end_at(p) and p + 1 or p end)
 M("down", "linewise", function(p) return line_down(p, 1) end)
-M("up", "linewise", function(p) return V.line_to_pos(math.max(0, V.pos_to_line(p) - 1)) end)
+M("up", "linewise", function(p) return line_down(p, -1) end)
 M("line-start", "exclusive", function(p) return core.line_start_at(p) end)
 M("first-non-blank", "exclusive", function(p) return core.first_non_blank_at(p) end)
 M("line-end", "inclusive", function(p) return core.last_char_at(p) end)

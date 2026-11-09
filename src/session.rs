@@ -410,7 +410,12 @@ impl Session {
                 // the cursor, if above) through as many normal-height rows as fit.
                 let estimate = window_rows(r, area);
                 let lo = w.scroll_top.min(cur_line);
-                let hi = (w.scroll_top + estimate).max(cur_line + 1).min(text.len_lines());
+                // Folded lines take no room: count only shown ones.
+                let hi = if buffer.has_folds() {
+                    (buffer.visible_line(w.scroll_top, estimate as isize) + 1).max(cur_line + 1).min(text.len_lines())
+                } else {
+                    (w.scroll_top + estimate).max(cur_line + 1).min(text.len_lines())
+                };
                 let language = buffer.language().or_else(|| buffer.file().and_then(|f| language_for_path(f)));
                 let spans = match language {
                     Some(lang) => syntax.highlight(w.buffer, lang, buffer.revision(), text, lo..hi),
@@ -457,7 +462,8 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default();
-                let height_of = |i: usize| ROW_HEIGHT * line_scale(&styles[i - lo]);
+                let height_of =
+                    |i: usize| if buffer.line_hidden(i) { 0. } else { ROW_HEIGHT * line_scale(&styles[i - lo]) };
                 let media = buffer.file().and_then(|f| crate::frame::media_kind(f).map(|k| (f.clone(), k)));
                 let is_custom =
                     rendered.contains(id) || media.is_some() || diffs.contains_key(&w.buffer);
@@ -520,6 +526,7 @@ impl Session {
                     };
                     let mut y = r.y * area;
                     let lines = (top..last)
+                        .filter(|&i| !buffer.line_hidden(i))
                         .map(|i| {
                             let raw = text.line(i).to_string();
                             let (line, cols) = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(i));
@@ -567,7 +574,11 @@ impl Session {
                                 deleted_above: marks.contains(&(i, false)),
                                 comment: comments.contains(&i),
                                 git_sign: git_signs.and_then(|g| g.get(&i)).copied().unwrap_or(0),
-                                annotation: blame.filter(|(_, l, _)| *l == i).map(|(_, _, t)| t.clone()),
+                                annotation: match buffer.folded_after(i) {
+                                    0 => blame.filter(|(_, l, _)| *l == i).map(|(_, _, t)| t.clone()),
+                                    1 => Some("… 1 line".into()),
+                                    n => Some(format!("… {n} lines")),
+                                },
                                 // Markdown code blocks: a band across the window.
                                 code_block: language == Some("markdown")
                                     && spans
@@ -851,7 +862,8 @@ fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl 
     }
     // Blank space below a short buffer still fits terminal rows. Counting
     // only drawn lines would resize a newly opened PTY to one or two rows.
-    let rows = last - top + ((room - used).max(0.) / ROW_HEIGHT) as usize;
+    let shown = (top..last).filter(|&i| height(i) > 0.).count();
+    let rows = shown + ((room - used).max(0.) / ROW_HEIGHT) as usize;
     (top, last, rows.max(1))
 }
 
@@ -885,6 +897,18 @@ mod tests {
             Content::Text(lines) => lines,
             other => panic!("not text: {other:?}"),
         }
+    }
+
+    #[test]
+    fn folded_lines_arent_drawn_and_the_heading_says_how_many() {
+        let mut s = session_with("# A\na1\na2\n# B\nb1\n");
+        s.editor.lock().buffer_mut().fold(1, 2);
+        let frame = s.frame(VIEW);
+        let lines = lines(&frame);
+        let shown: Vec<usize> = lines.iter().map(|l| l.line).collect();
+        assert_eq!(shown, vec![0, 3, 4, 5]);
+        assert_eq!(lines[0].annotation.as_deref(), Some("… 2 lines"));
+        assert_eq!(lines[1].top, lines[0].top + lines[0].height, "B sits right under A");
     }
 
     #[test]

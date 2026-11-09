@@ -101,7 +101,10 @@ name order. Its state and functions are in the global `core` table.
   list item with its children), `M-k`/`M-j` move it past its sibling,
   `SPC m d` inserts a date (`<2026-11-09 Mon>`; type `+3`, `fri`, `12-24`),
   `SPC m l` inserts a `[[link]]`, and `RET` follows `[[links]]` and
-  `[text](file.md)` links.
+  `[text](file.md)` links. `TAB` folds a heading's section (or a list item's
+  children) and shows `… N lines`, `S-TAB` folds every heading or opens them
+  all, and `za zo zc zM zR` work as in Vim. `j`/`k` step over folds; a search
+  or jump into one opens it, and editing inside one opens it.
 - **Find file:** `SPC f f` or `SPC SPC` opens a telescope-style picker over the
   project (the git repo of the current file; .gitignore respected): type to
   filter fuzzily, `C-n`/`C-p`, `C-j`/`C-k` or arrows to move, `RET` to open.

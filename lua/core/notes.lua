@@ -14,6 +14,10 @@
 --   SPC m d   insert a date: <2026-11-09 Mon> (asks: empty, +3, +2w, fri, 12-24)
 --   SPC m l   insert a [[link]] to another note
 --   RET       follow the [[link]] or [text](file.md) under the cursor
+--   TAB       fold or unfold the heading (or list item) on the cursor's line
+--   S-TAB     fold every heading, or unfold everything if anything's folded
+--   za zo zc  toggle, open, close the fold of the heading you're under
+--   zM zR     fold every heading, unfold everything
 --
 -- What counts: a TODO is a heading starting "TODO " or an unticked "- [ ]";
 -- "DONE " and "- [x]" are done. A date in angle brackets (<2026-11-09 Mon>)
@@ -314,6 +318,64 @@ local function move(dir)
     local start = dir < 0 and first.s or (first.s + (second.e - second.s + 1) + (second.s - first.e - 1))
     V.goto_line_column(start + offset, col + 1)
   end
+end
+
+---- Folding
+
+-- The heading (or, on its line, list item) to fold from here: its block.
+-- `anywhere`: from a section's text too, the heading above.
+local function foldable(anywhere)
+  local ls = buffer_lines()
+  local f = fenced(ls)
+  local line = V.line_number()
+  local b = block_at(ls, f, line)
+  if not b and anywhere then b = block_here(ls, f) end
+  return b
+end
+
+local function close_fold(b)
+  if b.e <= b.s then return false end
+  V.fold(b.s + 1, b.e)
+  return true
+end
+
+local function fallback(key)
+  local binding = core.keymaps.normal[key]
+  if binding then core.call_binding(binding) end
+end
+
+function N.fold_toggle(anywhere)
+  local b = foldable(anywhere)
+  if not b then return anywhere and V.message("Not under a heading") or fallback("TAB") end
+  if V.folded(b.s) then
+    V.unfold(b.s)
+  elseif not close_fold(b) then
+    V.message("Nothing under it to fold")
+  end
+end
+
+function N.fold_open()
+  local b = foldable(true)
+  if b then V.unfold(b.s) end
+end
+
+function N.fold_close()
+  local b = foldable(true)
+  if b and not V.folded(b.s) then close_fold(b) end
+end
+
+-- Every heading folded: just the top level shows, and opening one shows
+-- its subheadings, folded (org's overview).
+function N.fold_all()
+  local ls = buffer_lines()
+  local f = fenced(ls)
+  for i = #ls, 1, -1 do
+    if heading_level(ls, f, i) then close_fold(block_at(ls, f, i)) end
+  end
+end
+
+function N.fold_cycle_all()
+  if V.has_folds() then V.unfold_all() else N.fold_all() end
 end
 
 ---- Files
@@ -666,6 +728,13 @@ for name, fn in pairs({
       if fallback then core.call_binding(fallback) end
     end
   end,
+  ["notes-fold-toggle"] = function() N.fold_toggle(false) end,
+  ["notes-fold-toggle-here"] = in_markdown(function() N.fold_toggle(true) end),
+  ["notes-fold-open"] = in_markdown(N.fold_open),
+  ["notes-fold-close"] = in_markdown(N.fold_close),
+  ["notes-fold-all"] = in_markdown(N.fold_all),
+  ["notes-unfold-all"] = function() V.unfold_all() end,
+  ["notes-fold-cycle-all"] = in_markdown(N.fold_cycle_all),
   ["notes-agenda-visit"] = N.agenda_visit,
   ["notes-agenda-done"] = N.agenda_done,
   ["notes-agenda-refresh"] = function() N.agenda_draw(V.line_number()) end,
@@ -687,6 +756,9 @@ core.keymaps.notes = {
   ["SPC m t"] = "notes-todo-cycle", ["SPC m d"] = "notes-insert-date", ["SPC m l"] = "notes-insert-link",
   ["M-h"] = "notes-promote", ["M-l"] = "notes-demote", ["M-k"] = "notes-move-up", ["M-j"] = "notes-move-down",
   ["RET"] = "notes-follow-link",
+  ["TAB"] = "notes-fold-toggle", ["S-TAB"] = "notes-fold-cycle-all",
+  ["z a"] = "notes-fold-toggle-here", ["z o"] = "notes-fold-open", ["z c"] = "notes-fold-close",
+  ["z M"] = "notes-fold-all", ["z R"] = "notes-unfold-all",
 }
 core.keymaps.notes_agenda = {
   RET = "notes-agenda-visit", o = "notes-agenda-visit", t = "notes-agenda-done",

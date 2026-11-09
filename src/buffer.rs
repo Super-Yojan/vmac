@@ -47,6 +47,11 @@ pub struct Buffer {
     /// The language to highlight as when it isn't the file's (the agent
     /// buffer is Markdown).
     language: Option<&'static str>,
+    /// Folded (hidden) text: `start..end` in characters, each from a line's
+    /// start to another's (or the end). They may nest. Edits before one
+    /// shift it; an edit touching one (or its heading's line break) unfolds
+    /// it; undo unfolds everything.
+    folds: Vec<(usize, usize)>,
 }
 
 impl Buffer {
@@ -68,6 +73,7 @@ impl Buffer {
             saves: 0,
             protected: 0,
             language: None,
+            folds: Vec::new(),
         }
     }
 
@@ -103,6 +109,7 @@ impl Buffer {
             saves: 0,
             protected: 0,
             language: None,
+            folds: Vec::new(),
         })
     }
 
@@ -261,6 +268,7 @@ impl Buffer {
         let (a, b) = (a.min(b).max(self.protected), a.max(b).max(self.protected));
         let removed = self.text.slice(a..b).to_string();
         if a < b {
+            self.edited(a, b, 0);
             self.text.remove(a..b);
             self.point = if self.point >= b { self.point - (b - a) } else { self.point.min(a) };
             self.touch();
@@ -282,6 +290,7 @@ impl Buffer {
             return;
         }
         let added = text.chars().count();
+        self.edited(a, b, added);
         self.text.remove(a..b);
         self.text.insert(a, text);
         self.point = if self.point >= b {
@@ -308,6 +317,7 @@ impl Buffer {
     }
 
     fn restore(&mut self, snap: Snapshot) {
+        self.folds.clear();
         self.revision += 1;
         self.text = snap.text;
         self.point = snap.point.min(self.text.len_chars());
@@ -348,6 +358,7 @@ impl Buffer {
     /// Replaces the whole text, dropping its faces.
     pub fn set_text(&mut self, s: &str) {
         self.faces.clear();
+        self.folds.clear();
         self.revision += 1;
         self.text = Rope::from_str(s);
         self.point = self.point.min(self.len());
@@ -362,6 +373,7 @@ impl Buffer {
         let old = self.protected.min(self.len());
         let new = text.chars().count();
         self.faces.clear();
+        self.folds.clear();
         self.revision += 1;
         self.text.remove(0..old);
         self.text.insert(0, text);
@@ -386,6 +398,7 @@ impl Buffer {
         let start = self.protected.min(self.len());
         let end = self.len();
         if start < end {
+            self.edited(start, end, 0);
             self.text.remove(start..end);
             self.revision += 1;
         }
@@ -411,6 +424,7 @@ impl Buffer {
         if self.read_only || self.point < self.protected {
             return;
         }
+        self.edited(self.point, self.point, s.chars().count());
         self.text.insert(self.point, s);
         self.point += s.chars().count();
         self.goal_column = None;
@@ -423,6 +437,7 @@ impl Buffer {
         }
         let start = self.point.saturating_sub(n).max(self.protected);
         if start < self.point {
+            self.edited(start, self.point, 0);
             self.text.remove(start..self.point);
             self.point = start;
             self.touch();
@@ -436,6 +451,7 @@ impl Buffer {
         }
         let end = (self.point + n).min(self.len());
         if self.point < end && self.point >= self.protected {
+            self.edited(self.point, end, 0);
             self.text.remove(self.point..end);
             self.touch();
         }
@@ -459,11 +475,150 @@ impl Buffer {
 
     pub fn forward_line(&mut self, n: isize) {
         let goal = self.goal_column.unwrap_or_else(|| self.column());
-        let last = self.text.len_lines().saturating_sub(1) as isize;
-        let target = (self.line() as isize + n).clamp(0, last) as usize;
+        let target = self.visible_line(self.line(), n);
         let col = goal.min(self.line_len(target));
         self.point = self.text.line_to_char(target) + col;
         self.goal_column = Some(goal);
+    }
+
+    /// The line `n` shown lines from `line` (folded lines aren't counted),
+    /// stopping at the first or last shown line.
+    pub fn visible_line(&self, line: usize, n: isize) -> usize {
+        let last = self.text.len_lines().saturating_sub(1);
+        let mut at = line.min(last);
+        for _ in 0..n.unsigned_abs() {
+            let mut next = at;
+            loop {
+                if n > 0 {
+                    if next >= last {
+                        return self.shown_line(at);
+                    }
+                    next += 1;
+                } else {
+                    if next == 0 {
+                        return self.shown_line(at);
+                    }
+                    next -= 1;
+                }
+                if !self.line_hidden(next) {
+                    break;
+                }
+            }
+            at = next;
+        }
+        at
+    }
+
+    /// The line itself, or the heading whose fold hides it.
+    fn shown_line(&self, line: usize) -> usize {
+        let mut l = line;
+        while l > 0 && self.line_hidden(l) {
+            l -= 1;
+        }
+        l
+    }
+
+    // ---- Folds
+
+    /// An edit replacing `a..b` with `added` characters: folds after it
+    /// shift, folds it touches open. Touching includes the line break just
+    /// before a fold (joining the heading with what's hidden), but not
+    /// typing before that break (`o` on a folded heading).
+    fn edited(&mut self, a: usize, b: usize, added: usize) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let removed = b - a;
+        self.folds.retain_mut(|(start, end)| {
+            let clear_before = if a == b { a < *start } else { b < *start };
+            if clear_before {
+                *start = *start - removed + added;
+                *end = *end - removed + added;
+                true
+            } else {
+                a >= *end
+            }
+        });
+    }
+
+    /// Hides lines `first..=last` (0-based); nothing if the range is empty
+    /// or already hidden so.
+    pub fn fold(&mut self, first: usize, last: usize) {
+        let lines = self.text.len_lines();
+        if first > last || first >= lines {
+            return;
+        }
+        let start = self.text.line_to_char(first);
+        let end = if last + 1 >= lines { self.len() } else { self.text.line_to_char(last + 1) };
+        if start >= end || self.folds.contains(&(start, end)) {
+            return;
+        }
+        self.folds.push((start, end));
+        self.folds.sort();
+        // The cursor never sits in hidden text.
+        if self.line_hidden(self.line()) {
+            let line = self.shown_line(self.line());
+            self.point = self.text.line_to_char(line);
+        }
+    }
+
+    /// Unfolds the fold starting right after `line` (its heading); whether
+    /// there was one.
+    pub fn unfold_after(&mut self, line: usize) -> bool {
+        if line + 1 >= self.text.len_lines() {
+            return false;
+        }
+        let start = self.text.line_to_char(line + 1);
+        let before = self.folds.len();
+        // The outermost one: nested folds inside it stay folded.
+        if let Some(i) = self.folds.iter().enumerate().filter(|(_, f)| f.0 == start).max_by_key(|(_, f)| f.1).map(|(i, _)| i) {
+            self.folds.remove(i);
+        }
+        self.folds.len() != before
+    }
+
+    /// How many lines are folded right after `line`, shown or not (0: none).
+    pub fn folded_after(&self, line: usize) -> usize {
+        if line + 1 >= self.text.len_lines() {
+            return 0;
+        }
+        let start = self.text.line_to_char(line + 1);
+        self.folds
+            .iter()
+            .filter(|f| f.0 == start)
+            .map(|f| {
+                let end_line = self.text.char_to_line(f.1.min(self.len()));
+                let ends_at_line = f.1 == self.len() && self.text.line_to_char(end_line) != f.1;
+                end_line - (line + 1) + usize::from(ends_at_line)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Whether a fold hides this line.
+    pub fn line_hidden(&self, line: usize) -> bool {
+        if self.folds.is_empty() || line >= self.text.len_lines() {
+            return false;
+        }
+        let start = self.text.line_to_char(line);
+        self.folds.iter().any(|&(a, b)| a <= start && start < b)
+    }
+
+    /// Opens every fold hiding the cursor's line.
+    pub fn reveal_point(&mut self) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let start = self.text.line_to_char(self.line());
+        self.folds.retain(|&(a, b)| !(a <= start && start < b));
+    }
+
+    pub fn unfold_all(&mut self) {
+        self.folds.clear();
+    }
+
+    pub fn has_folds(&self) -> bool {
+        !self.folds.is_empty()
     }
 
     pub fn beginning_of_line(&mut self) {
@@ -503,6 +658,58 @@ mod tests {
         assert_eq!(b.unprotected_text(), "ask");
         b.clear_unprotected();
         assert_eq!(b.text().to_string(), "longer log\n");
+    }
+
+    fn folded(text: &str) -> Buffer {
+        let mut b = Buffer::new("t");
+        b.insert(text);
+        b.goto_char(0);
+        b
+    }
+
+    #[test]
+    fn folds_hide_lines_and_j_k_step_over_them() {
+        let mut b = folded("# A\na1\na2\n# B\nb1\n");
+        b.fold(1, 2);
+        assert!(b.line_hidden(1) && b.line_hidden(2) && !b.line_hidden(3));
+        assert_eq!(b.folded_after(0), 2);
+        b.forward_line(1);
+        assert_eq!(b.line(), 3, "j goes over the fold");
+        b.forward_line(-1);
+        assert_eq!(b.line(), 0, "k comes back to its heading");
+        assert!(b.unfold_after(0));
+        assert!(!b.line_hidden(1));
+    }
+
+    #[test]
+    fn folds_follow_edits_and_open_when_touched() {
+        let mut b = folded("# A\na1\n# B\nb1\nb2\n");
+        b.fold(3, 4);
+        b.insert("new\n");
+        assert!(b.line_hidden(4) && b.line_hidden(5), "an edit above shifts the fold");
+        b.goto_char(b.line_to_pos(3) + 3);
+        b.insert("!");
+        assert!(b.line_hidden(4), "typing at the heading's end keeps it");
+        b.delete_range(b.line_to_pos(3), b.line_to_pos(4) + 1);
+        assert!(!b.has_folds(), "deleting into it opens it");
+        b.fold(1, 1);
+        b.undo_boundary();
+        b.insert("x");
+        b.undo();
+        assert!(!b.has_folds(), "undo opens folds");
+    }
+
+    #[test]
+    fn folding_the_cursors_line_moves_it_to_the_heading() {
+        let mut b = folded("# A\na1\na2\n");
+        b.goto_char(b.line_to_pos(2));
+        b.fold(1, 2);
+        assert_eq!(b.line(), 0);
+        let mut c = folded("# A\na1\n");
+        c.fold(1, 1);
+        c.goto_char(c.line_to_pos(1));
+        c.reveal_point();
+        assert!(!c.has_folds(), "a jump into a fold opens it");
     }
 
     #[test]
