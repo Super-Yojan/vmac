@@ -279,6 +279,21 @@ pub struct FrameLine {
     /// Inside a Markdown code block.
     #[serde(default, skip_serializing_if = "no")]
     pub code_block: bool,
+    /// A box behind some of its columns (a chat bubble, a card, a prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<Band>,
+}
+
+/// A tinted box behind columns `from`..`to` of a line. Lines in a row with
+/// the same box join into one, rounded at its first and last.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Band {
+    pub from: usize,
+    pub to: usize,
+    /// bubble, card, ask or input.
+    pub kind: String,
+    pub first: bool,
+    pub last: bool,
 }
 
 /// How a run of text looks. Colors are names the window resolves against

@@ -4,11 +4,16 @@
 -- Agent Client Protocol: it reads files (from your buffers, saved or not),
 -- edits them and runs tools, asking first when it needs permission.
 --
--- The *agent* buffer holds the conversation, and below its rule the prompt
--- you type: an ordinary text area (every Vim key works; the conversation
--- above can be read, searched and yanked, not changed). RET in normal state
--- sends it (C-RET or Cmd-RET from insert state). On a tool call, RET or TAB
--- opens and closes its details; on a file it touched, RET visits it.
+-- The *agent* buffer holds the conversation, and in the box at its foot the
+-- prompt you type: an ordinary text area (every Vim key works; the
+-- conversation above can be read, searched and yanked, not changed). RET in
+-- normal state sends it (C-RET or Cmd-RET from insert state).
+--
+-- Your messages sit in bubbles on the right. The agent's thinking, and the
+-- tool calls it makes in a row, fold into a line each ("Read 2 files and
+-- edited 1 file"); RET or TAB opens and closes one, and a tool call's own
+-- details inside it; on a file it touched, RET visits it. Its changes
+-- waiting for review are listed in a card above the prompt (RET reviews).
 --
 -- When it asks permission (to edit, to run a command, to start coding
 -- after a plan), *agent* shows the question, what it's about (the plan, the

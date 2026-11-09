@@ -358,6 +358,8 @@ pub struct EditorState {
     agent_asked: usize,
     /// What each line of the agent buffer points at.
     agent_lines: Vec<crate::agent::Target>,
+    /// The boxes behind its lines (line, from, to, kind).
+    agent_bands: Vec<(usize, usize, usize, &'static str)>,
     /// Terminals the agent asked for (terminal/create), by its ids.
     agent_terms: Vec<AgentTerm>,
     /// The CLI agent's terminal (a CLI backend: claude, codex, pi...).
@@ -572,6 +574,7 @@ impl EditorState {
             agent_shown_width: 0,
             agent_asked: 0,
             agent_lines: Vec::new(),
+            agent_bands: Vec::new(),
             agent_terms: Vec::new(),
             agent_cli: None,
             file_stamps: Default::default(),
@@ -2148,6 +2151,39 @@ impl EditorState {
         ids.into_iter().map(|id| self.review_of(id).map_or(0, |(_, h)| h.len())).sum()
     }
 
+    /// The files with changes waiting for review: path, as shown (from the
+    /// agent's project), changes, lines added, lines removed.
+    pub fn review_files(&mut self) -> Vec<(PathBuf, String, usize, usize, usize)> {
+        let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| self.agent_root());
+        let ids: Vec<(PathBuf, BufferId)> =
+            self.reviews.iter().filter_map(|r| Some((r.path.clone(), self.buffer_visiting(&r.path)?))).collect();
+        ids.into_iter()
+            .filter_map(|(path, id)| {
+                let (_, hunks) = self.review_of(id)?;
+                if hunks.is_empty() {
+                    return None;
+                }
+                let added = hunks.iter().map(|h| h.new.len()).sum();
+                let removed = hunks.iter().map(|h| h.old.len()).sum();
+                let shown = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+                Some((path, shown, hunks.len(), added, removed))
+            })
+            .collect()
+    }
+
+    /// The boxes behind a buffer's lines (line, from column, to column,
+    /// kind): the agent buffer's bubbles and cards, and its prompt's box.
+    pub fn line_bands(&self, id: BufferId) -> Vec<(usize, usize, usize, String)> {
+        let Some(b) = self.buffer_by_id(id).filter(|_| self.agent_buffer == Some(id)) else { return Vec::new() };
+        let mut out: Vec<_> =
+            self.agent_bands.iter().map(|&(line, from, to, kind)| (line, from, to, kind.to_string())).collect();
+        let first = b.line_of(b.protected());
+        for line in first..b.line_count().max(first + 1) {
+            out.push((line, 0, self.agent_shown_width, "input".to_string()));
+        }
+        out
+    }
+
     /// The hunk ga/gx act on: the one on the cursor's line, in a file or in
     /// the review buffer. (buffer, review index, hunk).
     fn review_target(&mut self) -> Option<(BufferId, usize, crate::review::Hunk)> {
@@ -2550,8 +2586,12 @@ impl EditorState {
         // Wrapped to the widest window showing it (re-wrapped on resize).
         let width = self.windows.iter().filter(|w| w.buffer == id).map(|w| w.cols).max().unwrap_or(0);
         let width = if width == 0 { 80 } else { width.saturating_sub(2) };
-        let pending = self.review_count();
-        let revision = self.agent.as_ref().map_or(0, |a| a.revision + 1) + (pending as u64) * 1_000_003;
+        let changes = self.review_files();
+        let (pending, sizes): (usize, usize) =
+            changes.iter().fold((0, 0), |(n, s), (_, _, k, a, d)| (n + k, s + a * 7 + d * 13));
+        let revision = self.agent.as_ref().map_or(0, |a| a.revision + 1)
+            + (pending as u64) * 1_000_003
+            + (sizes as u64) * 7_919;
         if (revision, width) == (self.agent_shown, self.agent_shown_width) {
             return false;
         }
@@ -2561,30 +2601,79 @@ impl EditorState {
             Some(agent) => agent.render(width),
             None => crate::agent::Rendered::default(),
         };
+        use crate::agent::Target;
         if rendered.text.is_empty() {
-            rendered.text = format!(
-                "Ask {} anything about this project: type below, then RET in normal state.\n\n",
-                self.agent_config.name
-            );
-            rendered.faces.push((0, rendered.text.chars().count(), "dim"));
-            rendered.lines = vec![crate::agent::Target::None; 2];
+            let name = &self.agent_config.name;
+            let root = self.agent.as_ref().map(|a| a.root.clone()).unwrap_or_else(|| self.agent_root());
+            let home = std::env::var("HOME").unwrap_or_default();
+            let shown = root.display().to_string();
+            let shown = match shown.strip_prefix(&home) {
+                Some(rest) if !home.is_empty() => format!("~{rest}"),
+                _ => shown,
+            };
+            rendered.line("", Target::None);
+            rendered.styled(&format!("Ask {name} about {shown}"), "agent-heading", Target::None);
+            for piece in crate::agent::wrap(
+                "It reads your files (saved or not), edits them for your review and runs commands, asking first.",
+                width,
+            ) {
+                rendered.styled(&piece, "dim", Target::None);
+            }
+            rendered.line("", Target::None);
+            for (keys, what) in [
+                ("@file", "attach a file to the prompt"),
+                ("SPC a s", "ask about the line or selection"),
+                ("SPC a e", "fix this file's problems"),
+                ("SPC a h", "reopen a past session"),
+                ("SPC a b", "use another agent"),
+            ] {
+                let at = rendered.text.chars().count();
+                rendered.line(&format!("  {keys:<9}{what}"), Target::None);
+                rendered.faces.push((at + 2, at + 2 + keys.len(), "accent"));
+                rendered.faces.push((at + 11, at + 11 + what.chars().count(), "dim"));
+            }
+            rendered.line("", Target::None);
         }
-        if pending > 0 {
-            let plural = if pending == 1 { "" } else { "s" };
-            let note = format!("◆ {pending} change{plural} to review: SPC a r (ga accepts, gx rejects)");
-            let at = rendered.text.chars().count();
-            rendered.faces.push((at, at + note.chars().count(), "yellow"));
-            rendered.text.push_str(&note);
-            rendered.text.push_str("\n\n");
-            rendered.lines.extend([crate::agent::Target::None, crate::agent::Target::None]);
+        // The changes waiting for review, in a card: each file, its lines
+        // added and removed.
+        if !changes.is_empty() {
+            let card = |r: &mut crate::agent::Rendered| r.band(0, width, "card");
+            let plural = if changes.len() == 1 { "" } else { "s" };
+            let head = format!("◆ Changed {} file{plural}", changes.len());
+            rendered.styled(&head, "agent-heading", Target::Review);
+            card(&mut rendered);
+            for (path, shown, _, added, removed) in &changes {
+                let counts = match (added, removed) {
+                    (a, 0) => format!("+{a}"),
+                    (0, d) => format!("−{d}"),
+                    (a, d) => format!("+{a} −{d}"),
+                };
+                let room = width.saturating_sub(counts.chars().count() + 3);
+                let name: String = if shown.chars().count() > room {
+                    let tail: String = shown.chars().rev().take(room.saturating_sub(1)).collect();
+                    format!("…{}", tail.chars().rev().collect::<String>())
+                } else {
+                    shown.clone()
+                };
+                let fill = width.saturating_sub(2 + name.chars().count() + counts.chars().count());
+                let at = rendered.text.chars().count() + 2 + name.chars().count() + fill;
+                rendered.line(&format!("  {name}{}{counts}", " ".repeat(fill)), Target::File(path.clone(), None));
+                for (i, c) in counts.char_indices() {
+                    let face = if counts[..i].contains('−') || c == '−' { "red" } else { "green" };
+                    let n = counts[..i].chars().count();
+                    rendered.faces.push((at + n, at + n + 1, face));
+                }
+                card(&mut rendered);
+            }
+            rendered.styled("  RET reviews · SPC a A keeps all · SPC a X undoes all", "dim", Target::Review);
+            card(&mut rendered);
+            rendered.line("", Target::None);
         }
-        // The rule above the prompt.
-        let rule = "─".repeat(40);
-        let at = rendered.text.chars().count();
-        rendered.text.push_str(&rule);
-        rendered.text.push('\n');
-        rendered.faces.push((at, at + 40, "dim"));
-        rendered.lines.push(crate::agent::Target::None);
+        // The prompt's box starts with its hint; what you type goes below.
+        let hint = "Ask, or @ to attach a file · RET in normal state sends";
+        rendered.styled(hint, "dim", Target::None);
+        rendered.band(0, width, "input");
+        self.agent_bands = rendered.bands.clone();
 
         let b = &mut self.buffers.iter_mut().find(|(b, _)| *b == id).expect("checked above").1;
         let old = b.protected();
@@ -2648,6 +2737,7 @@ impl EditorState {
                 self.agent_visit(&path, line);
             }
             Some(crate::agent::Target::Permission(i)) => self.agent_permit(i),
+            Some(crate::agent::Target::Review) => self.review_show(),
             Some(crate::agent::Target::Buffer(name)) => {
                 let here = self.selected;
                 match self.window_order().into_iter().find(|&w| w != here && !self.is_sidebar(w)) {

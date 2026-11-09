@@ -119,6 +119,11 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    /// Whether it hasn't finished.
+    pub fn running(&self) -> bool {
+        matches!(self.status.as_str(), "pending" | "in_progress")
+    }
+
     /// Fills in the fields an update carries.
     fn update(&mut self, v: &Value) {
         if let Some(t) = v["title"].as_str() {
@@ -800,35 +805,41 @@ impl Agent {
         self.render(80).text
     }
 
+    /// A path as shown: from the project when it's in it.
+    fn shorten(&self, s: &str) -> String {
+        s.replace(&format!("{}/", self.root.display()), "")
+    }
+
     /// The conversation for the agent buffer: Markdown, faces to color it,
-    /// and what each line points at (a tool call to open, a file to visit).
+    /// boxes behind some lines (your messages, the permission asked), and
+    /// what each line points at (a tool call to open, a file to visit).
     pub fn render(&self, width: usize) -> Rendered {
         let width = width.max(20);
         let mut r = Rendered::default();
-        let shorten = |s: &str| {
-            let root = format!("{}/", self.root.display());
-            s.replace(&root, "")
-        };
-        for entry in &self.entries {
+        let running = self.state == State::Running;
+        let last = self.entries.len().saturating_sub(1);
+        // Quiet lines (thinking, tool calls) stack without gaps between them.
+        let mut quiet = false;
+        let mut i = 0;
+        while i < self.entries.len() {
+            let entry = &self.entries[i];
+            let was_quiet = std::mem::replace(&mut quiet, matches!(entry, Entry::Thought(_) | Entry::Tool(_)));
+            if !(quiet && was_quiet) {
+                r.gap();
+            }
             match entry {
+                // Yours: a bubble on the right.
                 Entry::User(s) => {
-                    if !r.text.is_empty() {
-                        r.line("", Target::None);
+                    let inner = (width * 3 / 4).clamp(16, width - 2);
+                    let pieces: Vec<String> = s.trim().lines().flat_map(|l| wrap(l, inner)).collect();
+                    let block = pieces.iter().map(|p| p.chars().count()).max().unwrap_or(0);
+                    let from = width.saturating_sub(block + 1);
+                    for piece in &pieces {
+                        r.styled(&format!("{}{piece}", " ".repeat(from)), "agent-user", Target::None);
+                        r.band(from, from + block, "bubble");
                     }
-                    let mut first = true;
-                    for line in s.trim().lines() {
-                        for piece in wrap(line, width - 2) {
-                            let mark = if first { "› " } else { "  " };
-                            first = false;
-                            r.styled(&format!("{mark}{piece}"), "agent-user", Target::None);
-                        }
-                    }
-                    r.line("", Target::None);
                 }
                 Entry::Agent(s) => {
-                    if r.lines.last().is_some_and(|t| *t != Target::None) {
-                        r.line("", Target::None);
-                    }
                     // Wrapped, except code blocks and tables.
                     let mut code = false;
                     for line in s.trim().lines() {
@@ -842,80 +853,55 @@ impl Agent {
                         }
                         code ^= fence;
                     }
-                    r.line("", Target::None);
                 }
+                // Thinking: one line, opened with TAB.
                 Entry::Thought(s) => {
-                    if r.lines.last().is_some_and(|t| *t != Target::None) {
-                        r.line("", Target::None);
-                    }
-                    for line in s.trim().lines() {
-                        for piece in wrap(line, width - 2) {
-                            r.styled(&format!("  {piece}"), "agent-thought", Target::None);
-                        }
-                    }
-                    r.line("", Target::None);
-                }
-                Entry::Tool(t) => {
-                    let (mark, face) = match t.status.as_str() {
-                        "completed" => ("✓", "green"),
-                        "failed" => ("✗", "red"),
-                        "in_progress" => ("…", "yellow"),
-                        _ => ("·", "dim"),
-                    };
-                    let open = self.expanded.contains(&t.id);
+                    let key = format!("thought:{i}");
+                    let open = self.expanded.contains(&key);
+                    let label = if running && i == last { "Thinking…" } else { "Thought" };
                     let fold = if open { "▾" } else { "▸" };
-                    let start = r.chars;
-                    r.line(&format!("{fold} {mark} {}", shorten(&t.title)), Target::Tool(t.id.clone()));
-                    r.faces.push((start, start + 1, "dim"));
-                    r.faces.push((start + 2, start + 3, face));
-                    let running = matches!(t.status.as_str(), "pending" | "in_progress");
-                    for id in &t.terminals {
-                        let Some((buffer, tail)) = self.terminals.get(id) else { continue };
-                        if open {
-                            r.styled(&format!("    ⌁ {buffer}  (RET opens it)"), "cyan", Target::Buffer(buffer.clone()));
-                            let lines: Vec<&str> = tail.lines().collect();
-                            for line in &lines[lines.len().saturating_sub(MAX_TERMINAL_LINES)..] {
-                                r.styled(&format!("    {line}"), "agent-output", Target::Buffer(buffer.clone()));
+                    r.styled(&format!("{fold} {label}"), "agent-thought", Target::Tool(key.clone()));
+                    if open {
+                        for line in s.trim().lines() {
+                            for piece in wrap(line, width - 4) {
+                                r.styled(&format!("    {piece}"), "agent-thought", Target::Tool(key.clone()));
                             }
-                        } else if running && let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty()) {
-                            // Collapsed but running: its latest line.
-                            let last: String = last.trim().chars().take(width.saturating_sub(6)).collect();
-                            r.styled(&format!("    {last}"), "dim", Target::Buffer(buffer.clone()));
                         }
                     }
-                    if open {
-                        for (path, line) in &t.locations {
-                            let shown = shorten(&path.display().to_string());
-                            let text = match line {
-                                Some(n) => format!("    {shown}:{n}"),
-                                None => format!("    {shown}"),
-                            };
-                            r.styled(&text, "cyan", Target::File(path.clone(), *line));
-                        }
-                        let lines: Vec<&str> = t.output.lines().collect();
-                        for line in lines.iter().take(MAX_TOOL_LINES) {
-                            let face = if line.starts_with("+ ") {
-                                "green"
-                            } else if line.starts_with("- ") {
-                                "red"
-                            } else {
-                                "agent-output"
-                            };
-                            r.styled(&format!("    {line}"), face, Target::Tool(t.id.clone()));
-                        }
-                        if lines.len() > MAX_TOOL_LINES {
-                            let more = lines.len() - MAX_TOOL_LINES;
-                            r.styled(&format!("    … {more} more lines"), "dim", Target::Tool(t.id.clone()));
-                        }
-                        if t.locations.is_empty() && lines.is_empty() && t.terminals.is_empty() {
-                            r.styled("    (no output)", "dim", Target::Tool(t.id.clone()));
+                }
+                // Tool calls in a row: one line saying what they did, opened
+                // with TAB; the one running shows under it.
+                Entry::Tool(_) => {
+                    let mut tools = Vec::new();
+                    while let Some(Entry::Tool(t)) = self.entries.get(i) {
+                        tools.push(t);
+                        i += 1;
+                    }
+                    i -= 1;
+                    if let [t] = tools[..] {
+                        self.render_tool(&mut r, t, "", width);
+                    } else {
+                        let key = format!("group:{}", tools[0].id);
+                        let open = self.expanded.contains(&key);
+                        let busy = tools.iter().any(|t| t.running());
+                        let failed = tools.iter().filter(|t| t.status == "failed").count();
+                        let (mark, face) = match (busy, failed) {
+                            (true, _) => ("…", "yellow"),
+                            (false, 0) => ("✓", "green"),
+                            _ => ("✗", "red"),
+                        };
+                        let fold = if open { "▾" } else { "▸" };
+                        let failures = if failed > 0 { format!(" · {failed} failed") } else { String::new() };
+                        let start = r.chars;
+                        r.line(&format!("{fold} {mark} {}{failures}", tools_summary(&tools)), Target::Tool(key));
+                        r.faces.push((start, start + 1, "dim"));
+                        r.faces.push((start + 2, start + 3, face));
+                        for t in tools.iter().filter(|t| open || t.running()) {
+                            self.render_tool(&mut r, t, "  ", width);
                         }
                     }
                 }
                 Entry::Plan(steps) => {
-                    if r.lines.last().is_some_and(|t| *t != Target::None) {
-                        r.line("", Target::None);
-                    }
                     r.styled("Plan", "agent-heading", Target::None);
                     for (step, status) in steps {
                         let (mark, face) = match status.as_str() {
@@ -927,58 +913,170 @@ impl Agent {
                         r.line(&format!("  {mark} {step}"), Target::None);
                         r.faces.push((start + 2, start + 3, face));
                     }
-                    r.line("", Target::None);
                 }
                 Entry::Notice(s) => {
                     for (i, piece) in wrap(&format!("— {s}"), width).into_iter().enumerate() {
                         let piece = if i == 0 { piece } else { format!("  {piece}") };
                         r.styled(&piece, "dim", Target::None);
                     }
-                    r.line("", Target::None);
                 }
             }
+            i += 1;
         }
-        // Permissions: the first can be answered here; its details to read
-        // first, then its choices (RET on one, or its number).
+        // Permissions: the first can be answered here, in a box: its details
+        // to read first, then its choices (RET on one, or its number).
         for (n, p) in self.permissions.iter().enumerate() {
-            let question = permission_question(&shorten(&p.title));
+            let question = permission_question(&self.shorten(&p.title));
+            r.gap();
             if n > 0 {
                 r.styled(&format!("⚠ {question}  (after the one above)"), "yellow", Target::None);
                 continue;
             }
+            let boxed = |r: &mut Rendered| r.band(0, width, "ask");
             r.styled(&format!("⚠ {question}"), "agent-ask", Target::Ask);
+            boxed(&mut r);
             if !p.details.trim().is_empty() {
                 r.line("", Target::Ask);
+                boxed(&mut r);
                 let mut code = false;
                 for line in p.details.trim().lines() {
                     let fence = line.trim_start().starts_with("```");
                     if line.trim().is_empty() {
                         r.line("", Target::Ask);
+                        boxed(&mut r);
                     } else if code || fence {
                         r.line(&format!("  {line}"), Target::Ask);
+                        boxed(&mut r);
                     } else {
                         for piece in wrap(line, width.saturating_sub(2)) {
                             r.line(&format!("  {piece}"), Target::Ask);
+                            boxed(&mut r);
                         }
                     }
                     code ^= fence;
                 }
                 r.line("", Target::Ask);
+                boxed(&mut r);
             }
             for (i, (_, name, kind)) in p.options.iter().enumerate() {
                 let face = if kind.starts_with("allow") { "green" } else { "red" };
                 let start = r.chars;
                 r.line(&format!("  {}  {name}", i + 1), Target::Permission(i));
                 r.faces.push((start + 2, start + 3, face));
+                boxed(&mut r);
             }
             r.styled("  RET or its number answers · SPC a p picks from a list", "dim", Target::None);
-            r.line("", Target::None);
+            boxed(&mut r);
         }
-        if self.state == State::Running && self.permissions.is_empty() {
+        if running && self.permissions.is_empty() {
+            r.gap();
             r.styled("… working (SPC a c cancels)", "dim", Target::None);
+        }
+        if !r.text.is_empty() {
+            r.gap();
         }
         r
     }
+
+    /// One tool call: its line, and opened, the files it touched and what
+    /// it produced (or the terminal it runs in).
+    fn render_tool(&self, r: &mut Rendered, t: &ToolCall, indent: &str, width: usize) {
+        let (mark, face) = match t.status.as_str() {
+            "completed" => ("✓", "green"),
+            "failed" => ("✗", "red"),
+            "in_progress" => ("…", "yellow"),
+            _ => ("·", "dim"),
+        };
+        let open = self.expanded.contains(&t.id);
+        let fold = if open { "▾" } else { "▸" };
+        let at = r.chars + indent.chars().count();
+        r.line(&format!("{indent}{fold} {mark} {}", self.shorten(&t.title)), Target::Tool(t.id.clone()));
+        r.faces.push((at, at + 1, "dim"));
+        r.faces.push((at + 2, at + 3, face));
+        let pad = format!("{indent}    ");
+        for id in &t.terminals {
+            let Some((buffer, tail)) = self.terminals.get(id) else { continue };
+            if open {
+                r.styled(&format!("{pad}⌁ {buffer}  (RET opens it)"), "cyan", Target::Buffer(buffer.clone()));
+                let lines: Vec<&str> = tail.lines().collect();
+                for line in &lines[lines.len().saturating_sub(MAX_TERMINAL_LINES)..] {
+                    r.styled(&format!("{pad}{line}"), "agent-output", Target::Buffer(buffer.clone()));
+                }
+            } else if t.running() && let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty()) {
+                // Closed but running: its latest line.
+                let last: String = last.trim().chars().take(width.saturating_sub(pad.len() + 2)).collect();
+                r.styled(&format!("{pad}{last}"), "dim", Target::Buffer(buffer.clone()));
+            }
+        }
+        if !open {
+            return;
+        }
+        for (path, line) in &t.locations {
+            let shown = self.shorten(&path.display().to_string());
+            let text = match line {
+                Some(n) => format!("{pad}{shown}:{n}"),
+                None => format!("{pad}{shown}"),
+            };
+            r.styled(&text, "cyan", Target::File(path.clone(), *line));
+        }
+        let lines: Vec<&str> = t.output.lines().collect();
+        for line in lines.iter().take(MAX_TOOL_LINES) {
+            let face = if line.starts_with("+ ") {
+                "green"
+            } else if line.starts_with("- ") {
+                "red"
+            } else {
+                "agent-output"
+            };
+            r.styled(&format!("{pad}{line}"), face, Target::Tool(t.id.clone()));
+        }
+        if lines.len() > MAX_TOOL_LINES {
+            let more = lines.len() - MAX_TOOL_LINES;
+            r.styled(&format!("{pad}… {more} more lines"), "dim", Target::Tool(t.id.clone()));
+        }
+        if t.locations.is_empty() && lines.is_empty() && t.terminals.is_empty() {
+            r.styled(&format!("{pad}(no output)"), "dim", Target::Tool(t.id.clone()));
+        }
+    }
+}
+
+/// What tool calls did, in a line: "Read 2 files, edited 1 file and ran a command".
+pub fn tools_summary(tools: &[&ToolCall]) -> String {
+    const KINDS: [(&str, &str, &str, &str); 7] = [
+        ("read", "read", "file", "files"),
+        ("edit", "edited", "file", "files"),
+        ("delete", "deleted", "file", "files"),
+        ("move", "moved", "file", "files"),
+        ("search", "searched", "once", "times"),
+        ("execute", "ran", "command", "commands"),
+        ("fetch", "fetched", "page", "pages"),
+    ];
+    let count = |kind: &str| tools.iter().filter(|t| t.kind == kind).count();
+    let mut parts: Vec<String> = KINDS
+        .iter()
+        .filter_map(|&(kind, verb, one, many)| match count(kind) {
+            0 => None,
+            1 if kind == "search" => Some(format!("{verb} {one}")),
+            1 if kind == "execute" => Some(format!("{verb} a {one}")),
+            1 => Some(format!("{verb} 1 {one}")),
+            n => Some(format!("{verb} {n} {many}")),
+        })
+        .collect();
+    let others = tools.iter().filter(|t| !KINDS.iter().any(|k| k.0 == t.kind)).count();
+    match others {
+        0 => {}
+        1 => parts.push("took 1 other step".into()),
+        n => parts.push(format!("took {n} other steps")),
+    }
+    let mut text = match parts.split_last() {
+        Some((tail, [])) => tail.clone(),
+        Some((tail, head)) => format!("{} and {tail}", head.join(", ")),
+        None => String::new(),
+    };
+    if let Some(c) = text.get(..1) {
+        text = c.to_uppercase() + &text[1..];
+    }
+    text
 }
 
 /// Tool output lines shown before "… N more lines".
@@ -1001,6 +1099,8 @@ pub enum Target {
     Ask,
     /// One of its choices: RET picks it.
     Permission(usize),
+    /// The changes waiting for review: RET lists them.
+    Review,
 }
 
 /// The agent buffer's text, its faces (character ranges) and each line's target.
@@ -1009,21 +1109,36 @@ pub struct Rendered {
     pub text: String,
     pub faces: Vec<(usize, usize, &'static str)>,
     pub lines: Vec<Target>,
+    /// Boxes behind lines: (line, from column, to column, kind).
+    pub bands: Vec<(usize, usize, usize, &'static str)>,
     chars: usize,
 }
 
 impl Rendered {
-    fn line(&mut self, text: &str, target: Target) {
+    pub fn line(&mut self, text: &str, target: Target) {
         self.text.push_str(text);
         self.text.push('\n');
         self.chars += text.chars().count() + 1;
         self.lines.push(target);
     }
 
-    fn styled(&mut self, text: &str, face: &'static str, target: Target) {
+    pub fn styled(&mut self, text: &str, face: &'static str, target: Target) {
         let start = self.chars;
         self.line(text, target);
         self.faces.push((start, start + text.chars().count(), face));
+    }
+
+    /// Puts the line just added in a box from column `from` to `to`: a
+    /// "bubble" (your message), "ask" (a permission), "card" or "input".
+    pub fn band(&mut self, from: usize, to: usize, kind: &'static str) {
+        self.bands.push((self.lines.len() - 1, from, to, kind));
+    }
+
+    /// A blank line, unless there is one (or nothing yet).
+    fn gap(&mut self) {
+        if !self.text.is_empty() && !self.text.ends_with("\n\n") {
+            self.line("", Target::None);
+        }
     }
 }
 
@@ -1465,6 +1580,49 @@ while True:
         assert!(r.text.contains("▾ ✓ Edit src/a.rs\n    src/a.rs:3\n    - x\n    + y\n"), "{}", r.text);
         assert_eq!(r.lines[line + 1], Target::File(dir.join("src/a.rs"), Some(3)));
         assert_eq!(r.text.lines().count(), r.lines.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn thinking_and_tool_calls_in_a_row_fold_into_a_line() {
+        let dir = std::env::temp_dir().join(format!("vmac-agent-groups-{}", std::process::id()));
+        let mut agent = Agent::start(fake_config(&dir), &dir).unwrap();
+        agent.entries.clear();
+        agent.entries.push(Entry::User("fix it".into()));
+        agent.entries.push(Entry::Thought("Let me look first.".into()));
+        for (id, kind, status) in [("t1", "read", "completed"), ("t2", "read", "completed"), ("t3", "edit", "failed")] {
+            agent.entries.push(Entry::Tool(ToolCall {
+                id: id.into(),
+                title: format!("{kind} {id}"),
+                kind: kind.into(),
+                status: status.into(),
+                ..Default::default()
+            }));
+        }
+        let r = agent.render(40);
+        assert!(r.text.contains("▸ Thought\n▸ ✗ Read 2 files and edited 1 file · 1 failed\n"), "{}", r.text);
+        assert!(!r.text.contains("Let me look") && !r.text.contains("read t1"), "{}", r.text);
+        // Your message: on the right, in a bubble.
+        let bubble = r.text.lines().position(|l| l.trim() == "fix it").unwrap();
+        assert_eq!(r.text.lines().nth(bubble).unwrap(), format!("{}fix it", " ".repeat(33)));
+        assert_eq!(r.bands, vec![(bubble, 33, 39, "bubble")]);
+
+        let group = r.text.lines().position(|l| l.contains("Read 2 files")).unwrap();
+        assert_eq!(r.lines[group], Target::Tool("group:t1".into()));
+        agent.toggle("group:t1");
+        agent.toggle(&format!("thought:{}", 1));
+        let r = agent.render(40);
+        assert!(r.text.contains("▾ Thought\n    Let me look first.\n▾ ✗ Read"), "{}", r.text);
+        assert!(r.text.contains("  ▸ ✓ read t1\n  ▸ ✓ read t2\n  ▸ ✗ edit t3\n"), "{}", r.text);
+
+        // Running, the step under way shows while the rest stay folded.
+        agent.toggle("group:t1");
+        if let Some(Entry::Tool(t)) = agent.entries.last_mut() {
+            t.status = "in_progress".into();
+        }
+        let r = agent.render(40);
+        assert!(r.text.contains("▸ … Read 2 files and edited 1 file\n  ▸ … edit t3\n"), "{}", r.text);
+        assert_eq!(tools_summary(&[&ToolCall { kind: "execute".into(), ..Default::default() }]), "Ran a command");
         std::fs::remove_dir_all(&dir).ok();
     }
 

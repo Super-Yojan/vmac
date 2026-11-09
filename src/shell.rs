@@ -811,6 +811,32 @@ fn window_line_element(line: &FrameLine, selected: bool, bar: bool, cx: &App) ->
     div()
         .relative()
         .when(line.code_block, |d| d.bg(theme.foreground.opacity(0.06)))
+        // A box behind its columns: a chat bubble, a card, the prompt.
+        .when_some(line.band.as_ref(), |d, b| {
+            let cw = FONT_SIZE * CHAR_WIDTH;
+            let numbers = line.number.as_ref().map_or(0., |n| n.chars().count() as f32 * cw);
+            let (fill, edge) = match b.kind.as_str() {
+                "ask" => (theme.yellow.opacity(0.10), theme.yellow.opacity(0.35)),
+                "input" => (theme.foreground.opacity(0.04), theme.border),
+                "card" => (theme.foreground.opacity(0.04), theme.border),
+                _ => (theme.foreground.opacity(0.08), theme.foreground.opacity(0.08)),
+            };
+            let radius = px(8.);
+            d.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(numbers + b.from as f32 * cw - 8.))
+                    .w(px(b.to.saturating_sub(b.from) as f32 * cw + 16.))
+                    .bg(fill)
+                    .border_color(edge)
+                    .border_l_1()
+                    .border_r_1()
+                    .when(b.first, |d| d.border_t_1().rounded_tl(radius).rounded_tr(radius))
+                    .when(b.last, |d| d.border_b_1().rounded_bl(radius).rounded_br(radius)),
+            )
+        })
         .when(line.current, |d| d.bg(if selected { theme.list_active } else { theme.list_hover }))
         // The agent's unreviewed lines: a green band, and a red rule where
         // it deleted lines.

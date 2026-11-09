@@ -2850,7 +2850,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("✓ Edit")));
 
         let transcript = editor.lock().buffer().text().to_string();
-        assert!(transcript.contains("› edit"), "{transcript}");
+        assert!(transcript.lines().any(|l| l.trim() == "edit"), "your message, in its bubble: {transcript}");
         assert!(transcript.contains("Reading it."), "{transcript}");
         assert!(transcript.contains("  ✓ Read it\n  ○ Shout it"), "{transcript}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "HELLOWORLD\n", "it read the unsaved text");
@@ -2887,25 +2887,25 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         // SPC a a: the prompt, in insert state; RET (normal) sends it.
         typed(&mut lisp, " aa");
         assert_eq!(editor.lock().buffer().name(), "*agent*");
-        assert!(text().contains("Ask fake anything"), "{}", text());
+        assert!(text().contains("Ask fake about"), "{}", text());
         typed(&mut lisp, "hello there");
         lisp.dispatch_key("ESC", "");
         typed(&mut lisp, "bdw");
-        assert!(text().ends_with("─\nhello "), "Vim keys edit the prompt: {:?}", text());
+        assert!(text().ends_with("sends\nhello "), "Vim keys edit the prompt: {:?}", text());
         typed(&mut lisp, "gg");
         typed(&mut lisp, "dd");
-        assert!(text().starts_with("Ask fake"), "the conversation can't be changed");
+        assert!(text().trim_start().starts_with("Ask fake"), "the conversation can't be changed");
         typed(&mut lisp, "G$x");
-        assert!(text().ends_with("─\nhello"), "{:?}", text());
+        assert!(text().ends_with("sends\nhello"), "{:?}", text());
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| s.buffer().text().to_string().contains("You said: hello")), "{} / {}", text(), editor.lock().message);
-        assert!(text().contains("› hello\n"), "{}", text());
-        assert!(text().ends_with("─\n"), "the prompt was cleared: {:?}", text());
+        assert!(text().lines().any(|l| l.trim() == "hello"), "{}", text());
+        assert!(text().ends_with("sends\n"), "the prompt was cleared: {:?}", text());
 
         // Typing while it answers keeps the prompt below the conversation.
         typed(&mut lisp, "inext");
         lisp.dispatch_key("ESC", "");
-        assert!(text().ends_with("─\nnext"));
+        assert!(text().ends_with("sends\nnext"));
 
         // A tool call: TAB opens it; RET on its file visits it.
         let path = file.display().to_string();
@@ -2917,7 +2917,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         editor.lock().buffer_mut().goto_char(pos);
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| s.agent_status() == "ready" && s.buffer().text().to_string().contains("▸ ✓ Edit lib.rs")), "{}", text());
-        assert!(text().ends_with("─\nnext"), "the prompt survived: {:?}", text());
+        assert!(text().ends_with("sends\nnext"), "the prompt survived: {:?}", text());
         let line = text().lines().position(|l| l.contains("▸ ✓ Edit")).unwrap();
         let pos = editor.lock().buffer().line_to_pos(line);
         editor.lock().buffer_mut().goto_char(pos);
@@ -2934,7 +2934,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         typed(&mut lisp, "why");
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| s.buffer().text().to_string().contains("You said: why")), "{}", text());
-        assert!(text().contains("› why  [lib.rs:2-3]"), "{}", text());
+        assert!(text().contains(" why  [lib.rs:2-3]\n"), "{}", text());
         assert!(text().contains("FN B() {}\nFN C() {}"), "the code went with it: {}", text());
 
         // SPC a n: a new conversation.
@@ -2982,7 +2982,8 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         let id = editor.lock().window().buffer;
         assert_eq!(editor.lock().review_marks(id), vec![(1, true), (3, false), (4, true)]);
         editor.lock().agent_show();
-        assert!(text(&editor).contains("◆ 6 changes to review"), "{}", text(&editor));
+        assert!(text(&editor).contains("◆ Changed 2 files\n  a.txt"), "{}", text(&editor));
+        assert!(text(&editor).contains("+2 −2\n"), "{}", text(&editor));
         editor.lock().open_file(&file).unwrap();
 
         // ]h to the first, gx rejects it (saved), u brings it back.
@@ -3143,7 +3144,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         let title = editor.lock().picker.as_ref().map(|p| p.title().to_string());
         assert_eq!(title.as_deref(), Some("Attach file"));
         lisp.dispatch_key("RET", "");
-        assert!(text(&editor).ends_with("─\nsee @a.txt "), "{:?}", text(&editor));
+        assert!(text(&editor).ends_with("sends\nsee @a.txt "), "{:?}", text(&editor));
         typed(&mut lisp, "x@y");
         assert!(editor.lock().picker.is_none(), "not at a word's start: just @");
         lisp.dispatch_key("ESC", "");
@@ -3158,7 +3159,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         lisp.dispatch_key("RET", "");
         assert!(pump(&mut lisp, &|s| said(s, "a.txt:1:1: error: boom")));
         let t = editor.lock().agent.as_ref().unwrap().transcript();
-        assert!(t.contains("› Fix these problems.  [1 problem in a.txt]"), "{t}");
+        assert!(t.contains(" Fix these problems.  [1 problem in a.txt]"), "{t}");
 
         // A command runs in a vmac terminal the agent waits on and reads.
         editor.lock().agent_prompt("run echo $GREETING; echo second; exit 3");
@@ -3381,7 +3382,7 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("reopened the session"))));
         let t = editor.lock().agent.as_ref().unwrap().transcript();
         assert!(t.contains("— Reopening “Second session”"), "{t}");
-        assert!(t.contains("› earlier question s-new\n\n▸ ✓ Read old.txt\n"), "the history, replayed: {t}");
+        assert!(t.contains(" earlier question s-new\n\n▸ ✓ Read old.txt\n"), "the history, replayed: {t}");
         assert!(t.contains("earlier answer"), "{t}");
         editor.lock().agent_prompt("and now?");
         assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("You said: and now?"))), "carries on");
@@ -3570,7 +3571,7 @@ for line in sys.stdin:
         assert!(editor.lock().review_comments.is_empty());
         assert!(pump(&mut lisp, &|s| s.agent.as_ref().is_some_and(|a| a.transcript().contains("You said: Please revise"))));
         let t = editor.lock().agent.as_ref().unwrap().transcript();
-        assert!(t.contains("› Revise by my 3 review comments"), "{t}");
+        assert!(t.contains(" Revise by my 3 review comments"), "{t}");
         assert!(t.contains("- `b.txt:2`: keep it lowercase"), "{t}");
         assert!(t.contains("> `TWO`"), "with the code: {t}");
         assert!(t.contains("- `b.txt:4` (the old version): bring four back"), "{t}");

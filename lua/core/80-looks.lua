@@ -105,7 +105,7 @@ function core.default_face_specs()
     { "md-list", color = "accent", bold = true },
     { "md-rule", color = "dim" },
     -- The agent buffer
-    { "agent-user", bold = true, color = "accent" },
+    { "agent-user", color = "strong" },
     { "agent-heading", bold = true },
     { "agent-ask", bold = true, color = "yellow" },
     { "agent-thought", italic = true, color = "dim" },

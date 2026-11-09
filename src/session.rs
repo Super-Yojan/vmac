@@ -306,6 +306,8 @@ impl Session {
         // your comments on them, per window.
         let mut review_marks: std::collections::HashMap<WindowId, Vec<(usize, bool)>> = Default::default();
         let mut comment_marks: std::collections::HashMap<WindowId, Vec<usize>> = Default::default();
+        let mut band_marks: std::collections::HashMap<WindowId, std::collections::HashMap<usize, (usize, usize, String)>> =
+            Default::default();
         for (id, _) in &rects {
             let Some(buffer) = st.window_by_id(*id).map(|w| w.buffer) else { continue };
             let marks = st.review_marks(buffer);
@@ -315,6 +317,10 @@ impl Session {
             let lines = st.comment_lines(buffer);
             if !lines.is_empty() {
                 comment_marks.insert(*id, lines);
+            }
+            let bands = st.line_bands(buffer);
+            if !bands.is_empty() {
+                band_marks.insert(*id, bands.into_iter().map(|(line, from, to, kind)| (line, (from, to, kind))).collect());
             }
         }
 
@@ -434,6 +440,20 @@ impl Session {
                 } else {
                     let marks = review_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
                     let comments = comment_marks.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                    let bands = band_marks.get(id);
+                    // A line's box, joined with the same box on the lines around it.
+                    let band_of = |i: usize| {
+                        let bands = bands?;
+                        let b = bands.get(&i)?;
+                        let same = |j: usize| bands.get(&j) == Some(b);
+                        Some(crate::frame::Band {
+                            from: b.0,
+                            to: b.1,
+                            kind: b.2.clone(),
+                            first: i == 0 || !same(i - 1),
+                            last: !same(i + 1),
+                        })
+                    };
                     let mut y = r.y * area;
                     let lines = (top..last)
                         .map(|i| {
@@ -487,6 +507,7 @@ impl Session {
                                     && spans
                                         .get(i.wrapping_sub(lo))
                                         .is_some_and(|l| l.iter().any(|sp| sp.capture == "markup.raw.block")),
+                                band: band_of(i),
                                 // 0, 1, 2... is left for the window to know.
                                 cols: if cols.len() == line.chars().count() + 1 && cols.iter().enumerate().all(|(i, c)| i == *c) {
                                     Vec::new()
@@ -798,6 +819,28 @@ mod tests {
             Content::Text(lines) => lines,
             other => panic!("not text: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_agent_prompt_is_drawn_in_one_box() {
+        let mut s = session_with("");
+        s.editor.lock().agent_show();
+        let frame = s.frame(VIEW);
+        let lines = frame
+            .windows
+            .iter()
+            .find_map(|w| match &w.content {
+                Content::Text(lines) if lines.iter().any(|l| l.text.contains("SPC a s")) => Some(lines),
+                _ => None,
+            })
+            .expect("a window on *agent*");
+        let boxed: Vec<_> = lines.iter().filter_map(|l| Some((l.text.as_str(), l.band.clone()?))).collect();
+        let [(hint, top), (typed, bottom)] = &boxed[..] else { panic!("{boxed:?}") };
+        assert!(hint.starts_with("Ask, or @"), "{hint}");
+        assert_eq!(*typed, "");
+        assert_eq!((top.kind.as_str(), top.first, top.last), ("input", true, false));
+        assert_eq!((bottom.kind.as_str(), bottom.first, bottom.last), ("input", false, true));
+        assert!(lines.iter().filter(|l| l.band.is_none()).any(|l| l.text.contains("SPC a s")), "the keys to start with");
     }
 
     #[test]
