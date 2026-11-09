@@ -401,6 +401,7 @@ function G.item() return G.items[V.line_number()] end
 local function changed()
   V.git_forget()
   if G.status_root and V.buffer_name() == G.status_buffer then G.refresh(true) end
+  if V.sidebar_shown() and core.tree and core.tree.render then core.tree.render() end
 end
 G.changed = changed
 

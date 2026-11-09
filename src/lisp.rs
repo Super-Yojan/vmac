@@ -29,6 +29,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("agents.lua", include_str!("../lua/core/agents.lua")),
     ("git.lua", include_str!("../lua/core/git.lua")),
     ("github.lua", include_str!("../lua/core/github.lua")),
+    ("notes.lua", include_str!("../lua/core/notes.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
     ("sessions.lua", include_str!("../lua/core/sessions.lua")),
@@ -3124,6 +3125,155 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         assert!(editor.lock().sidebar().is_none());
         assert_eq!(editor.lock().buffer().name(), "main.rs");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tree_marks_what_git_says_changed() {
+        let (mut lisp, editor, root) = tree_project("git");
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(root.join("src/main.rs"), "fn main() { changed() }\n").unwrap();
+        std::fs::write(root.join("NOTES.md"), "new\n").unwrap();
+        typed(&mut lisp, " op");
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            tree_text(&editor),
+            format!("{name}\n▾ src/  •\n  ▸ util/\n    main.rs  M\n  .gitignore\n  NOTES.md  ?\n  README.md"),
+            "changed files get git's letter, their folders a dot"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A notes folder with one note open: (lisp, editor, notes folder).
+    fn notes_project(tag: &str, note: &str) -> (Lisp, Editor, PathBuf) {
+        let root = std::env::temp_dir().join(format!("vmac-notes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.md"), note).unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        lisp.eval(&format!("vmac.set_notes_dir({:?})", root.display().to_string())).unwrap();
+        editor.lock().open_file(&root.join("note.md")).unwrap();
+        (lisp, editor, root)
+    }
+
+    #[test]
+    fn notes_cycle_todos_and_tick_boxes() {
+        let (mut lisp, editor, root) = notes_project("todo", "# Plan\n- milk\n- [ ] eggs\n");
+        typed(&mut lisp, " mt");
+        assert_eq!(text(&editor), "# TODO Plan\n- milk\n- [ ] eggs\n");
+        typed(&mut lisp, " mt");
+        assert_eq!(text(&editor), "# DONE Plan\n- milk\n- [ ] eggs\n");
+        typed(&mut lisp, " mt");
+        assert_eq!(text(&editor), "# Plan\n- milk\n- [ ] eggs\n");
+        typed(&mut lisp, "j mtj mt");
+        assert_eq!(text(&editor), "# Plan\n- [ ] milk\n- [x] eggs\n");
+        typed(&mut lisp, "u");
+        assert_eq!(text(&editor), "# Plan\n- [ ] milk\n- [ ] eggs\n", "one undo per cycle");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_move_and_promote_subtrees() {
+        let (mut lisp, editor, root) =
+            notes_project("move", "# A\na text\n## A1\n\n# B\nb text\n\n```\n# not a heading\n```\n");
+        typed(&mut lisp, "4j");
+        lisp.dispatch_key("M-k", "");
+        assert_eq!(
+            text(&editor),
+            "# B\nb text\n\n```\n# not a heading\n```\n\n# A\na text\n## A1\n",
+            "B moves above A with everything under it; blank lines stay between"
+        );
+        assert_eq!(editor.lock().buffer().line(), 0, "the cursor goes with B");
+        lisp.dispatch_key("M-j", "");
+        assert_eq!(text(&editor), "# A\na text\n## A1\n\n# B\nb text\n\n```\n# not a heading\n```\n");
+        typed(&mut lisp, "gg");
+        lisp.dispatch_key("M-l", "");
+        assert_eq!(&text(&editor)[..18], "## A\na text\n### A1", "demoting takes the subtree along");
+        lisp.dispatch_key("M-h", "");
+        lisp.dispatch_key("M-h", "");
+        assert_eq!(editor.lock().message, "Headings go from # to ######");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_move_list_items_with_their_children() {
+        let (mut lisp, editor, root) = notes_project("items", "- one\n  - child\n- two\n");
+        typed(&mut lisp, "2j");
+        lisp.dispatch_key("M-k", "");
+        assert_eq!(text(&editor), "- two\n- one\n  - child\n");
+        lisp.dispatch_key("M-l", "");
+        assert_eq!(text(&editor), "  - two\n- one\n  - child\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_capture_to_the_inbox_and_show_on_the_agenda() {
+        let (mut lisp, editor, root) = notes_project("agenda", "# TODO write report\n- [x] done thing\nmeet <2099-01-02 Fri>\n");
+        typed(&mut lisp, " ncbuy milk\n");
+        let inbox = std::fs::read_to_string(root.join("inbox.md")).unwrap();
+        assert!(inbox.starts_with("# Inbox\n\n- [ ] buy milk ["), "{inbox}");
+        assert_eq!(editor.lock().buffer().name(), "note.md", "capturing doesn't leave the note");
+        typed(&mut lisp, " na");
+        let agenda = text(&editor);
+        assert!(agenda.contains("Upcoming\n  2099-01-02 Fri  meet  note.md"), "{agenda}");
+        assert!(agenda.contains("  TODO buy milk  inbox.md"), "{agenda}");
+        assert!(agenda.contains("  TODO write report  note.md"), "{agenda}");
+        assert!(!agenda.contains("done thing"), "{agenda}");
+        // t on the first TODO marks it done in its file.
+        typed(&mut lisp, "gg");
+        while !text(&editor).lines().nth(editor.lock().buffer().line()).unwrap().contains("buy milk") {
+            typed(&mut lisp, "j");
+        }
+        typed(&mut lisp, "t");
+        assert!(std::fs::read_to_string(root.join("inbox.md")).unwrap().contains("- [x] buy milk"));
+        assert!(!text(&editor).contains("buy milk"), "gone from the agenda");
+        typed(&mut lisp, "q");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_follow_links_and_open_daily_notes() {
+        let (mut lisp, editor, root) = notes_project("links", "see [[Other Note]] and [x](sub/x.md)\n");
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        std::fs::write(root.join("deep/other note.md"), "hello\n").unwrap();
+        typed(&mut lisp, "6l\n");
+        assert_eq!(editor.lock().buffer().name(), "other note.md", "found anywhere, any case");
+        typed(&mut lisp, " bb");
+        lisp.dispatch_key("ESC", "");
+        lisp.dispatch_key("ESC", "");
+        editor.lock().open_file(&root.join("note.md")).unwrap();
+        typed(&mut lisp, "$\n");
+        assert_eq!(editor.lock().buffer().name(), "x.md");
+        typed(&mut lisp, " nd");
+        let day = lisp.eval(r#"os.date("%Y-%m-%d")"#).unwrap();
+        assert!(root.join(format!("daily/{day}.md")).exists());
+        assert!(text(&editor).starts_with("# "), "a new day starts with its date");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_parse_dates() {
+        let (mut lisp, _editor) = lisp_with("");
+        let d = |lisp: &mut Lisp, s: &str| lisp.eval(&format!("local t = core.notes.parse_date({s:?}); return t and os.date('%Y-%m-%d', t) or 'nil'")).unwrap();
+        let today = lisp.eval("os.date('%Y-%m-%d')").unwrap();
+        assert_eq!(d(&mut lisp, ""), today);
+        assert_eq!(d(&mut lisp, "+0"), today);
+        assert_eq!(d(&mut lisp, "2026-12-24"), "2026-12-24");
+        assert_eq!(d(&mut lisp, "+1w"), lisp.eval("os.date('%Y-%m-%d', os.time() + 7*86400)").unwrap());
+        assert_eq!(d(&mut lisp, "nonsense"), "nil");
     }
 
     #[test]

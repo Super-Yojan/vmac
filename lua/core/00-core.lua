@@ -172,14 +172,16 @@ end
 
 -- Buffers with keymaps of their own, by name: { name, normal state's
 -- keymap, insert state's, visual state's } (the last two optional), e.g.
--- { "*git-status*", "git_status" }.
+-- { "*git-status*", "git_status" }. The name can be a function instead,
+-- asked of the current buffer (Markdown files get notes' keys that way).
 core.buffer_keymaps = core.buffer_keymaps or {}
 
 function core.buffer_keymap(mode)
   local name = V.buffer_name()
   local slot = ({ normal = 2, insert = 3, visual = 4 })[mode or "normal"]
   for _, e in ipairs(core.buffer_keymaps) do
-    if e[1] == name and e[slot] then return core.keymaps[e[slot]] end
+    local match = type(e[1]) == "function" and e[1]() or e[1] == name
+    if match and e[slot] then return core.keymaps[e[slot]] end
   end
 end
 

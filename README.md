@@ -87,6 +87,21 @@ name order. Its state and functions are in the global `core` table.
   `l`/`h` open/close a folder (`h` on a closed one goes to its parent), `a` adds
   a file (end with `/` for a folder), `r` renames, `d` deletes (asks first),
   `R` refreshes, `q` closes. `C-w h`/`C-w l` move between it and your files.
+  Files git sees as changed show git's letter beside them (`M` modified,
+  `A` added, `?` untracked, `D` deleted, `U` conflicted) in color, and folders
+  holding changes a `•`.
+- **Notes (org-mode style, in Markdown):** kept in `~/notes`
+  (`vmac.set_notes_dir(...)` to move them). `SPC n c` captures a TODO into
+  `inbox.md` from anywhere (`SPC n C` a plain note), `SPC n d` opens today's
+  daily note (`SPC n y` yesterday's), `SPC n f` finds a note, `SPC n a` opens
+  the agenda: overdue, today's and upcoming dated items and open TODOs across
+  every note (`RET` visits, `t` marks done, `r` refreshes, `q` leaves). In a
+  Markdown file: `SPC m t` cycles a heading `TODO` -> `DONE` -> plain or ticks
+  a `- [ ]` box, `M-h`/`M-l` promote/demote a heading with its subtree (or a
+  list item with its children), `M-k`/`M-j` move it past its sibling,
+  `SPC m d` inserts a date (`<2026-11-09 Mon>`; type `+3`, `fri`, `12-24`),
+  `SPC m l` inserts a `[[link]]`, and `RET` follows `[[links]]` and
+  `[text](file.md)` links.
 - **Find file:** `SPC f f` or `SPC SPC` opens a telescope-style picker over the
   project (the git repo of the current file; .gitignore respected): type to
   filter fuzzily, `C-n`/`C-p`, `C-j`/`C-k` or arrows to move, `RET` to open.
