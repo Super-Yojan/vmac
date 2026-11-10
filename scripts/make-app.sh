@@ -7,6 +7,9 @@
 #   scripts/make-app.sh                  # installs /Applications/vmac.app
 #   scripts/make-app.sh ~/Applications   # or another folder
 #
+# VMAC_BIN=path uses that vmac instead of building one (the release
+# workflow passes a universal binary).
+#
 # Needs rsvg-convert and ImageMagick (brew install librsvg imagemagick).
 set -eu
 
@@ -19,14 +22,18 @@ for tool in rsvg-convert magick iconutil; do
   command -v "$tool" >/dev/null 2>&1 || { say "needs $tool"; exit 1; }
 done
 
-say "building vmac $version (release)"
-cargo build --release --locked --manifest-path "$root/Cargo.toml"
+bin=${VMAC_BIN:-}
+if [ -z "$bin" ]; then
+  say "building vmac $version (release)"
+  cargo build --release --locked --manifest-path "$root/Cargo.toml"
+  bin="$root/target/release/vmac"
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 app="$work/vmac.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$root/target/release/vmac" "$app/Contents/MacOS/vmac-bin"
+cp "$bin" "$app/Contents/MacOS/vmac-bin"
 
 # The icon: the logo on Apple's grid (824 of 1024 pixels, centered), at
 # every size an .icns holds.

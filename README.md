@@ -19,7 +19,7 @@ doesn't exist; move it there when you like.
 ## Install
 
 vmac builds from source with Rust's cargo (get it from [rustup.rs](https://rustup.rs)).
-It's tested on macOS; Linux and Windows builds come with each release.
+It's tested on macOS; each release also comes built, for macOS, Linux and Windows.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh
@@ -35,9 +35,14 @@ Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.lua`,
 `plugins/`). From a checkout, `cargo run -- FILE` runs it with live reload
 of `lua/core/`.
 
-**On Linux and Windows,** each [release](https://github.com/Super-Yojan/vmac/releases)
-has vmac with its window, built:
+**Built,** each [release](https://github.com/Super-Yojan/vmac/releases)
+has vmac with its window:
 
+- macOS 13 or later (Apple silicon and Intel): `vmac-macos-universal.zip`,
+  with `vmac.app`. Move it to `/Applications`. It isn't notarized, so the
+  first time, clear the quarantine macOS puts on downloads:
+  `xattr -dr com.apple.quarantine /Applications/vmac.app`.
+  For the `vmac` command too, link it: `ln -s /Applications/vmac.app/Contents/MacOS/vmac-bin ~/.local/bin/vmac`.
 - Linux (x86_64 and arm64, glibc 2.35 or later): `vmac-<arch>-unknown-linux-gnu.tar.gz`.
   Unpack it into `~/.local` (or `/usr/local`) for the `vmac` command and a
   menu entry: `tar -xzf vmac-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 -C ~/.local`.
@@ -46,7 +51,7 @@ has vmac with its window, built:
   `vmac.exe`. Put it on your `PATH`, or open it from Explorer. Windows is
   new: commands that run shell scripts expect a Unix shell (Git Bash, WSL).
 
-**As a Mac app.** From a checkout, `scripts/make-app.sh` builds `vmac.app`
+**As a Mac app, from source.** From a checkout, `scripts/make-app.sh` builds `vmac.app`
 into `/Applications` (or the folder you name), with its icon, so it opens
 from Spotlight, Launchpad and the Dock. Opened that way it starts on the
 dashboard, in your home folder, with your login shell's `PATH` (so it finds
@@ -206,13 +211,13 @@ through it), text re-wrapped on resize, and answers to programs' queries.
 
 Open as many terminals as you like and move between them like tmux windows:
 
-| Keys | |
-|---|---|
-| `SPC o T`, `s-t` | a new terminal (in this window) |
-| `SPC o n` / `SPC o N`, `s-]` / `s-[`, `gt` / `gT` | next / previous terminal |
-| `SPC o l` | pick a terminal from a list |
-| `SPC o k` | end this terminal |
-| `:terminal-rename NAME` | name it |
+| Keys                                              |                                 |
+|---------------------------------------------------|---------------------------------|
+| `SPC o T`, `s-t`                                  | a new terminal (in this window) |
+| `SPC o n` / `SPC o N`, `s-]` / `s-[`, `gt` / `gT` | next / previous terminal        |
+| `SPC o l`                                         | pick a terminal from a list     |
+| `SPC o k`                                         | end this terminal               |
+| `:terminal-rename NAME`                           | name it                         |
 
 `SPC o t` brings back the terminal you used last. A shell's buffer closes
 when it exits, and another terminal takes its place (the window closes when

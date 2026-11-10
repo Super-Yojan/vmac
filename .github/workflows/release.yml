@@ -3,7 +3,8 @@
 # - vmac with its window for Linux and Windows:
 #   vmac-<target>.tar.gz (Linux: bin/, the .desktop file and icon in share/,
 #   to unpack into ~/.local or /usr/local) and vmac-<target>.zip (Windows).
-#   macOS builds its app from source (scripts/make-app.sh).
+# - vmac.app for macOS, universal (Apple silicon and Intel), ad-hoc signed:
+#   vmac-macos-universal.zip.
 # - The server (vmac without the window) for the systems `vmac connect`
 #   installs it on: vmac-server-<target>, which `vmac connect` downloads.
 #
@@ -164,3 +165,40 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           files: vmac-${{ matrix.target }}.zip
+
+  # vmac.app, one binary for Apple silicon and Intel. Signed ad hoc, not
+  # notarized: macOS quarantines it when downloaded by a browser.
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # This workflow's make-app.sh, so redoing an older tag's build makes
+      # the app the same way.
+      - run: |
+          git fetch --depth 1 origin ${{ github.sha }}
+          git show FETCH_HEAD:scripts/make-app.sh > scripts/make-app.sh
+      - run: brew install librsvg imagemagick
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+      - run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create -output vmac-universal \
+            target/aarch64-apple-darwin/release/vmac target/x86_64-apple-darwin/release/vmac
+      - run: VMAC_BIN="$PWD/vmac-universal" sh scripts/make-app.sh "$PWD/dist"
+      - run: ditto -c -k --keepParent dist/vmac.app vmac-macos-universal.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmac-macos-universal
+          path: vmac-macos-universal.zip
+      - uses: softprops/action-gh-release@v2
+        if: env.TAG != ''
+        with:
+          tag_name: ${{ env.TAG }}
+          files: vmac-macos-universal.zip
