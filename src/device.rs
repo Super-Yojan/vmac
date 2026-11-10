@@ -16,7 +16,10 @@
 //! its console (a TCP socket on its port, 5554 for emulator-5554), in a
 //! couple of milliseconds, the touch going down, moving and coming up as
 //! the mouse does; keys and buttons through its gRPC service (the console's
-//! `event send` is taken and dropped), a unary call sent with curl.
+//! `event send` is taken and dropped), a unary call sent with curl. A
+//! simulator takes them through idb_companion's hid call (on its socket),
+//! kept open in a curl streaming each event as it happens, where the idb
+//! command takes a quarter of a second to start.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -483,7 +486,191 @@ fn grpc_key(serial: &str, code: u32) -> bool {
     headers.lines().any(|l| l.trim().eq_ignore_ascii_case("grpc-status: 0"))
 }
 
-/// A touch on an emulator's screen, in its pixels.
+// ---- A simulator's HID stream
+
+/// idb_companion's socket for a simulator (the idb command starts it).
+fn companion_socket(udid: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/tmp/idb/{udid}_companion.sock"))
+}
+
+static HID_STREAMS: OnceLock<Mutex<HashMap<String, (Child, ChildStdin)>>> = OnceLock::new();
+
+/// Sends HID events (idb.proto's HIDEvent, framed) to a simulator, over
+/// one call to the companion's hid kept open: a curl streaming them as
+/// they're written. The companion acts on an event once the next one
+/// arrives, so each is followed by a delay of nothing, which pushes it
+/// through (else a tap's touch would go down only as it comes up, too
+/// short to count). False when the companion isn't running.
+fn hid_send(udid: &str, events: &[Vec<u8>]) -> bool {
+    let socket = companion_socket(udid);
+    if !socket.exists() {
+        return false;
+    }
+    let Ok(mut streams) = HID_STREAMS.get_or_init(Default::default).lock() else { return false };
+    for _ in 0..2 {
+        let alive = streams.get_mut(udid).is_some_and(|(child, _)| matches!(child.try_wait(), Ok(None)));
+        if !alive {
+            let started = Command::new("curl")
+                .args(["-s", "-N", "--http2-prior-knowledge", "--unix-socket"])
+                .arg(&socket)
+                .args(["-X", "POST", "-T", "-", "-H", "content-type: application/grpc", "-H", "te: trailers"])
+                .args(["-o", "/dev/null", "http://localhost/idb.CompanionService/hid"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let Ok(mut child) = started else { return false };
+            let Some(stdin) = child.stdin.take() else { return false };
+            streams.insert(udid.to_string(), (child, stdin));
+        }
+        let Some((_, stdin)) = streams.get_mut(udid) else { return false };
+        let push = hid_delay(0.);
+        let written = events.iter().try_for_each(|e| stdin.write_all(e).and_then(|_| stdin.write_all(&push))).and_then(|_| stdin.flush());
+        if written.is_ok() {
+            return true;
+        }
+        streams.remove(udid);
+    }
+    false
+}
+
+/// Protobuf: a number as a varint, seven bits a byte.
+fn pb_varint(out: &mut Vec<u8>, mut n: u64) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        out.push(if n == 0 { byte } else { byte | 0x80 });
+        if n == 0 {
+            return;
+        }
+    }
+}
+
+/// Protobuf: a length-delimited field.
+fn pb_bytes(field: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![field << 3 | 2];
+    pb_varint(&mut out, body.len() as u64);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Protobuf: a varint field.
+fn pb_number(field: u8, n: u64) -> Vec<u8> {
+    let mut out = vec![field << 3];
+    pb_varint(&mut out, n);
+    out
+}
+
+/// A HIDEvent pressing (or releasing) an action, framed for gRPC.
+fn hid_press(action: Vec<u8>, up: bool) -> Vec<u8> {
+    let mut press = pb_bytes(1, &action);
+    press.extend([0x10, up as u8]);
+    let event = pb_bytes(1, &press);
+    let mut framed = vec![0];
+    framed.extend((event.len() as u32).to_be_bytes());
+    framed.extend(event);
+    framed
+}
+
+/// A HIDEvent waiting `secs`, framed.
+fn hid_delay(secs: f64) -> Vec<u8> {
+    let mut body = vec![0x09];
+    body.extend(secs.to_le_bytes());
+    let event = pb_bytes(3, &body);
+    let mut framed = vec![0];
+    framed.extend((event.len() as u32).to_be_bytes());
+    framed.extend(event);
+    framed
+}
+
+/// A finger at a point, in points: down, or moved there while down, or up.
+fn hid_touch((x, y): (f32, f32), up: bool) -> Vec<u8> {
+    let mut point = vec![0x09];
+    point.extend((x as f64).to_le_bytes());
+    point.push(0x11);
+    point.extend((y as f64).to_le_bytes());
+    hid_press(pb_bytes(1, &pb_bytes(1, &point)), up)
+}
+
+/// A key (a USB HID usage) going down or up.
+fn hid_key(code: u8, up: bool) -> Vec<u8> {
+    hid_press(pb_bytes(3, &pb_number(1, code as u64)), up)
+}
+
+/// A button (idb's HIDButtonType) going down or up.
+fn hid_button(button: u8, up: bool) -> Vec<u8> {
+    hid_press(pb_bytes(2, &pb_number(1, button as u64)), up)
+}
+
+/// The keys that type a character on a US keyboard: its usage, and whether
+/// shift is held.
+fn hid_char(c: char) -> Option<(u8, bool)> {
+    const SHIFTED: &str = ")!@#$%^&*(";
+    Some(match c {
+        'a'..='z' => (4 + (c as u8 - b'a'), false),
+        'A'..='Z' => (4 + (c as u8 - b'A'), true),
+        '1'..='9' => (30 + (c as u8 - b'1'), false),
+        '0' => (39, false),
+        ' ' => (44, false),
+        '\n' => (40, false),
+        '\t' => (43, false),
+        _ => {
+            if let Some(i) = SHIFTED.find(c) {
+                return Some((if i == 0 { 39 } else { 29 + i as u8 }, true));
+            }
+            let (plain, shifted) = (r"-=[]\;'`,./", r#"_+{}|:"~<>?"#);
+            let i = plain.find(c).map(|i| (i, false)).or_else(|| shifted.find(c).map(|i| (i, true)))?;
+            ([45, 46, 47, 48, 49, 51, 52, 53, 54, 55, 56][i.0], i.1)
+        }
+    })
+}
+
+/// The events typing some text: None if a character has no key.
+fn hid_text(text: &str) -> Option<Vec<Vec<u8>>> {
+    const SHIFT: u8 = 225;
+    let mut events = Vec::new();
+    for c in text.chars() {
+        let (code, shift) = hid_char(c)?;
+        if shift {
+            events.push(hid_key(SHIFT, false));
+        }
+        events.extend([hid_key(code, false), hid_key(code, true)]);
+        if shift {
+            events.push(hid_key(SHIFT, true));
+        }
+    }
+    Some(events)
+}
+
+/// The usage for a key typed by name (RET, DEL...).
+fn hid_named_key(key: &str) -> Option<u8> {
+    Some(match key {
+        "RET" => 40,
+        "DEL" => 42,
+        "TAB" => 43,
+        "<right>" => 79,
+        "<left>" => 80,
+        "<down>" => 81,
+        "<up>" => 82,
+        "<delete>" => 76,
+        _ => return None,
+    })
+}
+
+/// idb's HIDButtonType for a button.
+fn hid_button_type(name: &str) -> Option<u8> {
+    Some(match name {
+        "home" => 1,
+        "power" => 2,
+        "volume-up" => 6,
+        "volume-down" => 7,
+        _ => return None,
+    })
+}
+
+// ---- Live touches: an emulator's console, a simulator's HID stream
+
+/// A touch on the screen, in the device's input units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Touch {
     Down,
@@ -496,68 +683,81 @@ fn touch_command(touch: Touch, (x, y): (f32, f32)) -> String {
     format!("event mouse {} {} 0 {pressed}", x as i32, y as i32)
 }
 
-/// Touches an emulator's screen through its console, as the mouse moves:
-/// false for a device without one (then a gesture goes on mouse up).
+/// Touches the screen as the mouse moves: an emulator through its
+/// console, a simulator through its HID stream (a move is the finger down
+/// at the new point). False for a device without either (then a gesture
+/// goes on mouse up).
 pub fn touch(device: &Device, touch: Touch, at: (f32, f32)) -> bool {
     match device {
         Device::Android(serial) => console_send(serial, &[touch_command(touch, at)]),
-        Device::Ios(_) => false,
+        Device::Ios(udid) => hid_send(udid, &[hid_touch(at, touch == Touch::Up)]),
     }
 }
 
-/// A swipe for the wheel on an emulator, through its console: down in the
-/// middle, along `reach` in a few steps over a tenth of a second, up.
-fn console_wheel(serial: &str, (w, h): (u32, u32), reach: f32) -> bool {
-    if console_port(serial).is_none() {
+/// A swipe made of live touches, on a thread: down, along to `to` in a
+/// few steps over `ms`, up. False when the device takes no live touches.
+fn live_swipe(device: &Device, from: (f32, f32), to: (f32, f32), ms: u64) -> bool {
+    if !touch(device, Touch::Down, from) {
         return false;
     }
-    let (x, y) = (w as f32 / 2., h as f32 / 2.);
-    let serial = serial.to_string();
+    let device = device.clone();
     std::thread::spawn(move || {
-        const STEPS: usize = 6;
-        console_send(&serial, &[touch_command(Touch::Down, (x, y))]);
+        const STEPS: u64 = 6;
         for i in 1..=STEPS {
-            std::thread::sleep(std::time::Duration::from_millis(16));
-            console_send(&serial, &[touch_command(Touch::Move, (x, y + reach * i as f32 / STEPS as f32))]);
+            std::thread::sleep(std::time::Duration::from_millis(ms / STEPS));
+            let f = i as f32 / STEPS as f32;
+            touch(&device, Touch::Move, (from.0 + (to.0 - from.0) * f, from.1 + (to.1 - from.1) * f));
         }
-        console_send(&serial, &[touch_command(Touch::Up, (x, y + reach))]);
+        touch(&device, Touch::Up, to);
     });
     true
 }
 
-/// Scrolls by `reach` (input units, down positive): through the console on
-/// an emulator, else as a swipe.
-pub fn wheel(target: &str, device: &Device, size: (u32, u32), reach: f32) -> bool {
-    match device {
-        Device::Android(serial) if console_wheel(serial, size, reach) => true,
-        _ => shell_send(target, &wheel_command(device, size, reach)),
-    }
+/// Scrolls by `reach` (input units, down positive): a live swipe from the
+/// middle, else a swipe command.
+pub fn wheel(target: &str, device: &Device, (w, h): (u32, u32), reach: f32) -> bool {
+    let middle = (w as f32 / 2., h as f32 / 2.);
+    live_swipe(device, middle, (middle.0, middle.1 + reach), 100)
+        || shell_send(target, &wheel_command(device, (w, h), reach))
 }
 
-/// Types a key into the device: on an emulator, a key through gRPC and
-/// text through the console; else through its shell.
+/// Types a key into the device. An emulator: a key through gRPC, text
+/// through the console. A simulator: through its HID stream. Else through
+/// the shell.
 pub fn key(target: &str, key: &str, text: &str) -> Result<(), String> {
-    if let Some(Device::Android(serial)) = locate(target) {
-        let fast = match evdev_code(key) {
+    let fast = match locate(target) {
+        Some(Device::Android(serial)) => match evdev_code(key) {
             Some(code) => grpc_key(&serial, code),
             None => console_text_command(text).is_some_and(|c| console_send(&serial, &[c])),
-        };
-        if fast {
-            return Ok(());
+        },
+        Some(Device::Ios(udid)) => {
+            let events = match hid_named_key(key) {
+                Some(code) => Some(vec![hid_key(code, false), hid_key(code, true)]),
+                None if text.is_empty() => None,
+                None => hid_text(text),
+            };
+            events.is_some_and(|e| hid_send(&udid, &e))
         }
-    }
-    send(target, |d| key_command(d, key, text))
+        None => false,
+    };
+    if fast { Ok(()) } else { send(target, |d| key_command(d, key, text)) }
 }
 
-/// Presses a button: on an emulator through gRPC, else the device's shell.
+/// Presses a button. An emulator: through gRPC. A simulator: through its
+/// HID stream (back is a swipe in from the left edge). Else the shell.
 pub fn button(target: &str, name: &str) -> Result<(), String> {
-    if let Some(Device::Android(serial)) = locate(target)
-        && let Some(code) = evdev_code(name)
-        && grpc_key(&serial, code)
-    {
-        return Ok(());
-    }
-    send(target, |d| button_command(d, name))
+    let fast = match locate(target) {
+        Some(Device::Android(serial)) => evdev_code(name).is_some_and(|code| grpc_key(&serial, code)),
+        Some(Device::Ios(udid)) if name == "back" => ios_screen(&udid).is_some_and(|(w, h)| {
+            let y = h as f32 / 2.;
+            live_swipe(&Device::Ios(udid.clone()), (1., y), (w as f32 * 0.75, y), 250)
+        }),
+        Some(Device::Ios(udid)) => {
+            hid_button_type(name).is_some_and(|b| hid_send(&udid, &[hid_button(b, false), hid_button(b, true)]))
+        }
+        None => false,
+    };
+    if fast { Ok(()) } else { send(target, |d| button_command(d, name)) }
 }
 
 /// Sends a key or a button, saying why not when it can't.
@@ -1029,6 +1229,71 @@ mod view {
 mod tests {
     use super::*;
 
+    /// Against a booted simulator: VMAC_SIMULATOR=UDID. Leaves screenshots
+    /// of each step in VMAC_SHOTS.
+    #[test]
+    #[ignore]
+    fn a_simulator_takes_touches_keys_and_buttons_fast() {
+        let udid = std::env::var("VMAC_SIMULATOR").unwrap();
+        let shots = std::env::var("VMAC_SHOTS").unwrap();
+        let target = format!("ios:{udid}");
+        let device = locate(&target).unwrap();
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(1500));
+        let shot = |name: &str| {
+            Command::new("xcrun").args(["simctl", "io", &udid, "screenshot", &format!("{shots}/{name}.png")]).output().unwrap();
+        };
+        assert!(ios_screen(&udid).is_some(), "booted, the companion running");
+        Command::new("xcrun").args(["simctl", "launch", &udid, "com.apple.Preferences"]).output().unwrap();
+        settle();
+        let start = std::time::Instant::now();
+        assert_eq!(button(&target, "home"), Ok(()));
+        eprintln!("home: {:?}", start.elapsed());
+        settle();
+        shot("1-home");
+        // Settings' icon on the home screen, then a 12-step drag.
+        let start = std::time::Instant::now();
+        assert!(touch(&device, Touch::Down, (339., 420.)));
+        eprintln!("a touch down: {:?}", start.elapsed());
+        // A click's length: a touch as short as nothing doesn't count.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(touch(&device, Touch::Up, (339., 420.)));
+        settle();
+        shot("2-tapped-settings");
+        // General, then back: a swipe in from the left edge.
+        assert!(touch(&device, Touch::Down, (94., 318.)));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(touch(&device, Touch::Up, (94., 318.)));
+        settle();
+        shot("2a-general");
+        assert_eq!(button(&target, "back"), Ok(()));
+        settle();
+        shot("2b-back");
+        assert_eq!(button(&target, "home"), Ok(()));
+        settle();
+        // Down from the middle: Search, as the mouse moves (a frame apart).
+        let mut sending = std::time::Duration::ZERO;
+        let mut timed = |f: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            assert!(f());
+            sending += start.elapsed();
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        };
+        timed(&|| touch(&device, Touch::Down, (201., 300.)));
+        for i in 1..=10 {
+            timed(&|| touch(&device, Touch::Move, (201., 300. + 25. * i as f32)));
+        }
+        timed(&|| touch(&device, Touch::Up, (201., 550.)));
+        eprintln!("a 12-step drag, sending: {sending:?}");
+        settle();
+        let start = std::time::Instant::now();
+        assert_eq!(key(&target, "x", "Hi there!"), Ok(()));
+        assert_eq!(key(&target, "DEL", ""), Ok(()));
+        eprintln!("text and a key: {:?}", start.elapsed());
+        settle();
+        shot("3-search-typed");
+        assert_eq!(button(&target, "home"), Ok(()));
+    }
+
     /// Against a running emulator: VMAC_DEVICE=avd:NAME or emulator-NNNN.
     #[test]
     #[ignore]
@@ -1109,6 +1374,34 @@ mod tests {
         assert_eq!(touch_command(Touch::Down, (672.4, 1500.)), "event mouse 672 1500 0 1");
         assert_eq!(touch_command(Touch::Up, (10., 20.)), "event mouse 10 20 0 0");
         assert_eq!(console_text_command("a b'").as_deref(), Some("event text a b'"));
+        // HIDEvent { press { action { button { HOME } }, direction: UP } }, framed.
+        assert_eq!(hid_button(1, true), [0, 0, 0, 0, 10, 0x0a, 8, 0x0a, 4, 0x12, 2, 0x08, 1, 0x10, 1]);
+        // HIDEvent { press { action { touch { point { x: 1.0, y: 2.0 } } }, direction: DOWN } }.
+        let mut point = vec![0x09];
+        point.extend(1f64.to_le_bytes());
+        point.push(0x11);
+        point.extend(2f64.to_le_bytes());
+        let press = [pb_bytes(1, &pb_bytes(1, &pb_bytes(1, &point))), vec![0x10, 0]].concat();
+        let event = pb_bytes(1, &press);
+        assert_eq!(hid_touch((1., 2.), false), [vec![0], (event.len() as u32).to_be_bytes().to_vec(), event].concat());
+        // As idb's own client encodes a touch up at (339, 420).
+        let idb_up = "0a1a0a160a140a12090000000000307540110000000000407a401001";
+        let hex: String = hid_touch((339., 420.), true)[5..].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, idb_up);
+        assert_eq!(hid_delay(0.), [0, 0, 0, 0, 11, 0x1a, 9, 0x09, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Shift (225) down, as idb encodes it (but for the default
+        // direction, which idb leaves out): the code is a two-byte varint.
+        let hex: String = hid_key(225, false)[5..].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "0a090a051a0308e1011000");
+        assert_eq!(hid_char('a'), Some((4, false)));
+        assert_eq!(hid_char('Z'), Some((29, true)));
+        assert_eq!(hid_char('!'), Some((30, true)));
+        assert_eq!(hid_char(')'), Some((39, true)));
+        assert_eq!(hid_char('?'), Some((56, true)));
+        assert_eq!(hid_char('\''), Some((52, false)));
+        assert_eq!(hid_char('é'), None);
+        assert_eq!(hid_text("Hi").map(|e| e.len()), Some(6), "shift down, H down, up, shift up, i down, up");
+        assert_eq!(hid_text("né"), None, "not typable: through idb ui text");
         assert_eq!(console_text_command("é"), None, "not ASCII: through input");
         assert_eq!(evdev_code("home"), Some(102));
         assert_eq!(evdev_code("x"), None);

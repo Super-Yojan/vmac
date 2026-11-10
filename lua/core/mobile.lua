@@ -13,8 +13,8 @@
 -- The device's screen (*device*, beside the code; it opens by itself when
 -- an app runs): click to tap, drag to swipe, hold to long press, the wheel
 -- scrolls. In it, i types into the device (ESC stops), b goes back (on iOS,
--- a swipe in from the left edge), H home, P presses power; on Android, o
--- shows the recent apps and + and - change the volume. With the screen in
+-- a swipe in from the left edge), H home, P presses power, + and - change
+-- the volume; on Android, o shows the recent apps. With the screen in
 -- vmac, the emulator or simulator runs without a window of its own: set
 -- core.mobile.headless_emulator = false to keep it, or
 -- core.mobile.show_screen = false not to open *device* on a run. An iOS
