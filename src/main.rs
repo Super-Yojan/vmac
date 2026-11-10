@@ -35,6 +35,7 @@ mod pdf;
 #[cfg(feature = "gui")]
 mod shell;
 mod syntax;
+mod sys;
 mod terminal;
 #[cfg(feature = "gui")]
 mod themes;
@@ -90,6 +91,7 @@ fn main() {
         }
         Some("attach" | "a") => {
             let target = args.get(1).cloned();
+            sys::drop_own_console();
             let client = daemon::ensure_server(&socket)
                 .and_then(|()| daemon::Client::attach(&socket, target))
                 .unwrap_or_else(|e| fail(&e));
@@ -141,6 +143,7 @@ fn main() {
         _ => fail(&"this vmac is only the server (built without the window)"),
         #[cfg(feature = "gui")]
         file => {
+            sys::drop_own_console();
             let buffer = match file {
                 Some(path) => Buffer::from_file(path.into()).unwrap_or_else(|e| fail(&e)),
                 None => Buffer::new("*scratch*"),

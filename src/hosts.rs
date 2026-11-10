@@ -389,7 +389,7 @@ mod tests {
     use crate::lisp::Lisp;
     use crate::server::Server;
     use crate::session::Session;
-    use std::os::unix::net::UnixStream;
+    use crate::sys::UnixStream;
     use std::time::Duration;
 
     fn fresh() -> Session {

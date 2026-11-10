@@ -1,0 +1,166 @@
+# Builds a release for the tag pushed and attaches it to the tag's release:
+#
+# - vmac with its window for Linux and Windows:
+#   vmac-<target>.tar.gz (Linux: bin/, the .desktop file and icon in share/,
+#   to unpack into ~/.local or /usr/local) and vmac-<target>.zip (Windows).
+#   macOS builds its app from source (scripts/make-app.sh).
+# - The server (vmac without the window) for the systems `vmac connect`
+#   installs it on: vmac-server-<target>, which `vmac connect` downloads.
+#
+# Run by hand (Actions > release > Run workflow): with a tag, it builds that
+# tag and attaches everything to its release (to redo a release's build);
+# without one, it only builds, to check that every target still does.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach to (empty: just build)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # The tag being released, if any.
+  TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      # Each target on its own: one failing doesn't stop the others.
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Zig from PyPI, which cargo-zigbuild finds: zig's own download mirrors
+      # failed the 0.0.3 build. cargo-zigbuild 0.24 or later knows the linker
+      # flags recent Rust passes for arm64.
+      - run: pip install ziglang
+      - run: cargo install cargo-zigbuild --locked
+      - run: cargo zigbuild --release --locked --no-default-features --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/vmac vmac-server-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmac-server-${{ matrix.target }}
+          path: vmac-server-${{ matrix.target }}
+      - uses: softprops/action-gh-release@v2
+        if: env.TAG != ''
+        with:
+          tag_name: ${{ env.TAG }}
+          files: vmac-server-${{ matrix.target }}
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --no-default-features --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/vmac vmac-server-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmac-server-${{ matrix.target }}
+          path: vmac-server-${{ matrix.target }}
+      - uses: softprops/action-gh-release@v2
+        if: env.TAG != ''
+        with:
+          tag_name: ${{ env.TAG }}
+          files: vmac-server-${{ matrix.target }}
+
+  # vmac with its window, for Linux. Built on Ubuntu 22.04 so that its glibc
+  # (2.35) is old enough for the distributions people run.
+  linux-app:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # GPUI's system libraries: Wayland and X11 (with xkbcommon), fontconfig
+      # and freetype for fonts, Vulkan for drawing.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          dir=vmac-${{ matrix.target }}
+          install -Dm755 target/release/vmac "$dir/bin/vmac"
+          install -Dm644 assets/linux/vmac.desktop "$dir/share/applications/vmac.desktop"
+          install -Dm644 assets/logo.svg "$dir/share/icons/hicolor/scalable/apps/vmac.svg"
+          install -Dm644 -t "$dir/share/doc/vmac" README.md LICENSE-MIT LICENSE-APACHE
+          tar -czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmac-${{ matrix.target }}
+          path: vmac-${{ matrix.target }}.tar.gz
+      - uses: softprops/action-gh-release@v2
+        if: env.TAG != ''
+        with:
+          tag_name: ${{ env.TAG }}
+          files: vmac-${{ matrix.target }}.tar.gz
+
+  # vmac with its window, for Windows 10 and later.
+  windows-app:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "vmac-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/vmac.exe, README.md, LICENSE-MIT, LICENSE-APACHE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmac-${{ matrix.target }}
+          path: vmac-${{ matrix.target }}.zip
+      - uses: softprops/action-gh-release@v2
+        if: env.TAG != ''
+        with:
+          tag_name: ${{ env.TAG }}
+          files: vmac-${{ matrix.target }}.zip

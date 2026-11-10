@@ -107,8 +107,7 @@ fn server_binary(target: &str) -> Result<PathBuf> {
         .status()
         .is_ok_and(|s| s.success());
     if fetched {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755))?;
+        crate::sys::set_mode(&cache, 0o755)?;
         return Ok(cache);
     }
     let _ = std::fs::remove_file(&cache);

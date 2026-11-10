@@ -59,3 +59,9 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGPDFDocument",
     "CGPDFPage",
 ], optional = true }
+
+# The socket windows attach to the server over (AF_UNIX, Windows 10 and later).
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.2"
+# Closing the console window Windows opens for vmac.exe (sys.rs).
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

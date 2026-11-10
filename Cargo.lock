@@ -7108,6 +7108,8 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

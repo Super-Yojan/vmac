@@ -531,8 +531,7 @@ fn link_command(command: &str, target: &Path) -> Result<(), String> {
 }
 
 fn make_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
+    crate::sys::set_mode(path, 0o755).map_err(|e| e.to_string())
 }
 
 fn install_server(server: &Server, step: &Step) -> Result<(), String> {

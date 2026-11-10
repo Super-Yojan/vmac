@@ -458,11 +458,7 @@ fn grpc_key(serial: &str, code: u32) -> bool {
     let Some((port, token)) = grpc_endpoint(serial) else { return false };
     // The token goes in a file of our own rather than where ps shows it.
     let header = std::env::temp_dir().join(format!("vmac-emulator-{port}.header"));
-    let written = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&header)
-            .and_then(|mut f| f.write_all(format!("authorization: Bearer {token}\n").as_bytes()))
-    };
+    let written = crate::sys::write_private(&header, format!("authorization: Bearer {token}\n").as_bytes());
     if written.is_err() {
         return false;
     }

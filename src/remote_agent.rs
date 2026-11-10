@@ -151,12 +151,7 @@ pub fn stand_in(root: &Path) -> PathBuf {
 }
 
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: the buffer is valid for its length; gethostname writes a
-    // NUL-terminated name into it (truncated if longer).
-    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
-    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    let name = if ok { String::from_utf8_lossy(&buf[..end]).into_owned() } else { String::new() };
+    let name = crate::sys::hostname();
     let name = name.split('.').next().unwrap_or("").to_string();
     if name.is_empty() { "remote".into() } else { name }
 }

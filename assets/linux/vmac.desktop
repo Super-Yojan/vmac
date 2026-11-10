@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=vmac
+GenericName=Text Editor
+Comment=A modal editor whose behavior is written in Lua
+Exec=vmac %F
+Icon=vmac
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/plain;
+StartupWMClass=vmac

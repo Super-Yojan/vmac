@@ -13,7 +13,7 @@ use crate::frame::{Frame, Input, Viewport};
 use crate::server::{Host, LSP_POLL, RELOAD_POLL, Server, TERMINAL_POLL};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use crate::sys::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -102,7 +102,7 @@ pub fn socket_path() -> PathBuf {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) => PathBuf::from(dir).join("vmac"),
         None => {
-            let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+            let user = crate::sys::user();
             std::env::temp_dir().join(format!("vmac-{user}"))
         }
     };
@@ -198,10 +198,9 @@ pub fn serve(make: impl FnOnce() -> Server, socket: &Path) -> std::io::Result<()
 
 fn listen(socket: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = socket.parent() {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir)?;
         // Yours alone: whoever can connect can type into your editor.
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::sys::set_mode(dir, 0o700)?;
     }
     if socket.exists() {
         if UnixStream::connect(socket).is_ok() {
@@ -679,7 +678,6 @@ struct LocalAgent {
 
 impl LocalAgent {
     fn start(spawn: crate::remote_agent::Spawn, writer: Arc<Mutex<Box<dyn Write + Send>>>) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         // The stand-in folder, with the project's rules.
         std::fs::create_dir_all(&spawn.cwd)?;
@@ -690,10 +688,10 @@ impl LocalAgent {
             }
             std::fs::write(path, text)?;
         }
-        let mut child = std::process::Command::new(&spawn.command)
+        let mut command = std::process::Command::new(&spawn.command);
+        let mut child = crate::sys::own_group(&mut command)
             .args(&spawn.args)
             .current_dir(&spawn.cwd)
-            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -734,11 +732,7 @@ impl LocalAgent {
 impl Drop for LocalAgent {
     fn drop(&mut self) {
         // Its whole process group: npx runs the adapter as a child.
-        // SAFETY: kill with a negative pid signals that process group.
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGTERM);
-        }
-        let _ = self.child.kill();
+        crate::sys::kill_group(&mut self.child);
         let _ = self.child.wait();
     }
 }
@@ -904,7 +898,6 @@ pub fn ensure_server(socket: &Path) -> std::io::Result<()> {
     if UnixStream::connect(socket).is_ok() {
         return Ok(());
     }
-    use std::os::unix::process::CommandExt;
     let log = crate::projects::History::default_dir().map(|d| {
         let _ = std::fs::create_dir_all(&d);
         d.join("server.log")
@@ -925,15 +918,7 @@ pub fn ensure_server(socket: &Path) -> std::io::Result<()> {
         });
     // Its own session: neither a Ctrl-C in the terminal it came from nor
     // the end of the ssh connection that started it stops it.
-    // SAFETY: setsid is async-signal-safe, and nothing else runs in the
-    // child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    command.spawn()?;
+    crate::sys::detach(&mut command).spawn()?;
     for _ in 0..200 {
         if UnixStream::connect(socket).is_ok() {
             return Ok(());

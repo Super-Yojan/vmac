@@ -1236,13 +1236,12 @@ impl Pipe {
 
     /// Runs the agent's program in `root`.
     fn spawn(config: &AgentConfig, root: &Path) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt;
-        let mut child = Command::new(&config.command)
+        let mut command = Command::new(&config.command);
+        // Its own process group, so stopping it stops what it started (npx
+        // runs the adapter as a child).
+        let mut child = crate::sys::own_group(&mut command)
             .args(&config.args)
             .current_dir(root)
-            // Its own process group, so stopping it stops what it started
-            // (npx runs the adapter as a child).
-            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1289,9 +1288,7 @@ impl Pipe {
 
 /// Stops a program and everything in its process group.
 fn kill_tree(child: &mut Child) {
-    let group = format!("-{}", child.id());
-    let _ = Command::new("kill").args(["-TERM", "--", &group]).stderr(Stdio::null()).status();
-    let _ = child.kill();
+    crate::sys::kill_group(child);
 }
 
 fn log_traffic(direction: &str, agent: &str, message: &Value) {

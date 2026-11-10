@@ -19,7 +19,7 @@ doesn't exist; move it there when you like.
 ## Install
 
 vmac builds from source with Rust's cargo (get it from [rustup.rs](https://rustup.rs)).
-It's tested on macOS.
+It's tested on macOS; Linux and Windows builds come with each release.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Super-Yojan/vmac/master/install.sh | sh
@@ -34,6 +34,17 @@ cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.7 --locked
 Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.lua`,
 `plugins/`). From a checkout, `cargo run -- FILE` runs it with live reload
 of `lua/core/`.
+
+**On Linux and Windows,** each [release](https://github.com/Super-Yojan/vmac/releases)
+has vmac with its window, built:
+
+- Linux (x86_64 and arm64, glibc 2.35 or later): `vmac-<arch>-unknown-linux-gnu.tar.gz`.
+  Unpack it into `~/.local` (or `/usr/local`) for the `vmac` command and a
+  menu entry: `tar -xzf vmac-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 -C ~/.local`.
+  It needs Vulkan drivers, and Wayland or X11.
+- Windows 10 or later (x86_64): `vmac-x86_64-pc-windows-msvc.zip`, with
+  `vmac.exe`. Put it on your `PATH`, or open it from Explorer. Windows is
+  new: commands that run shell scripts expect a Unix shell (Git Bash, WSL).
 
 **As a Mac app.** From a checkout, `scripts/make-app.sh` builds `vmac.app`
 into `/Applications` (or the folder you name), with its icon, so it opens
