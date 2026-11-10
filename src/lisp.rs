@@ -847,6 +847,24 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         s.buffer().search_backward(&re, before.max(0) as usize).map_or(-1, |p| p as isize)
     });
     pure!(reg, "regex-quote", |text: String| regex::escape(&text));
+    // A device's screen in a buffer (device.rs): vmac.device_show(target,
+    // name) shows it in this window, target a serial or "avd:NAME".
+    prim!(reg, editor, "device-show", |s, target: String, name: String| {
+        let id = s.ensure_buffer(&name);
+        s.device_buffers.insert(id, target);
+        s.show_buffer(id);
+        s.buffer_mut().set_read_only(true);
+    });
+    prim!(reg, editor, "device-here?", |s| s.device_buffers.contains_key(&s.window().buffer));
+    prim!(reg, editor, "device-target", |s| s.device_buffers.get(&s.window().buffer).cloned().unwrap_or_default());
+    // vmac.device_shell(target, command): runs it in the device's shell
+    // (input keyevent 4, ...), not waiting; false when there's no device.
+    pure!(reg, "device-shell", |target: String, command: String| crate::device::shell_send(&target, &command));
+    // vmac.device_key(target, key, text) and vmac.device_button(target,
+    // name) (back, home, recents, power, volume-up, volume-down) send them
+    // to an Android device or iOS simulator: "" when sent, else why not.
+    pure!(reg, "device-key", |target: String, key: String, text: String| crate::device::send(&target, |d| crate::device::key_command(d, &key, &text)).err().unwrap_or_default());
+    pure!(reg, "device-button", |target: String, name: String| crate::device::send(&target, |d| crate::device::button_command(d, &name)).err().unwrap_or_default());
     // vmac.on_path(command): whether the command is on PATH.
     pure!(reg, "on-path?", |command: String| crate::packages::on_path(&command));
     // The fuzzy picker. Lua opens it and decides what picking does.
@@ -2247,6 +2265,38 @@ esac"#
         assert!(android.contains("':app:installDebug'") && android.contains("PKG='com.example.hello'"), "{android}");
         assert!(android.contains("AVD='Pixel_9'"), "{android}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_device_screen_opens_beside_the_code_and_takes_typing() {
+        let (mut lisp, editor) = lisp_with("fn main() {}\n");
+        lisp.eval_lua("core.mobile.show_device('avd:Pixel_9')").unwrap();
+        {
+            let st = editor.lock();
+            assert_eq!(st.window_count(), 2);
+            assert_eq!(st.buffer().name(), "test", "the code keeps the focus");
+            assert_eq!(st.device_buffers.values().collect::<Vec<_>>(), [&"avd:Pixel_9".to_string()]);
+        }
+        // Showing it again reuses its window.
+        lisp.eval_lua("core.mobile.show_device('emulator-5554')").unwrap();
+        assert_eq!(editor.lock().window_count(), 2);
+        lisp.eval_lua("vmac.select_window_in_direction('right')").unwrap();
+        assert_eq!(editor.lock().buffer().name(), "*device*");
+        assert_eq!(lisp.eval_lua("return vmac.device_target()").unwrap(), "emulator-5554");
+        // i types into it (keys go to core.device_type), ESC stops.
+        lisp.eval_lua("core.typed = {} core.device_type = function(k, t) table.insert(core.typed, k .. '=' .. t) end").unwrap();
+        lisp.dispatch_key("i", "i");
+        assert_eq!(lisp.eval_lua("return core.state").unwrap(), "insert");
+        lisp.dispatch_key("h", "h");
+        lisp.dispatch_key("RET", "");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(lisp.eval_lua("return core.state").unwrap(), "normal");
+        assert_eq!(lisp.eval_lua("return table.concat(core.typed, ' ')").unwrap(), "h=h RET=");
+        assert_eq!(lisp.eval_lua("return vmac.device_button('ios:U-1', 'volume-up')").unwrap(), if crate::device::idb_installed() {
+            "the iOS simulator has no volume-up button"
+        } else {
+            "iOS input needs idb: brew install facebook/fb/idb-companion and uv tool install fb-idb"
+        });
     }
 
     #[test]

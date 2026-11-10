@@ -8,6 +8,18 @@
 -- SPC r s   choose the Xcode scheme    SPC r e   the last build's errors
 -- SPC r k   stop the app               SPC r o   show *run*
 -- SPC r L   set up sourcekit-lsp for the Xcode project (buildServer.json)
+-- SPC r v   show the device's screen   SPC r Q   shut the emulator or simulator down
+--
+-- The device's screen (*device*, beside the code; it opens by itself when
+-- an app runs): click to tap, drag to swipe, hold to long press, the wheel
+-- scrolls. In it, i types into the device (ESC stops), b goes back (on iOS,
+-- a swipe in from the left edge), H home, P presses power; on Android, o
+-- shows the recent apps and + and - change the volume. With the screen in
+-- vmac, the emulator or simulator runs without a window of its own: set
+-- core.mobile.headless_emulator = false to keep it, or
+-- core.mobile.show_screen = false not to open *device* on a run. An iOS
+-- simulator's screen and input need idb (brew install
+-- facebook/fb/idb-companion, then uv tool install fb-idb).
 --
 -- The first run asks for what it needs (a device, a scheme when there are
 -- several) and remembers it for the project. A project with both an Xcode
@@ -31,6 +43,9 @@ core.mobile = M
 M.run_buffer = "*run*"
 M.configuration = "Debug"
 M.android_variant = "Debug"
+M.show_screen = true
+M.headless_emulator = true
+M.device_buffer = "*device*"
 
 -- Programs (tests put stand-ins here).
 M.xcrun = "xcrun"
@@ -454,7 +469,8 @@ function M.ios_script(project, container, scheme, device, build_only)
     "BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \"$APP/Info.plist\") || fail 'No bundle identifier'",
     "wait",
     M.xcrun .. " simctl boot \"$UDID\" >/dev/null 2>&1",
-    "open -a Simulator --args -CurrentDeviceUDID \"$UDID\" >/dev/null 2>&1",
+    (M.show_screen and M.headless_emulator) and ""
+      or "open -a Simulator --args -CurrentDeviceUDID \"$UDID\" >/dev/null 2>&1",
     M.xcrun .. " simctl bootstatus \"$UDID\" >/dev/null 2>&1",
     "say \"▸ Installing $(basename \"$APP\")\"",
     M.xcrun .. " simctl install \"$UDID\" \"$APP\" || fail 'Install failed'",
@@ -484,6 +500,7 @@ end
 
 local function run_ios(project, device, build_only)
   with_scheme(project, false, function(container, scheme)
+    if M.show_screen and not build_only then M.show_device(M.device_target(device)) end
     if not V.file_exists(project.root .. "/buildServer.json") then lsp_setup(project, container, scheme, true) end
     run_script(project, M.ios_script(project, container, scheme, device, build_only))
   end)
@@ -520,7 +537,8 @@ function M.android_script(project, app, device, build_only)
         "SERIAL=$(find_avd)",
         "if [ -z \"$SERIAL\" ]; then",
         "  say \"▸ Starting the emulator $AVD\"",
-        "  nohup \"$EMULATOR\" -avd \"$AVD\" > \"$LOG.emulator\" 2>&1 &",
+        "  nohup \"$EMULATOR\" -avd \"$AVD\" " .. ((M.show_screen and M.headless_emulator) and "-no-window " or "")
+          .. "> \"$LOG.emulator\" 2>&1 &",
         "  EMULATOR_PID=$!",
         "fi",
       }) do
@@ -594,6 +612,7 @@ local function go(build_only)
       run_ios(project, device, build_only)
     else
       if not project.android then return V.message("No Android app here; SPC r d picks a simulator") end
+      if M.show_screen and not build_only then M.show_device(M.device_target(device)) end
       run_script(project, M.android_script(project, project.android, device, build_only))
     end
   end
@@ -686,10 +705,95 @@ V.command("mobile-errors", function()
   core.pick("Build problems", items, project.root, function(item) V.goto_location(item) end)
 end)
 
+---- The device's screen
+
+-- What device.rs streams from: a phone's serial, "avd:NAME" or "ios:UDID".
+function M.device_target(device)
+  if device.platform == "ios" then return "ios:" .. device.udid end
+  return device.avd and ("avd:" .. device.avd) or device.serial
+end
+
+-- Shows the screen to the right of this window (or where it's shown
+-- already), keeping this window selected.
+function M.show_device(target)
+  for i = 0, V.window_count() - 1 do
+    if V.buffer_name() == M.device_buffer then
+      V.device_show(target, M.device_buffer)
+      if i > 0 then V.other_window(-i) end
+      return
+    end
+    V.other_window(1)
+  end
+  V.split_window("right")
+  V.device_show(target, M.device_buffer)
+  V.select_window_in_direction("left")
+end
+
+V.command("mobile-screen", function()
+  local project = M.project()
+  local s = M.settings(project.root)
+  local device = s.platform and s[s.platform] and s[s.platform].device
+  if device then return M.show_device(M.device_target(device)) end
+  spawn(project.root, M.adb(), { "devices" }, function(ok, out)
+    local serial = ok and out:match("\n(%S+)%s+device%f[%s]")
+    if not serial then return V.message("No Android device (SPC r d picks one)") end
+    M.show_device(serial)
+  end)
+end)
+
+V.command("mobile-emulator-stop", function()
+  local project = M.project()
+  local s = M.settings(project.root)
+  local device = s.platform and s[s.platform] and s[s.platform].device
+  local target = V.device_here() and V.device_target() or (device and M.device_target(device))
+  if not target then return V.message("No emulator or simulator chosen") end
+  local udid = target:match("^ios:(.*)$")
+  if udid then
+    spawn(project.root, M.xcrun, { "simctl", "shutdown", udid }, function(ok, out, err)
+      V.message(ok and "Shut the simulator down" or ("simctl: " .. last_line(err ~= "" and err or out)))
+    end)
+  elseif V.device_shell(target, "reboot -p") then
+    V.message("Shutting the emulator down")
+  else
+    V.message("It isn't running")
+  end
+end)
+
+local function button(name)
+  return function()
+    local why = V.device_button(V.device_target(), name)
+    if why ~= "" then V.message(why) end
+  end
+end
+
+-- Keys typed into the device (i in *device*).
+function core.device_type(key, text)
+  local why = V.device_key(V.device_target(), key, text)
+  if why ~= "" then V.message(why) end
+end
+
+V.command("device-type", function()
+  core.state = "insert"
+  V.message("Typing into the device (ESC stops)")
+end)
+V.command("device-back", button("back"))
+V.command("device-home", button("home"))
+V.command("device-recents", button("recents"))
+V.command("device-power", button("power"))
+V.command("device-volume-up", button("volume-up"))
+V.command("device-volume-down", button("volume-down"))
+
+for key, command in pairs({ i = "device-type", a = "device-type", b = "device-back", H = "device-home",
+    o = "device-recents", P = "device-power", ["+"] = "device-volume-up", ["-"] = "device-volume-down" }) do
+  core.keymaps.device[key] = command
+end
+core.keymaps.device_insert.ESC = "normal-state"
+
 for key, command in pairs({
   ["SPC r r"] = "mobile-run", ["SPC r b"] = "mobile-build", ["SPC r d"] = "mobile-device",
   ["SPC r s"] = "mobile-scheme", ["SPC r e"] = "mobile-errors", ["SPC r k"] = "mobile-stop",
   ["SPC r o"] = "mobile-show", ["SPC r L"] = "mobile-lsp-setup",
+  ["SPC r v"] = "mobile-screen", ["SPC r Q"] = "mobile-emulator-stop",
 }) do
   core.keymaps.normal[key] = command
 end

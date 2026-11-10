@@ -339,6 +339,8 @@ pub struct EditorState {
     pub pdf_themed: bool,
     /// Each PDF buffer's latest scrolls asked for by keys, numbered.
     pub media_scroll: std::collections::HashMap<BufferId, Vec<(u64, crate::frame::MediaScroll)>>,
+    /// Buffers showing a device's screen: its serial or `avd:NAME`.
+    pub device_buffers: std::collections::HashMap<BufferId, String>,
     /// Each image or PDF buffer's zoom (1 fits it to the window).
     pub media_zoom: std::collections::HashMap<BufferId, f32>,
     pub preview_last: Option<BufferId>,
@@ -573,6 +575,7 @@ impl EditorState {
             markdown_preview: false,
             pdf_themed: true,
             media_scroll: Default::default(),
+            device_buffers: Default::default(),
             media_zoom: Default::default(),
             preview_last: None,
             last_terminal: None,

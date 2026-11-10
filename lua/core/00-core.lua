@@ -69,6 +69,7 @@ core.keymaps = {
   normal = {}, visual = {}, operator = {}, insert = {}, minibuffer = {},
   picker_normal = {}, tree = {}, agent = {}, agent_insert = {}, review = {},
   dashboard = {}, terminal = {}, terminal_normal = {}, media = {},
+  device = {}, device_insert = {},
 }
 
 -- core.define_key("normal", "Q", "some-command") or a keymap table.
@@ -170,6 +171,13 @@ function core.terminal_normal()
   return core.state == "normal" and not V.minibuffer_active() and V.terminal_here()
 end
 
+-- Typing into a device's screen (mobile.lua): keys go to the device.
+function core.device_insert()
+  return core.state == "insert" and not V.minibuffer_active() and V.device_here()
+end
+-- What typing a key into a device does (mobile.lua sets it).
+function core.device_type(_key, _text) end
+
 -- Buffers with keymaps of their own, by name: { name, normal state's
 -- keymap, insert state's, visual state's } (the last two optional), e.g.
 -- { "*git-status*", "git_status" }. The name can be a function instead,
@@ -192,6 +200,8 @@ function core.current_keymaps()
   local normal = core.state == "normal" and plain
   if core.terminal_insert() then return { k.terminal } end
   if core.terminal_normal() then return { k.terminal_normal, k.normal } end
+  if core.device_insert() then return { k.device_insert } end
+  if normal and V.device_here() then return { k.device, k.normal } end
   if normal and V.buffer_name() == core.tree_buffer then return { k.tree, k.normal } end
   if normal and V.dashboard_here() then return { k.dashboard, k.normal } end
   if normal and V.review_here() then return { k.review, k.normal } end
@@ -362,6 +372,8 @@ function core.dispatch_binding(key, text)
   elseif core.pending_keys == "" and core.terminal_insert() then
     -- Typing into a terminal: every other key goes to its program.
     V.terminal_send(key, text)
+  elseif core.pending_keys == "" and core.device_insert() then
+    core.device_type(key, text)
   elseif core.pending_keys == "" and core.inserting() and text ~= "" then
     V.insert(text)
     if core.state == "insert" and not V.minibuffer_active() then core.after_self_insert(text) end

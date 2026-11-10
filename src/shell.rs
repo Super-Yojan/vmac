@@ -40,6 +40,8 @@ pub struct Shell {
     md_views: std::collections::HashMap<crate::frame::BufferId, MdView>,
     /// PDFs shown in windows, by buffer: their pages, drawn as they come into view.
     pdf_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::media::PdfView>>,
+    /// Device screens, streaming while a window shows them.
+    device_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::device::DeviceView>>,
     /// Images shown in windows, by buffer: their zoom and scroll.
     image_views: std::collections::HashMap<crate::frame::BufferId, gpui_kit::Entity<crate::media::ImageView>>,
     /// *agent-review*, drawn by gpui-kit's Diff: its state, the text it was
@@ -171,6 +173,7 @@ impl Shell {
             _appearance: appearance,
             md_views: Default::default(),
             pdf_views: Default::default(),
+            device_views: Default::default(),
             image_views: Default::default(),
             review_view: Default::default(),
             hits: Vec::new(),
@@ -1057,6 +1060,16 @@ impl Render for Shell {
         self.md_views.retain(|id, _| live.contains(id));
         self.pdf_views.retain(|id, _| live.contains(id));
         self.image_views.retain(|id, _| live.contains(id));
+        // A screen streams only while it's shown.
+        let shown: std::collections::HashMap<_, _> = frame
+            .windows
+            .iter()
+            .filter_map(|w| match &w.content {
+                Content::Device { target } => Some((w.buffer, target.clone())),
+                _ => None,
+            })
+            .collect();
+        self.device_views.retain(|id, v| shown.get(id).is_some_and(|t| t == v.read(cx).target()));
 
         let this = cx.entity().downgrade();
         let windows: Vec<_> = frame
@@ -1189,6 +1202,15 @@ impl Render for Shell {
                     }
                     Content::Media { path, kind: MediaKind::Pdf, themed, scroll, zoom } => {
                         let view = self.pdf_view(w.buffer, path, *themed, scroll, *zoom, w.width, cx);
+                        view.update(cx, |v, _| v.set_window(w.id));
+                        div().flex_1().overflow_hidden().child(view).into_any_element()
+                    }
+                    Content::Device { target } => {
+                        let view = self
+                            .device_views
+                            .entry(w.buffer)
+                            .or_insert_with(|| gpui_kit::AppContext::new(cx, |cx| crate::device::DeviceView::new(target.clone(), cx)))
+                            .clone();
                         view.update(cx, |v, _| v.set_window(w.id));
                         div().flex_1().overflow_hidden().child(view).into_any_element()
                     }

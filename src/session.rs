@@ -465,8 +465,9 @@ impl Session {
                 let height_of =
                     |i: usize| if buffer.line_hidden(i) { 0. } else { ROW_HEIGHT * line_scale(&styles[i - lo]) };
                 let media = buffer.file().and_then(|f| crate::frame::media_kind(f).map(|k| (f.clone(), k)));
+                let device = st.device_buffers.get(&w.buffer).cloned();
                 let is_custom =
-                    rendered.contains(id) || media.is_some() || diffs.contains_key(&w.buffer);
+                    rendered.contains(id) || media.is_some() || diffs.contains_key(&w.buffer) || device.is_some();
                 // Line numbers, in a gutter: for files, when they're on.
                 let numbers = match st.line_numbers.as_str() {
                     "on" | "relative" if buffer.file().is_some() && !is_sidebar && !is_custom => {
@@ -492,7 +493,9 @@ impl Session {
                     cursor_at = Some((x, y, height_of(cur_line)));
                 }
 
-                let content = if let Some(review) = diffs.get(&w.buffer) {
+                let content = if let Some(target) = device {
+                    Content::Device { target }
+                } else if let Some(review) = diffs.get(&w.buffer) {
                     Content::Review(review.clone())
                 } else if let Some((path, kind)) = media {
                     Content::Media { path, kind, themed: st.pdf_themed, scroll: st.media_scroll.get(&w.buffer).cloned().unwrap_or_default(),

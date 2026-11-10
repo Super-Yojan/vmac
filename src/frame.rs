@@ -174,6 +174,9 @@ pub enum Content {
         #[serde(default = "default_scale")]
         zoom: f32,
     },
+    /// An Android device's screen, streamed and drawn by the window, which
+    /// sends the mouse back to it: a serial, or `avd:NAME` (device.rs).
+    Device { target: String },
 }
 
 /// A move through an image or PDF, asked for by keys (j, C-d, G...).

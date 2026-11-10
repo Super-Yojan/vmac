@@ -8,6 +8,7 @@ mod agent;
 mod buffer;
 mod clipboard;
 mod daemon;
+mod device;
 mod editor;
 mod lisp;
 mod lsp;
