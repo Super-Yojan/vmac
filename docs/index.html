@@ -380,7 +380,7 @@ src/modeline.lua  <span class="c-d">(2 changes)</span>
   <section id="install">
     <h2 class="big">Install</h2>
     <div class="panel">
-      <div class="bar"><span class="label">Build / From source</span><span class="label"><i class="dot"></i> macOS</span></div>
+      <div class="bar"><span class="label">Build / From source</span><span class="label"><i class="dot"></i> macOS · Linux · Windows</span></div>
       <div class="intro">
         <h2>Build it, open a file, make it yours.</h2>
         <p>vmac builds with Rust's <code>cargo</code> (from <a href="https://rustup.rs">rustup.rs</a>); the first build takes a few minutes. The installer builds the latest release, v0.0.7, and makes <code>~/.config/vmac/</code>.</p>
@@ -393,6 +393,15 @@ src/modeline.lua  <span class="c-d">(2 changes)</span>
       <div class="cmd">
         <code id="cargo-cmd">cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.7 --locked vmac</code>
         <button type="button" data-copy="cargo-cmd">Copy <span>↗</span></button>
+      </div>
+      <div class="intro">
+        <h2>Or download it, ready to run.</h2>
+        <p>Each <a href="https://github.com/Super-Yojan/vmac/releases">release</a> has vmac built for Linux (x86_64 and arm64, glibc 2.35 or later, with Vulkan and Wayland or X11) and Windows 10 or later. On Linux, this puts <code>vmac</code> in <code>~/.local/bin</code> and adds it to your app menu (use <code>aarch64</code> on arm64):</p>
+        <p class="side">On Windows, download <a href="https://github.com/Super-Yojan/vmac/releases/latest/download/vmac-x86_64-pc-windows-msvc.zip"><code>vmac-x86_64-pc-windows-msvc.zip</code></a> and open <code>vmac.exe</code>. Windows is new: commands that run shell scripts want Git Bash or WSL.</p>
+      </div>
+      <div class="cmd">
+        <code id="linux-cmd">curl -fsSL https://github.com/Super-Yojan/vmac/releases/latest/download/vmac-x86_64-unknown-linux-gnu.tar.gz | tar -xz --strip-components=1 -C ~/.local</code>
+        <button type="button" data-copy="linux-cmd">Copy <span>↗</span></button>
       </div>
       <div class="steps">
         <div class="step"><span class="label">Step / 01</span><h3>Install</h3><p>Run the installer, or the cargo line yourself.</p></div>
@@ -531,7 +540,7 @@ vmac.<span class="c-f">map</span>(<span class="c-s">"normal"</span>, <span class
     <div><span class="label">Links</span><ul><li><a href="https://github.com/Super-Yojan/vmac">GitHub</a></li><li><a href="https://github.com/Super-Yojan/vmac/releases">Releases</a></li></ul></div>
     <div><span class="label">Learn</span><ul><li><a href="tutorial.html">Tutorial</a></li><li><a href="https://github.com/Super-Yojan/vmac#keys">Keys</a></li><li><a href="https://github.com/Super-Yojan/vmac#customizing">Customizing</a></li></ul></div>
     <div><span class="label">Extend</span><ul><li><a href="https://github.com/Super-Yojan/vmac/tree/master/examples/plugins">Example plugins</a></li><li><a href="https://github.com/Super-Yojan/vmac#coding-agent">The assistant</a></li></ul></div>
-    <div><span class="label">Install</span><ul><li><a href="#install">From source</a></li><li><a href="https://github.com/Super-Yojan/vmac#install">Mac app</a></li></ul></div>
+    <div><span class="label">Install</span><ul><li><a href="#install">From source</a></li><li><a href="#install">Linux and Windows</a></li><li><a href="https://github.com/Super-Yojan/vmac#install">Mac app</a></li></ul></div>
   </div>
   <div class="legal">
     <span class="label">MIT or Apache-2.0</span>
