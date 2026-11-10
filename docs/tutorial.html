@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>vmac tutorial</title>
+<meta name="description" content="Learn vmac in nine short lessons: editing, files and windows, language servers, git, notes, the assistant, your own Lua config, and sessions that keep running.">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="columns" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
+
+<header>
+  <div class="brand">
+    <a class="wordmark" href="index.html"><img src="logo.svg" alt=""><span>vmac</span></a>
+    <nav aria-label="Site">
+      <a class="box" href="index.html">Home</a>
+      <a class="box" href="index.html#install">Install</a>
+      <a class="box" href="index.html#keys">Keys</a>
+    </nav>
+  </div>
+  <a class="box solid" href="https://github.com/Super-Yojan/vmac">GitHub ↗</a>
+</header>
+
+<main id="top">
+  <div class="page-head">
+    <h1 class="rise d1">Tutorial</h1>
+    <p class="rise d2">Nine short lessons, each a few things to try. <span>Open a real project beside this page and follow along; an afternoon covers all of it.</span></p>
+  </div>
+
+  <div class="tut">
+    <nav class="toc" aria-label="Lessons">
+      <span class="label">Lessons</span>
+      <a href="#first-file"><b>01</b> First file</a>
+      <a href="#editing"><b>02</b> Editing</a>
+      <a href="#around"><b>03</b> Getting around</a>
+      <a href="#code"><b>04</b> Code</a>
+      <a href="#git"><b>05</b> Git</a>
+      <a href="#notes"><b>06</b> Notes</a>
+      <a href="#assistant"><b>07</b> Assistant</a>
+      <a href="#config"><b>08</b> Make it yours</a>
+      <a href="#sessions"><b>09</b> Sessions</a>
+    </nav>
+
+    <div class="lessons">
+
+      <!-- 01 -->
+      <section class="lesson panel" id="first-file">
+        <div class="bar"><span class="label">Lesson / 01</span><span class="label"><i class="dot"></i> 5 minutes</span></div>
+        <div class="intro">
+          <h2>Your first file</h2>
+          <p>vmac is modal, like Vim. It starts in <b>normal</b> state, where keys move and edit, rather than type. <kbd>i</kbd> enters <b>insert</b> state to type text; <kbd>ESC</kbd> goes back. The modeline at the bottom shows which state you're in.</p>
+          <p><kbd>SPC</kbd> is the leader, as in Doom Emacs: press it, pause, and a list of everything that can follow pops up. You don't need to memorise anything to begin.</p>
+          <p class="side">Not installed yet? The <a href="index.html#install">installer</a> builds the latest release and makes <code>~/.config/vmac/</code>.</p>
+        </div>
+        <div class="code">
+          <div class="bar"><span class="label">Terminal</span></div>
+          <pre><span class="c-d">$</span> vmac notes.txt     <span class="c-d"># open (or create) a file</span>
+<span class="c-d">$</span> vmac               <span class="c-d"># or start on the dashboard</span></pre>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div>Press <kbd>i</kbd>, type a few lines, then <kbd>ESC</kbd>.</div></li>
+            <li><div>Move with <kbd>h</kbd> <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd>: left, down, up, right. <span>Arrow keys work too, but your hands stay put this way.</span></div></li>
+            <li><div>Save with <code>:w</code> and <kbd>RET</kbd>, or <kbd>SPC f s</kbd>.</div></li>
+            <li><div>Press <kbd>SPC</kbd> and wait. <span>Browse the groups: <kbd>f</kbd> files, <kbd>b</kbd> buffers, <kbd>g</kbd> git, <kbd>a</kbd> the assistant.</span></div></li>
+            <li><div>Quit with <code>:q</code> (<code>:wq</code> saves first). <span>Plain <code>vmac</code> opens the dashboard, where <kbd>SPC b h</kbd> takes you back any time.</span></div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#editing">Next: Editing →</a></div>
+      </section>
+
+      <!-- 02 -->
+      <section class="lesson panel" id="editing">
+        <div class="bar"><span class="label">Lesson / 02</span><span class="label"><i class="dot"></i> 15 minutes</span></div>
+        <div class="intro">
+          <h2>Editing, the Vim way</h2>
+          <p>Edits in normal state are sentences: an <b>operator</b> (what to do) followed by a <b>motion</b> or <b>text object</b> (what to do it to). <kbd>d</kbd> deletes, <kbd>c</kbd> changes, <kbd>y</kbd> yanks (copies). <kbd>w</kbd> is a word forward, <kbd>$</kbd> the end of the line, <kbd>iw</kbd> the word you're in, <kbd>i(</kbd> what's inside the parentheses.</p>
+          <p>So <kbd>dw</kbd> deletes a word, <kbd>c$</kbd> changes to the end of the line, <kbd>yi"</kbd> copies a string's contents. Doubling an operator acts on the line: <kbd>dd</kbd>, <kbd>yy</kbd>. A count repeats: <kbd>3dd</kbd>.</p>
+          <p class="side">Yanks go to the system clipboard too, so <kbd>p</kbd> pastes what you copied in another app, and <kbd>⌘V</kbd> works everywhere.</p>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div>Jump around: <kbd>w</kbd> <kbd>b</kbd> <kbd>e</kbd> by words, <kbd>0</kbd> <kbd>$</kbd> the line's ends, <kbd>gg</kbd> <kbd>G</kbd> the file's, <kbd>5G</kbd> line 5.</div></li>
+            <li><div>Put the cursor inside some parentheses and type <kbd>ci(</kbd>. <span>The contents go and you're typing their replacement. <kbd>ESC</kbd> when done.</span></div></li>
+            <li><div>Press <kbd>.</kbd> somewhere else. <span>It repeats your last change, the whole <kbd>ci(</kbd> and what you typed.</span></div></li>
+            <li><div>Find on the line with <kbd>f</kbd> and a character, <kbd>;</kbd> for the next. <span><kbd>dt)</kbd> deletes up to the next <code>)</code>.</span></div></li>
+            <li><div>Search with <kbd>/</kbd>, then <kbd>n</kbd> <kbd>N</kbd>. <kbd>*</kbd> searches for the word under the cursor.</div></li>
+            <li><div>Select with <kbd>v</kbd> (characters), <kbd>V</kbd> (lines) or <kbd>C-v</kbd> (a block), move, then <kbd>d</kbd>, <kbd>y</kbd> or <kbd>&gt;</kbd>. <span>In a block, <kbd>I</kbd> types on every line at once.</span></div></li>
+            <li><div>Undo with <kbd>u</kbd>, redo with <kbd>C-r</kbd>.</div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#around">Next: Getting around →</a></div>
+      </section>
+
+      <!-- 03 -->
+      <section class="lesson panel" id="around">
+        <div class="bar"><span class="label">Lesson / 03</span><span class="label"><i class="dot"></i> 10 minutes</span></div>
+        <div class="intro">
+          <h2>Files, windows and terminals</h2>
+          <p>Open vmac inside a git repository and that repository is your project. <kbd>SPC SPC</kbd> finds any file in it by typing a few letters of its path, with a preview. Every file you open stays open as a <b>buffer</b>; <kbd>SPC ,</kbd> switches between them.</p>
+          <p>Windows split the screen, each with its own cursor. Terminals are buffers too, so motions, search and yank work in their scrollback.</p>
+          <p class="side">The picker is modal as well: <kbd>ESC</kbd> lets you move through results with <kbd>j</kbd> <kbd>k</kbd>, and <kbd>q</kbd> closes it.</p>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div><kbd>SPC SPC</kbd>, type part of a filename, <kbd>RET</kbd>. <span><kbd>C-n</kbd> <kbd>C-p</kbd> move through the results.</span></div></li>
+            <li><div><kbd>SPC o p</kbd> opens the file tree. <span><kbd>RET</kbd> opens, <kbd>a</kbd> adds a file, <kbd>r</kbd> renames, and git's changes show as letters beside files.</span></div></li>
+            <li><div><kbd>C-w v</kbd> splits beside, <kbd>C-w s</kbd> below. <kbd>C-w h</kbd> / <kbd>C-w l</kbd> move between them, <kbd>C-w c</kbd> closes one.</div></li>
+            <li><div><kbd>SPC o t</kbd> opens a terminal below. <span>Type in insert state; <kbd>ESC</kbd> to scroll and search it; <kbd>SPC o t</kbd> again hides it.</span></div></li>
+            <li><div><kbd>SPC f r</kbd> reopens a recent file; <kbd>SPC p p</kbd> switches to another project.</div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#code">Next: Code →</a></div>
+      </section>
+
+      <!-- 04 -->
+      <section class="lesson panel" id="code">
+        <div class="bar"><span class="label">Lesson / 04</span><span class="label"><i class="dot"></i> 10 minutes</span></div>
+        <div class="intro">
+          <h2>Code with a language server</h2>
+          <p>Open a Rust, Python, TypeScript, Go or C file and vmac starts its language server for the project. Errors get squiggles, the one under the cursor shows at the bottom, and the modeline counts them (<code>E2 W1</code>). Completions pop up as you type.</p>
+          <p>vmac looks for <code>rust-analyzer</code>, <code>pyright</code>, <code>typescript-language-server</code>, <code>gopls</code> and <code>clangd</code> on your <code>PATH</code>. Install the ones you use.</p>
+          <p class="side">Installed one while vmac was running? <kbd>SPC c R</kbd> restarts the servers and tries the missing ones again.</p>
+        </div>
+        <div class="code">
+          <div class="bar"><span class="label">Terminal</span><span class="label">For Rust, say</span></div>
+          <pre><span class="c-d">$</span> rustup component add rust-analyzer</pre>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div>On a function call, <kbd>gd</kbd> goes to its definition; <kbd>C-o</kbd> comes back.</div></li>
+            <li><div><kbd>K</kbd> shows its documentation. <span>Any key closes it.</span></div></li>
+            <li><div><kbd>gr</kbd> lists every reference, previewing each.</div></li>
+            <li><div><kbd>]d</kbd> / <kbd>[d</kbd> jump between errors. <kbd>SPC c a</kbd> on one offers fixes.</div></li>
+            <li><div><kbd>SPC c r</kbd> renames a symbol everywhere; <kbd>SPC c f</kbd> formats the file. <span>Edits to other files open them unsaved, so you can look before <code>:w</code>.</span></div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#git">Next: Git →</a></div>
+      </section>
+
+      <!-- 05 -->
+      <section class="lesson panel" id="git">
+        <div class="bar"><span class="label">Lesson / 05</span><span class="label"><i class="dot"></i> 15 minutes</span></div>
+        <div class="intro">
+          <h2>Git, the magit way</h2>
+          <p><kbd>SPC g g</kbd> opens <code>*git-status*</code>: your branch and how far it is from its upstream, then untracked, unstaged and staged changes, stashes and recent commits. Each key acts on what's under the cursor, whether that's a whole section, one file or a single hunk.</p>
+          <p>In ordinary files, the gutter marks changed lines (green added, blue changed, red where lines went), and the cursor's line says who last changed it and when.</p>
+          <p class="side">GitHub works through the <code>gh</code> CLI. Run <code>gh auth login</code> once and pull requests, reviews and issues open inside vmac.</p>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it: a commit</span></div>
+          <ol>
+            <li><div>Change a file, save it, and press <kbd>SPC g g</kbd>.</div></li>
+            <li><div><kbd>TAB</kbd> on the file unfolds its hunks. <kbd>s</kbd> on one stages just that hunk.</div></li>
+            <li><div>To stage only some lines, select them with <kbd>V</kbd> and press <kbd>s</kbd>. <span><kbd>u</kbd> unstages the same way; <kbd>x</kbd> discards, after asking.</span></div></li>
+            <li><div><kbd>c c</kbd>, write the message, <kbd>C-c C-c</kbd>. <span><kbd>C-c C-k</kbd> cancels; <kbd>c a</kbd> amends the last commit.</span></div></li>
+            <li><div><kbd>P p</kbd> pushes, setting the upstream the first time. <span><kbd>F p</kbd> pulls, <kbd>b b</kbd> switches branch, <kbd>l l</kbd> shows the log.</span></div></li>
+          </ol>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it: a pull request</span></div>
+          <ol>
+            <li><div>On a branch, <kbd>SPC g n</kbd> writes a pull request. <span>The title and description start from your commits; <kbd>C-c C-c</kbd> creates it (pushing first if needed).</span></div></li>
+            <li><div><kbd>SPC g p</kbd> lists the repository's pull requests with their checks. <kbd>RET</kbd> opens one.</div></li>
+            <li><div><kbd>d</kbd> reviews its diff. <kbd>c</kbd> comments on a line; <kbd>S</kbd> submits the review as a comment, approval or request for changes.</div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#notes">Next: Notes →</a></div>
+      </section>
+
+      <!-- 06 -->
+      <section class="lesson panel" id="notes">
+        <div class="bar"><span class="label">Lesson / 06</span><span class="label"><i class="dot"></i> 10 minutes</span></div>
+        <div class="intro">
+          <h2>Notes, the org-mode way</h2>
+          <p>Notes are plain Markdown files in <code>~/notes</code>. A heading that starts with <code>TODO</code> is a task; a date like <code>&lt;2026-11-12 Thu&gt;</code> anywhere puts the line on the agenda. That's the whole format, and every other Markdown tool can still read it.</p>
+          <p>Markdown files read like the rendered page outside insert state: the <code>#</code>s and stars hide until you type.</p>
+          <p class="side">Keep them somewhere else with <code>vmac.set_notes_dir("~/Documents/notes")</code> in your config.</p>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div>From any file, <kbd>SPC n c</kbd>, type a task, <kbd>RET</kbd>. <span>It lands in <code>inbox.md</code> as a <code>TODO</code>, and you're back where you were.</span></div></li>
+            <li><div><kbd>SPC n d</kbd> opens today's daily note. Write a heading or two.</div></li>
+            <li><div>On a heading, <kbd>SPC m t</kbd> cycles <code>TODO</code> → <code>DONE</code> → plain. <span>On a <code>- [ ]</code> item it ticks the box.</span></div></li>
+            <li><div><kbd>SPC m d</kbd> inserts a date: type <code>fri</code>, <code>+3</code> or <code>12-24</code>.</div></li>
+            <li><div><kbd>TAB</kbd> on a heading folds its section; <kbd>S-TAB</kbd> folds them all. <span><kbd>M-h</kbd> <kbd>M-l</kbd> promote and demote a heading with its subtree, <kbd>M-k</kbd> <kbd>M-j</kbd> move it.</span></div></li>
+            <li><div><kbd>SPC n a</kbd> opens the agenda: overdue, today, upcoming and open TODOs from every note. <span><kbd>RET</kbd> visits one, <kbd>t</kbd> marks it done.</span></div></li>
+            <li><div><kbd>SPC m l</kbd> inserts a <code>[[link]]</code> to another note; <kbd>RET</kbd> on it follows.</div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#assistant">Next: Assistant →</a></div>
+      </section>
+
+      <!-- 07 -->
+      <section class="lesson panel" id="assistant">
+        <div class="bar"><span class="label">Lesson / 07</span><span class="label"><i class="dot"></i> 10 minutes</span></div>
+        <div class="intro">
+          <h2>Ask, then review</h2>
+          <p>When you're stuck, ask from where you are. vmac drives the real Claude Code, Codex or Gemini CLI over the Agent Client Protocol, in a pane beside your code. It reads your buffers, including unsaved edits, and every change it makes waits for your review.</p>
+          <p>Claude Code is the default; it needs Node (for <code>npx</code>) and your <code>claude</code> login. <kbd>SPC a b</kbd> picks another agent.</p>
+          <p class="side">Start vmac from a plain terminal rather than from inside a Claude Code session; Claude Code won't nest.</p>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div>Select a few confusing lines with <kbd>V</kbd>, then <kbd>SPC a s</kbd>. <span>Your question goes with the file, the line numbers and the code.</span></div></li>
+            <li><div>In a file with errors, <kbd>SPC a e</kbd>. <span>It sends the language server's diagnostics; the question defaults to “Fix these problems.”</span></div></li>
+            <li><div><kbd>SPC a a</kbd> opens the prompt. Type <kbd>@</kbd> to attach another file; <kbd>RET</kbd> in normal state sends.</div></li>
+            <li><div>When it edits, changed lines get a green band. <kbd>]h</kbd> <kbd>[h</kbd> move between changes; <kbd>ga</kbd> accepts one, <kbd>gx</kbd> rejects it.</div></li>
+            <li><div><kbd>SPC a r</kbd> lists every change as a diff. <span><kbd>gc</kbd> comments on a line and <kbd>SPC a S</kbd> asks it to revise by your comments.</span></div></li>
+            <li><div><kbd>SPC a h</kbd> reopens an earlier conversation, including ones from the Claude Code CLI.</div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="#config">Next: Make it yours →</a></div>
+      </section>
+
+      <!-- 08 -->
+      <section class="lesson panel" id="config">
+        <div class="bar"><span class="label">Lesson / 08</span><span class="label"><i class="dot"></i> 20 minutes</span></div>
+        <div class="intro">
+          <h2>Make it yours, in Lua</h2>
+          <p>Everything you've used so far is Lua in <code>lua/core/</code>, and <code>~/.config/vmac/init.lua</code> loads after it, so your config can change any of it. Save the file and vmac reloads, keeping your buffers. If it doesn't load, you see the error and the last working version keeps running.</p>
+          <p>The primitives are in the <code>vmac</code> table; the core's state and functions are in <code>core</code>. <kbd>SPC f P</kbd> opens your config.</p>
+          <p class="side">Try things live first: <kbd>SPC ;</kbd> evaluates a line of Lua, and <code>print</code> shows at the bottom.</p>
+        </div>
+        <div class="code">
+          <div class="bar"><span class="label">Config / Lua</span><span class="label">~/.config/vmac/init.lua</span></div>
+          <pre><span class="c-d">-- A command, and a key for it.</span>
+vmac.<span class="c-f">command</span>(<span class="c-s">"insert-date"</span>, <span class="c-k">function</span>()
+  vmac.<span class="c-f">insert</span>(os.<span class="c-f">date</span>(<span class="c-s">"%Y-%m-%d"</span>))
+<span class="c-k">end</span>)
+vmac.<span class="c-f">map</span>(<span class="c-s">"normal"</span>, <span class="c-s">"SPC i d"</span>, <span class="c-s">"insert-date"</span>)
+
+<span class="c-d">-- A light and a dark theme, following the system.</span>
+vmac.<span class="c-f">set_themes</span>(<span class="c-s">"Catppuccin Latte"</span>, <span class="c-s">"Catppuccin Mocha"</span>)
+
+<span class="c-d">-- Your own modeline: a list of { text, face }.</span>
+vmac.hooks.modeline = <span class="c-k">function</span>()
+  <span class="c-k">return</span> {
+    { core.<span class="c-f">inserting</span>() <span class="c-k">and</span> <span class="c-s">"I"</span> <span class="c-k">or</span> <span class="c-s">"N"</span>, <span class="c-s">"accent"</span> },
+    { vmac.<span class="c-f">buffer_name</span>(), <span class="c-s">"strong"</span> },
+  }
+<span class="c-k">end</span>
+
+<span class="c-d">-- Let the assistant read and search without asking.</span>
+vmac.hooks.agent_permission = <span class="c-k">function</span>(title, kind)
+  <span class="c-k">if</span> kind == <span class="c-s">"read"</span> <span class="c-k">or</span> kind == <span class="c-s">"search"</span> <span class="c-k">then return</span> <span class="c-s">"allow"</span> <span class="c-k">end</span>
+<span class="c-k">end</span></pre>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div>Paste the first block into <code>init.lua</code>, save, and press <kbd>SPC i d</kbd>.</div></li>
+            <li><div><kbd>SPC h t</kbd> previews the 36 built-in themes; <code>:font NAME</code> or <kbd>SPC h F</kbd> picks a font.</div></li>
+            <li><div>Copy the example plugins in and open <kbd>SPC h p</kbd>. <span><code>word-count</code> adds <kbd>SPC t w</kbd>, <code>zen</code> adds <kbd>SPC t z</kbd>.</span></div></li>
+            <li><div><code>:plugin-install URL</code> clones a plugin from git. <span>A plugin is just config in a folder: <code>vmac.command</code> and <code>vmac.map</code>, like <code>init.lua</code>.</span></div></li>
+          </ol>
+        </div>
+        <div class="code">
+          <div class="bar"><span class="label">Terminal</span><span class="label">From a checkout</span></div>
+          <pre><span class="c-d">$</span> cp -r examples/plugins/* ~/.config/vmac/plugins/</pre>
+        </div>
+        <div class="next"><a href="#sessions">Next: Sessions →</a></div>
+      </section>
+
+      <!-- 09 -->
+      <section class="lesson panel" id="sessions">
+        <div class="bar"><span class="label">Lesson / 09</span><span class="label"><i class="dot"></i> 10 minutes</span></div>
+        <div class="intro">
+          <h2>Sessions that keep running</h2>
+          <p>Like tmux, each project opens in a <b>session</b> of its own, with its own buffers, windows, terminals, language servers and agent. Switch between them without one project's files cluttering another's buffer list.</p>
+          <p>Run them in a server and they outlive the window: close it, and terminals, builds and agents carry on until you attach again. On another machine, over ssh, the sessions run beside the files and only the window is here.</p>
+          <p class="side">ssh has to log in without asking, with a key or an agent. vmac installs its server on the other machine the first time.</p>
+        </div>
+        <div class="code">
+          <div class="bar"><span class="label">Terminal</span></div>
+          <pre><span class="c-d">$</span> vmac attach              <span class="c-d"># a window on the server, started if none runs</span>
+<span class="c-d">$</span> vmac attach ~/git/app    <span class="c-d"># ... on that project's session</span>
+<span class="c-d">$</span> vmac ls                  <span class="c-d"># the server's sessions</span>
+<span class="c-d">$</span> vmac connect me@devbox   <span class="c-d"># the same, on another machine</span></pre>
+        </div>
+        <div class="try">
+          <div class="bar"><span class="label">Try it</span></div>
+          <ol>
+            <li><div><kbd>SPC p p</kbd> and pick a second project. <span>It opens in a new session; the modeline starts with its name.</span></div></li>
+            <li><div><kbd>SPC S s</kbd> switches session; <kbd>SPC S l</kbd> goes back to the last one.</div></li>
+            <li><div>Start <code>vmac attach</code>, run something long in <kbd>SPC o t</kbd>, then <code>:q</code>. <span>Attach again and it's still running, where you left it.</span></div></li>
+            <li><div><kbd>SPC S c</kbd> adds another machine's sessions to this window. <span>What you yank there lands on this machine's clipboard.</span></div></li>
+          </ol>
+        </div>
+        <div class="next"><a href="https://github.com/Super-Yojan/vmac#readme">Everything else, in the README ↗</a></div>
+      </section>
+
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="foot">
+    <div class="mark"><img src="logo.svg" alt=""><span>VMAC</span></div>
+    <div><span class="label">Links</span><ul><li><a href="https://github.com/Super-Yojan/vmac">GitHub</a></li><li><a href="https://github.com/Super-Yojan/vmac/releases">Releases</a></li></ul></div>
+    <div><span class="label">Learn</span><ul><li><a href="#top">Tutorial</a></li><li><a href="index.html#keys">Keys</a></li></ul></div>
+    <div><span class="label">Extend</span><ul><li><a href="https://github.com/Super-Yojan/vmac/tree/master/examples/plugins">Example plugins</a></li><li><a href="https://github.com/Super-Yojan/vmac#customizing">Customizing</a></li></ul></div>
+    <div><span class="label">Install</span><ul><li><a href="index.html#install">From source</a></li><li><a href="https://github.com/Super-Yojan/vmac#install">Mac app</a></li></ul></div>
+  </div>
+  <div class="legal">
+    <span class="label">MIT or Apache-2.0</span>
+    <span class="label">Made with GPUI</span>
+    <span class="label"></span><span class="label"></span><span class="label"></span>
+    <span class="label">2026</span>
+  </div>
+</footer>
+
+<script>
+  // Mark the lesson in view in the contents rail.
+  const links = new Map([...document.querySelectorAll(".toc a")].map(a => [a.hash.slice(1), a]));
+  const seen = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      for (const a of links.values()) a.classList.remove("on");
+      links.get(e.target.id)?.classList.add("on");
+    }
+  }, { rootMargin: "-30% 0px -60% 0px" });
+  for (const id of links.keys()) seen.observe(document.getElementById(id));
+</script>
+</body>
+</html>
