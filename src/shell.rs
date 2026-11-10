@@ -53,11 +53,48 @@ pub struct Shell {
     modal: bool,
     /// The window a button went down in, while it's held.
     dragging: Option<WindowId>,
+    /// A window border being dragged, and the size of the last frame's
+    /// window area (its width and the windows' height), which the border's
+    /// place is a fraction of.
+    resizing: Option<(WindowId, crate::frame::Border)>,
+    area_size: (f32, f32),
     /// Wheel movement short of a whole line, kept for the next event.
     wheel: f32,
     /// This machine's clipboard as last told to (or set from) a server on
     /// another machine.
     clipboard_told: Option<String>,
+}
+
+/// A border between two windows that the mouse can drag: the window whose
+/// right or bottom edge it is, which edge, and where it's drawn (from its
+/// top or left end, and how long it is).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BorderHit {
+    window: WindowId,
+    border: crate::frame::Border,
+    x: f32,
+    y: f32,
+    len: f32,
+}
+
+/// How far either side of a border the mouse grabs it.
+const BORDER_GRAB: f32 = 3.;
+
+/// The borders between windows: a window's right edge where another
+/// window starts beside it, its bottom edge where one starts below it.
+fn borders(hits: &[WindowHit]) -> Vec<BorderHit> {
+    use crate::frame::Border;
+    let near = |a: f32, b: f32| (a - b).abs() < 1.;
+    let mut out = Vec::new();
+    for h in hits {
+        if hits.iter().any(|g| near(g.left, h.right) && g.top < h.bottom && g.bottom > h.top) {
+            out.push(BorderHit { window: h.id, border: Border::Right, x: h.right, y: h.top, len: h.bottom - h.top });
+        }
+        if hits.iter().any(|g| near(g.top, h.bottom) && g.left < h.right && g.right > h.left) {
+            out.push(BorderHit { window: h.id, border: Border::Bottom, x: h.left, y: h.bottom, len: h.right - h.left });
+        }
+    }
+    out
 }
 
 /// A window as last drawn: its area in pixels and where each line is.
@@ -179,6 +216,8 @@ impl Shell {
             hits: Vec::new(),
             modal: false,
             dragging: None,
+            resizing: None,
+            area_size: (1., 1.),
             wheel: 0.,
             clipboard_told: None,
         }
@@ -340,7 +379,27 @@ impl Shell {
         self.send(Input::MouseDown { window: hit.id, button, line, col, ch, clicks: event.click_count, mods }, cx);
     }
 
+    /// A border handle pressed: dragging it resizes the windows either side.
+    fn start_resize(&mut self, hit: BorderHit, cx: &mut Context<Self>) {
+        self.resizing = Some((hit.window, hit.border));
+        self.dragging = None;
+        cx.stop_propagation();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((window, border)) = self.resizing {
+            if event.pressed_button.is_none() {
+                self.resizing = None;
+                return;
+            }
+            let (x, y): (f32, f32) = (event.position.x.into(), event.position.y.into());
+            let to = match border {
+                crate::frame::Border::Right => x / self.area_size.0,
+                crate::frame::Border::Bottom => y / self.area_size.1,
+            };
+            self.send(Input::Resize { window, border, to: to.clamp(0., 1.) }, cx);
+            return;
+        }
         let Some(id) = self.dragging else { return };
         if event.pressed_button.is_none() {
             self.dragging = None;
@@ -353,6 +412,9 @@ impl Shell {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.resizing.take().is_some() {
+            return;
+        }
         let Some(id) = self.dragging.take() else { return };
         let Some(hit) = self.hits.iter().find(|h| h.id == id) else {
             self.session.handle(Input::MouseLost);
@@ -1055,6 +1117,30 @@ impl Render for Shell {
         let bar = frame.bar;
 
         self.hits = frame.windows.iter().map(WindowHit::of).collect();
+        self.area_size = (width.max(1.), area.max(1.));
+        // Grab handles on the borders between windows, over them, with the
+        // resize cursor (none while a prompt or the picker has the screen).
+        let handles: Vec<_> = if frame.modal { Vec::new() } else { borders(&self.hits) }
+            .into_iter()
+            .map(|b| {
+                let handle = div().absolute().occlude();
+                let handle = match b.border {
+                    crate::frame::Border::Right => handle
+                        .left(px(b.x - BORDER_GRAB))
+                        .top(px(b.y))
+                        .w(px(2. * BORDER_GRAB))
+                        .h(px(b.len))
+                        .cursor_col_resize(),
+                    crate::frame::Border::Bottom => handle
+                        .left(px(b.x))
+                        .top(px(b.y - BORDER_GRAB))
+                        .w(px(b.len))
+                        .h(px(2. * BORDER_GRAB))
+                        .cursor_row_resize(),
+                };
+                handle.on_mouse_down(MouseButton::Left, cx.listener(move |shell, _, _, cx| shell.start_resize(b, cx)))
+            })
+            .collect();
         self.modal = frame.modal;
         let live: std::collections::HashSet<_> = frame.buffers.iter().copied().collect();
         self.md_views.retain(|id, _| live.contains(id));
@@ -1376,7 +1462,7 @@ impl Render for Shell {
             .font_family(font.unwrap_or_else(|| theme.mono_font_family.clone()))
             .text_size(px(FONT_SIZE))
             .line_height(px(ROW_HEIGHT))
-            .child(div().relative().w_full().h(px(area)).children(windows).children(preview))
+            .child(div().relative().w_full().h(px(area)).children(windows).children(preview).children(handles))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
             .children(whichkey)
             .children(hover)
@@ -1394,6 +1480,19 @@ mod tests {
         let mut k = Keystroke::parse(s).unwrap();
         k.key_char = key_char.map(Into::into);
         k
+    }
+
+    #[test]
+    fn borders_are_found_between_windows_not_at_the_edges() {
+        use crate::frame::Border;
+        let hit = |id, left, top, right, bottom| WindowHit { id, left, top, right, bottom, ..Default::default() };
+        // A | (B over C), in an 800 x 600 area.
+        let hits = [hit(1, 0., 0., 400., 600.), hit(2, 400., 0., 800., 300.), hit(3, 400., 300., 800., 600.)];
+        let found = borders(&hits);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.contains(&BorderHit { window: 1, border: Border::Right, x: 400., y: 0., len: 600. }));
+        assert!(found.contains(&BorderHit { window: 2, border: Border::Bottom, x: 400., y: 300., len: 400. }));
+        assert!(borders(&hits[..1]).is_empty(), "one window: no borders");
     }
 
     #[test]

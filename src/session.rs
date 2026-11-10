@@ -20,6 +20,10 @@ pub struct Session {
     /// Windows the last frame left for the window to draw itself (rendered
     /// Markdown, the review), where a click only selects the window.
     custom: HashSet<WindowId>,
+    /// The sidebar's width in points (dragging its edge changes it), and
+    /// the width of the last frame.
+    sidebar_px: f32,
+    width: f32,
 }
 
 /// A button held down: in a window's text (dragging selects), or reported
@@ -35,7 +39,15 @@ struct Drag {
 
 impl Session {
     pub fn new(editor: Editor, lisp: Lisp) -> Self {
-        Self { editor, lisp, syntax: Syntax::default(), drag: None, custom: HashSet::new() }
+        Self {
+            editor,
+            lisp,
+            syntax: Syntax::default(),
+            drag: None,
+            custom: HashSet::new(),
+            sidebar_px: SIDEBAR_WIDTH,
+            width: 1.,
+        }
     }
 
     pub fn quit_requested(&self) -> bool {
@@ -98,6 +110,21 @@ impl Session {
                 st.terminal_mouse(buffer, crate::terminal::MouseAction::Release(button), line, col, mouse_mods(mods));
             }
             Input::MouseLost => self.drag = None,
+            Input::Resize { window, border, to } => {
+                self.drag = None;
+                let mut st = self.editor.lock();
+                if st.is_sidebar(window) {
+                    if border == crate::frame::Border::Right {
+                        self.sidebar_px = to * self.width;
+                    }
+                    return;
+                }
+                let axis = match border {
+                    crate::frame::Border::Right => crate::editor::Axis::Row,
+                    crate::frame::Border::Bottom => crate::editor::Axis::Column,
+                };
+                st.move_window_border(window, axis, to);
+            }
             Input::Wheel { window, lines, line, col, mods } => {
                 let mut st = self.editor.lock();
                 let Some(buffer) = st.window_by_id(window).map(|w| w.buffer) else { return };
@@ -247,7 +274,8 @@ impl Session {
         let syntax = &mut self.syntax;
 
         let mut st = self.editor.lock();
-        st.sidebar_width = (SIDEBAR_WIDTH / width.max(1.)).clamp(0.12, 0.45);
+        self.width = width.max(1.);
+        st.sidebar_width = (self.sidebar_px / self.width).clamp(0.08, 0.6);
         let rects = st.window_rects();
         for (id, r) in &rects {
             st.fit_window(*id, window_rows(r, area));
@@ -900,6 +928,28 @@ mod tests {
             Content::Text(lines) => lines,
             other => panic!("not text: {other:?}"),
         }
+    }
+
+    #[test]
+    fn dragging_a_border_resizes_the_windows_and_the_sidebar() {
+        use crate::frame::Border;
+        let mut s = session_with("a");
+        let width_of = |frame: &Frame, id| frame.windows.iter().find(|w| w.id == id).unwrap().width;
+        let left = s.editor.lock().selected_window();
+        s.editor.lock().split_window(crate::editor::Axis::Row);
+        let frame = s.frame(VIEW);
+        assert!((width_of(&frame, left) - 400.).abs() < 1.);
+        s.handle(Input::Resize { window: left, border: Border::Right, to: 0.3 });
+        let frame = s.frame(VIEW);
+        assert!((width_of(&frame, left) - 240.).abs() < 1., "{}", width_of(&frame, left));
+        // The sidebar's edge sets its width, in points.
+        let tree = s.editor.lock().add_buffer(Buffer::new("*tree*"));
+        s.editor.lock().open_sidebar(tree);
+        let side = s.editor.lock().selected_window();
+        s.frame(VIEW);
+        s.handle(Input::Resize { window: side, border: Border::Right, to: 0.4 });
+        let frame = s.frame(VIEW);
+        assert!((width_of(&frame, side) - 320.).abs() < 1., "{}", width_of(&frame, side));
     }
 
     #[test]

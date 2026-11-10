@@ -1028,6 +1028,9 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
     prim!(reg, editor, "delete-window", |s| s.close_window());
     prim!(reg, editor, "delete-other-windows", |s| s.only_window());
+    // Every window the same size as its neighbours (dragging a border with
+    // the mouse sizes them otherwise).
+    prim!(reg, editor, "balance-windows", |s| s.balance_windows());
     prim!(reg, editor, "window-count", |s| s.window_count() as isize);
     prim!(reg, editor, "window-height", |s| s.window().rows.max(1) as isize);
     prim!(reg, editor, "window-top-line", |s| s.window().scroll_top as isize);

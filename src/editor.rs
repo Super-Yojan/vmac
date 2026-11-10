@@ -192,11 +192,18 @@ pub enum Axis {
     Column,
 }
 
+/// Windows, or splits of them: the children of a split, side by side or
+/// stacked, each with its share of the split's space (dragging a border
+/// moves space between two neighbours).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Layout {
     Leaf(WindowId),
-    Split(Axis, Vec<Layout>),
+    Split(Axis, Vec<Layout>, Vec<f32>),
 }
+
+/// The smallest share of the editing area a border can be dragged to leave
+/// a window.
+const MIN_SHARE: f32 = 0.05;
 
 /// A window's place, as fractions of the editing area.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -211,20 +218,44 @@ impl Layout {
     fn leaves(&self, out: &mut Vec<WindowId>) {
         match self {
             Layout::Leaf(id) => out.push(*id),
-            Layout::Split(_, children) => children.iter().for_each(|c| c.leaves(out)),
+            Layout::Split(_, children, _) => children.iter().for_each(|c| c.leaves(out)),
         }
+    }
+
+    fn contains(&self, target: WindowId) -> bool {
+        match self {
+            Layout::Leaf(id) => *id == target,
+            Layout::Split(_, children, _) => children.iter().any(|c| c.contains(target)),
+        }
+    }
+
+    /// Each child's span along the split's axis: where it starts and how long
+    /// it is, within `start..start + len`.
+    fn spans(shares: &[f32], start: f32, len: f32) -> Vec<(f32, f32)> {
+        let total: f32 = shares.iter().sum::<f32>().max(f32::EPSILON);
+        let mut at = start;
+        shares
+            .iter()
+            .map(|s| {
+                let span = (at, len * s / total);
+                at += span.1;
+                span
+            })
+            .collect()
     }
 
     fn rects(&self, r: Rect, out: &mut Vec<(WindowId, Rect)>) {
         match self {
             Layout::Leaf(id) => out.push((*id, r)),
-            Layout::Split(axis, children) => {
-                let n = children.len() as f32;
-                for (i, c) in children.iter().enumerate() {
-                    let i = i as f32;
+            Layout::Split(axis, children, shares) => {
+                let (start, len) = match axis {
+                    Axis::Row => (r.x, r.w),
+                    Axis::Column => (r.y, r.h),
+                };
+                for (c, (at, span)) in children.iter().zip(Self::spans(shares, start, len)) {
                     let part = match axis {
-                        Axis::Row => Rect { x: r.x + r.w * i / n, w: r.w / n, ..r },
-                        Axis::Column => Rect { y: r.y + r.h * i / n, h: r.h / n, ..r },
+                        Axis::Row => Rect { x: at, w: span, ..r },
+                        Axis::Column => Rect { y: at, h: span, ..r },
                     };
                     c.rects(part, out);
                 }
@@ -232,19 +263,22 @@ impl Layout {
         }
     }
 
-    /// Puts `new` beside `target`, after it along `axis`.
+    /// Puts `new` beside `target`, after it along `axis`; the two share what
+    /// `target` had.
     fn split(&mut self, target: WindowId, new: WindowId, axis: Axis) -> bool {
         match self {
             Layout::Leaf(id) if *id == target => {
-                *self = Layout::Split(axis, vec![Layout::Leaf(target), Layout::Leaf(new)]);
+                *self = Layout::Split(axis, vec![Layout::Leaf(target), Layout::Leaf(new)], vec![1., 1.]);
                 true
             }
             Layout::Leaf(_) => false,
-            Layout::Split(a, children) => {
+            Layout::Split(a, children, shares) => {
                 if *a == axis
                     && let Some(i) = children.iter().position(|c| *c == Layout::Leaf(target))
                 {
                     children.insert(i + 1, Layout::Leaf(new));
+                    shares[i] /= 2.;
+                    shares.insert(i + 1, shares[i]);
                     return true;
                 }
                 children.iter_mut().any(|c| c.split(target, new, axis))
@@ -254,12 +288,56 @@ impl Layout {
 
     /// Removes a window; a split left with one child becomes that child.
     fn remove(&mut self, target: WindowId) {
-        if let Layout::Split(_, children) = self {
-            children.retain(|c| *c != Layout::Leaf(target));
+        if let Layout::Split(_, children, shares) = self {
+            if let Some(i) = children.iter().position(|c| *c == Layout::Leaf(target)) {
+                children.remove(i);
+                shares.remove(i);
+            }
             children.iter_mut().for_each(|c| c.remove(target));
             if children.len() == 1 {
                 *self = children.remove(0);
             }
+        }
+    }
+
+    /// Moves the border after `target` along `axis` (its right edge for
+    /// `Row`, its bottom for `Column`) to `to`, a fraction of the editing
+    /// area, between the two windows it divides. The border is the one of
+    /// the innermost split along `axis` where `target` isn't in the last
+    /// child; false when there's none (the edge of the area).
+    fn move_border(&mut self, target: WindowId, axis: Axis, to: f32, r: Rect) -> bool {
+        let Layout::Split(a, children, shares) = self else { return false };
+        let (start, len) = match a {
+            Axis::Row => (r.x, r.w),
+            Axis::Column => (r.y, r.h),
+        };
+        let spans = Self::spans(shares, start, len);
+        let Some(i) = children.iter().position(|c| c.contains(target)) else { return false };
+        let part = match a {
+            Axis::Row => Rect { x: spans[i].0, w: spans[i].1, ..r },
+            Axis::Column => Rect { y: spans[i].0, h: spans[i].1, ..r },
+        };
+        if children[i].move_border(target, axis, to, part) {
+            return true;
+        }
+        if *a != axis || i + 1 >= children.len() {
+            return false;
+        }
+        // Space moves between child i and the next; together they keep theirs.
+        let (from, pair) = (spans[i].0, spans[i].1 + spans[i + 1].1);
+        let min = MIN_SHARE.min(pair / 3.);
+        let first = (to - from).clamp(min, pair - min);
+        let both = shares[i] + shares[i + 1];
+        shares[i] = both * first / pair;
+        shares[i + 1] = both - shares[i];
+        true
+    }
+
+    /// Every split's children back to equal shares.
+    fn balance(&mut self) {
+        if let Layout::Split(_, children, shares) = self {
+            shares.iter_mut().for_each(|s| *s = 1.);
+            children.iter_mut().for_each(Layout::balance);
         }
     }
 }
@@ -1060,17 +1138,32 @@ impl EditorState {
     /// the rest.
     pub fn window_rects(&self) -> Vec<(WindowId, Rect)> {
         let mut out = Vec::new();
-        let left = match self.sidebar {
-            Some(id) => {
-                out.push((id, Rect { x: 0., y: 0., w: self.sidebar_width, h: 1. }));
-                self.sidebar_width
-            }
-            None => 0.,
-        };
-        // The Markdown preview takes the right side.
-        let right = if self.preview_buffer().is_some() { PREVIEW_WIDTH } else { 0. };
-        self.layout.rects(Rect { x: left, y: 0., w: 1. - left - right, h: 1. }, &mut out);
+        if let Some(id) = self.sidebar {
+            out.push((id, Rect { x: 0., y: 0., w: self.sidebar_width, h: 1. }));
+        }
+        self.layout.rects(self.layout_area(), &mut out);
         out
+    }
+
+    /// The area the split layout fills: right of the sidebar, left of the
+    /// Markdown preview.
+    fn layout_area(&self) -> Rect {
+        let left = if self.sidebar.is_some() { self.sidebar_width } else { 0. };
+        let right = if self.preview_buffer().is_some() { PREVIEW_WIDTH } else { 0. };
+        Rect { x: left, y: 0., w: 1. - left - right, h: 1. }
+    }
+
+    /// Drags a window's right edge (`Row`) or bottom edge (`Column`) to `to`,
+    /// a fraction of the editing area's width or height. False when that
+    /// edge isn't between two windows.
+    pub fn move_window_border(&mut self, window: WindowId, axis: Axis, to: f32) -> bool {
+        let area = self.layout_area();
+        self.layout.move_border(window, axis, to, area)
+    }
+
+    /// C-w =: every window in the layout the same size as its neighbours.
+    pub fn balance_windows(&mut self) {
+        self.layout.balance();
     }
 
     /// The Markdown file the preview shows: the selected window's, else the
@@ -3756,6 +3849,50 @@ mod tests {
         assert_eq!(s.buffer().name(), "a");
         s.kill_buffer(true).unwrap();
         assert_eq!(s.buffer_names(), vec!["*scratch*"]);
+    }
+
+    #[test]
+    fn borders_move_between_neighbours_and_balance_back() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let rect = |s: &EditorState, id: WindowId| s.window_rects().into_iter().find(|(w, _)| *w == id).unwrap().1;
+        let mut s = state("x");
+        let a = s.selected_window();
+        s.split_window(Axis::Row);
+        let b = s.selected_window();
+        s.split_window(Axis::Column);
+        let c = s.selected_window();
+        // A | (B over C); splitting halves the window split.
+        assert!(close(rect(&s, a).w, 0.5) && close(rect(&s, b).h, 0.5) && close(rect(&s, c).y, 0.5));
+        // A's right edge, dragged to 0.3: B and C both get wider.
+        assert!(s.move_window_border(a, Axis::Row, 0.3));
+        assert!(close(rect(&s, a).w, 0.3) && close(rect(&s, b).x, 0.3) && close(rect(&s, c).w, 0.7));
+        // B's right edge is the area's: nothing to drag. B's bottom moves within its column.
+        assert!(!s.move_window_border(b, Axis::Row, 0.8));
+        assert!(s.move_window_border(b, Axis::Column, 0.75));
+        assert!(close(rect(&s, b).h, 0.75) && close(rect(&s, c).y, 0.75) && close(rect(&s, a).h, 1.));
+        // C's right edge is the area's too, and so is its bottom.
+        assert!(!s.move_window_border(c, Axis::Row, 0.5) && !s.move_window_border(c, Axis::Column, 0.9));
+        // Dragged past a neighbour: it keeps a sliver.
+        assert!(s.move_window_border(a, Axis::Row, 0.99));
+        assert!(close(rect(&s, b).w, MIN_SHARE));
+        // Closing C gives its space to B; C-w = evens the rest.
+        s.select_window(c);
+        assert!(s.close_window());
+        assert!(close(rect(&s, b).h, 1.));
+        s.balance_windows();
+        assert!(close(rect(&s, a).w, 0.5) && close(rect(&s, b).w, 0.5));
+    }
+
+    #[test]
+    fn splitting_a_row_halves_the_window_split() {
+        let mut s = state("x");
+        let a = s.selected_window();
+        s.split_window(Axis::Row);
+        let b = s.selected_window();
+        s.split_window(Axis::Row);
+        let widths: Vec<f32> = s.window_rects().iter().map(|(_, r)| r.w).collect();
+        assert_eq!(widths, [0.5, 0.25, 0.25], "as Vim does: the split window halves");
+        assert_eq!(s.window_order()[..2], [a, b]);
     }
 
     #[test]

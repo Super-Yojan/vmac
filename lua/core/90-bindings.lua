@@ -110,6 +110,7 @@ bind(K.normal, {
   { "C-w C-k", "window-up" }, { "C-w C-l", "window-right" },
   { "C-w w", "window-next" }, { "C-w C-w", "window-next" }, { "C-w W", "window-previous" },
   { "C-w c", "window-close" }, { "C-w q", "quit-window" }, { "C-w o", "window-only" },
+  { "C-w =", "window-balance" }, { "SPC w =", "window-balance" },
   { "SPC w v", "split-right" }, { "SPC w s", "split-below" },
   { "SPC w h", "window-left" }, { "SPC w j", "window-down" },
   { "SPC w k", "window-up" }, { "SPC w l", "window-right" },

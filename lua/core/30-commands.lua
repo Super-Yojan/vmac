@@ -292,6 +292,9 @@ V.command("window-close", function()
   if not V.delete_window() then V.message("Can't close the last window") end
 end)
 V.command("window-only", function() V.delete_other_windows() end)
+-- Drag a border between windows with the mouse to size them; C-w = (or
+-- SPC w =) makes them all the same size again.
+V.command("window-balance", function() V.balance_windows() end)
 
 -- :q closes the window, and quits from the last one.
 V.command("quit-window", function()

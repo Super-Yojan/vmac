@@ -50,6 +50,10 @@ pub enum Input {
     MouseUp { window: WindowId, line: usize, col: usize, mods: Mods },
     /// The button came up somewhere the window didn't see: the drag is over.
     MouseLost,
+    /// A window's border dragged to `to`: its right edge to that fraction
+    /// of the width, or its bottom edge to that fraction of the windows'
+    /// height (the sidebar's right edge sizes the sidebar).
+    Resize { window: WindowId, border: Border, to: f32 },
     /// Whole lines of wheel movement over a window (negative: up).
     Wheel { window: WindowId, lines: isize, line: usize, col: usize, mods: Mods },
     /// A click on a row of the review's diff, and its + (a comment on it).
@@ -73,6 +77,13 @@ pub enum Input {
     /// The theme's text and background colors (0xRRGGBB), for terminal
     /// programs that ask.
     TerminalColors { foreground: u32, background: u32 },
+}
+
+/// A window's edge that can be dragged.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Border {
+    Right,
+    Bottom,
 }
 
 /// Everything on screen.
