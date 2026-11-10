@@ -863,8 +863,8 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // vmac.device_key(target, key, text) and vmac.device_button(target,
     // name) (back, home, recents, power, volume-up, volume-down) send them
     // to an Android device or iOS simulator: "" when sent, else why not.
-    pure!(reg, "device-key", |target: String, key: String, text: String| crate::device::send(&target, |d| crate::device::key_command(d, &key, &text)).err().unwrap_or_default());
-    pure!(reg, "device-button", |target: String, name: String| crate::device::send(&target, |d| crate::device::button_command(d, &name)).err().unwrap_or_default());
+    pure!(reg, "device-key", |target: String, key: String, text: String| crate::device::key(&target, &key, &text).err().unwrap_or_default());
+    pure!(reg, "device-button", |target: String, name: String| crate::device::button(&target, &name).err().unwrap_or_default());
     // vmac.on_path(command): whether the command is on PATH.
     pure!(reg, "on-path?", |command: String| crate::packages::on_path(&command));
     // The fuzzy picker. Lua opens it and decides what picking does.

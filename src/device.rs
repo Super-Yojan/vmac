@@ -10,6 +10,13 @@
 //! through a shell kept open per device, so each command doesn't wait for
 //! one to start: `adb shell` running `input tap`, `input swipe`, `input
 //! keyevent` and `input text`, or a local one running `idb ui ...`.
+//!
+//! An emulator takes input through its own control channels instead, where
+//! `input` takes a quarter of a second to start: touches and text through
+//! its console (a TCP socket on its port, 5554 for emulator-5554), in a
+//! couple of milliseconds, the touch going down, moving and coming up as
+//! the mouse does; keys and buttons through its gRPC service (the console's
+//! `event send` is taken and dropped), a unary call sent with curl.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -60,9 +67,18 @@ pub fn resolve(target: &str) -> Option<String> {
     if let Some(serial) = cache.lock().ok()?.get(target).filter(|s| ready.contains(s)).cloned() {
         return Some(serial);
     }
-    let serial = ready.into_iter().filter(|s| s.starts_with("emulator-")).find(|s| {
-        adb_output(&["-s", s, "emu", "avd", "name"]).is_some_and(|o| o.lines().next().map(str::trim) == Some(avd))
-    })?;
+    // The emulator's own file says which console port it has; else ask
+    // each running emulator its name over its console.
+    let listed = discovery_files().iter().find_map(|ini| {
+        let port = ini_value(ini, "port.serial")?;
+        (ini_value(ini, "avd.id")? == avd).then(|| format!("emulator-{port}"))
+    });
+    let serial = match listed.filter(|s| ready.contains(s)) {
+        Some(serial) => serial,
+        None => ready.into_iter().filter(|s| s.starts_with("emulator-")).find(|s| {
+            adb_output(&["-s", s, "emu", "avd", "name"]).is_some_and(|o| o.lines().next().map(str::trim) == Some(avd))
+        })?,
+    };
     cache.lock().ok()?.insert(target.to_string(), serial.clone());
     Some(serial)
 }
@@ -271,6 +287,279 @@ pub fn button_command(device: &Device, button: &str) -> Result<String, String> {
     }
 }
 
+// ---- The emulator console
+
+/// An emulator's console port: its serial's number.
+fn console_port(serial: &str) -> Option<u16> {
+    serial.strip_prefix("emulator-")?.parse().ok()
+}
+
+static CONSOLES: OnceLock<Mutex<HashMap<String, std::io::BufReader<std::net::TcpStream>>>> = OnceLock::new();
+
+/// Reads the console's answer: true for OK, false for KO (or nothing).
+fn console_reply(reader: &mut std::io::BufReader<std::net::TcpStream>) -> std::io::Result<bool> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let line = line.trim();
+        if line == "OK" {
+            return Ok(true);
+        }
+        if line.starts_with("KO") {
+            return Ok(false);
+        }
+    }
+}
+
+/// Connects to an emulator's console, signed in with the token the
+/// emulator keeps in ~/.emulator_console_auth_token.
+fn console_connect(port: u16) -> std::io::Result<std::io::BufReader<std::net::TcpStream>> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let stream = std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+    stream.set_nodelay(true)?;
+    let mut reader = std::io::BufReader::new(stream);
+    console_reply(&mut reader)?;
+    let token = std::env::var_os("HOME")
+        .and_then(|h| std::fs::read_to_string(std::path::PathBuf::from(h).join(".emulator_console_auth_token")).ok())
+        .unwrap_or_default();
+    if !token.trim().is_empty() {
+        writeln!(reader.get_mut(), "auth {}", token.trim())?;
+        if !console_reply(&mut reader)? {
+            return Err(std::io::Error::other("the console didn't take the token"));
+        }
+    }
+    Ok(reader)
+}
+
+/// Sends console commands to an emulator: false when it has no console,
+/// it can't be reached, or a command is refused.
+pub fn console_send(serial: &str, commands: &[String]) -> bool {
+    let Some(port) = console_port(serial) else { return false };
+    let Ok(mut consoles) = CONSOLES.get_or_init(Default::default).lock() else { return false };
+    for _ in 0..2 {
+        if !consoles.contains_key(serial) {
+            match console_connect(port) {
+                Ok(reader) => consoles.insert(serial.to_string(), reader),
+                Err(_) => return false,
+            };
+        }
+        let Some(reader) = consoles.get_mut(serial) else { return false };
+        let sent = commands.iter().try_fold(true, |ok, c| {
+            writeln!(reader.get_mut(), "{c}")?;
+            Ok::<_, std::io::Error>(ok && console_reply(reader)?)
+        });
+        match sent {
+            Ok(ok) => return ok,
+            // A console that went away (the emulator restarted): once more.
+            Err(_) => consoles.remove(serial),
+        };
+    }
+    false
+}
+
+/// Text typed into an emulator, as a console command: plain ASCII only
+/// (anything else goes through input).
+fn console_text_command(text: &str) -> Option<String> {
+    (!text.is_empty() && text.chars().all(|c| c.is_ascii_graphic() || c == ' ')).then(|| format!("event text {text}"))
+}
+
+/// The Linux key code an emulator's keyboard (qwerty2) maps to a key or
+/// button: 102 is its home button, not KEY_HOMEPAGE.
+fn evdev_code(name: &str) -> Option<u32> {
+    Some(match name {
+        "RET" => 28,
+        "DEL" => 14,
+        "TAB" => 15,
+        "<up>" => 103,
+        "<left>" => 105,
+        "<right>" => 106,
+        "<down>" => 108,
+        "<delete>" => 111,
+        "back" => 158,
+        "home" => 102,
+        "recents" => 580,
+        "power" => 116,
+        "volume-up" => 115,
+        "volume-down" => 114,
+        _ => return None,
+    })
+}
+
+/// The files running emulators write about themselves (avd/running/
+/// pid_N.ini): their AVD, ports and gRPC token.
+fn discovery_files() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return Vec::new() };
+    let mut dirs = vec![home.join("Library/Caches/TemporaryItems/avd/running")];
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        dirs.push(std::path::PathBuf::from(runtime).join("avd/running"));
+    }
+    if let Some(user) = std::env::var_os("USER") {
+        dirs.push(std::env::temp_dir().join(format!("android-{}", user.to_string_lossy())).join("avd/running"));
+    }
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".ini"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect()
+}
+
+fn ini_value<'a>(ini: &'a str, key: &str) -> Option<&'a str> {
+    ini.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::trim))
+}
+
+/// Where a running emulator's gRPC service is, and its token, found by its
+/// console port.
+fn grpc_endpoint(serial: &str) -> Option<(u16, String)> {
+    let console = console_port(serial)?;
+    discovery_files().iter().find_map(|ini| parse_discovery(ini, console))
+}
+
+fn parse_discovery(ini: &str, console: u16) -> Option<(u16, String)> {
+    if ini_value(ini, "port.serial")?.parse::<u16>().ok()? != console {
+        return None;
+    }
+    Some((ini_value(ini, "grpc.port")?.parse().ok()?, ini_value(ini, "grpc.token").unwrap_or_default().to_string()))
+}
+
+/// A KeyboardEvent (emulator_controller.proto) pressing a key by its Linux
+/// code, framed as a gRPC message.
+fn key_press_message(code: u32) -> Vec<u8> {
+    // codeType = Evdev (1), eventType = keypress (2), keyCode.
+    let mut msg = vec![0x08, 0x01, 0x10, 0x02, 0x18];
+    let mut n = code;
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        msg.push(if n == 0 { byte } else { byte | 0x80 });
+        if n == 0 {
+            break;
+        }
+    }
+    let mut framed = vec![0];
+    framed.extend((msg.len() as u32).to_be_bytes());
+    framed.extend(msg);
+    framed
+}
+
+/// Presses a key on an emulator through its gRPC service: false when it
+/// has none, or the call fails.
+fn grpc_key(serial: &str, code: u32) -> bool {
+    use std::io::Read as _;
+    let Some((port, token)) = grpc_endpoint(serial) else { return false };
+    // The token goes in a file of our own rather than where ps shows it.
+    let header = std::env::temp_dir().join(format!("vmac-emulator-{port}.header"));
+    let written = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&header)
+            .and_then(|mut f| f.write_all(format!("authorization: Bearer {token}\n").as_bytes()))
+    };
+    if written.is_err() {
+        return false;
+    }
+    let url = format!("http://127.0.0.1:{port}/android.emulation.control.EmulatorController/sendKey");
+    let child = Command::new("curl")
+        .args(["-s", "-m", "2", "--http2-prior-knowledge", "-X", "POST", "-H", "content-type: application/grpc", "-H", "te: trailers"])
+        .args(["-H", &format!("@{}", header.display()), "--data-binary", "@-", "-D", "-", "-o", "/dev/null", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&key_press_message(code));
+    }
+    let mut headers = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut headers);
+    }
+    let _ = child.wait();
+    headers.lines().any(|l| l.trim().eq_ignore_ascii_case("grpc-status: 0"))
+}
+
+/// A touch on an emulator's screen, in its pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Touch {
+    Down,
+    Move,
+    Up,
+}
+
+fn touch_command(touch: Touch, (x, y): (f32, f32)) -> String {
+    let pressed = if touch == Touch::Up { 0 } else { 1 };
+    format!("event mouse {} {} 0 {pressed}", x as i32, y as i32)
+}
+
+/// Touches an emulator's screen through its console, as the mouse moves:
+/// false for a device without one (then a gesture goes on mouse up).
+pub fn touch(device: &Device, touch: Touch, at: (f32, f32)) -> bool {
+    match device {
+        Device::Android(serial) => console_send(serial, &[touch_command(touch, at)]),
+        Device::Ios(_) => false,
+    }
+}
+
+/// A swipe for the wheel on an emulator, through its console: down in the
+/// middle, along `reach` in a few steps over a tenth of a second, up.
+fn console_wheel(serial: &str, (w, h): (u32, u32), reach: f32) -> bool {
+    if console_port(serial).is_none() {
+        return false;
+    }
+    let (x, y) = (w as f32 / 2., h as f32 / 2.);
+    let serial = serial.to_string();
+    std::thread::spawn(move || {
+        const STEPS: usize = 6;
+        console_send(&serial, &[touch_command(Touch::Down, (x, y))]);
+        for i in 1..=STEPS {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            console_send(&serial, &[touch_command(Touch::Move, (x, y + reach * i as f32 / STEPS as f32))]);
+        }
+        console_send(&serial, &[touch_command(Touch::Up, (x, y + reach))]);
+    });
+    true
+}
+
+/// Scrolls by `reach` (input units, down positive): through the console on
+/// an emulator, else as a swipe.
+pub fn wheel(target: &str, device: &Device, size: (u32, u32), reach: f32) -> bool {
+    match device {
+        Device::Android(serial) if console_wheel(serial, size, reach) => true,
+        _ => shell_send(target, &wheel_command(device, size, reach)),
+    }
+}
+
+/// Types a key into the device: on an emulator, a key through gRPC and
+/// text through the console; else through its shell.
+pub fn key(target: &str, key: &str, text: &str) -> Result<(), String> {
+    if let Some(Device::Android(serial)) = locate(target) {
+        let fast = match evdev_code(key) {
+            Some(code) => grpc_key(&serial, code),
+            None => console_text_command(text).is_some_and(|c| console_send(&serial, &[c])),
+        };
+        if fast {
+            return Ok(());
+        }
+    }
+    send(target, |d| key_command(d, key, text))
+}
+
+/// Presses a button: on an emulator through gRPC, else the device's shell.
+pub fn button(target: &str, name: &str) -> Result<(), String> {
+    if let Some(Device::Android(serial)) = locate(target)
+        && let Some(code) = evdev_code(name)
+        && grpc_key(&serial, code)
+    {
+        return Ok(());
+    }
+    send(target, |d| button_command(d, name))
+}
+
 /// Sends a key or a button, saying why not when it can't.
 pub fn send(target: &str, command: impl FnOnce(&Device) -> Result<String, String>) -> Result<(), String> {
     let device = locate(target).ok_or("the device isn't connected")?;
@@ -348,7 +637,7 @@ mod view {
     use crate::frame::WindowId;
     use gpui_kit::component::ActiveTheme as _;
     use gpui_kit::{
-        Bounds, Context, DispatchPhase, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _,
+        Bounds, Context, DispatchPhase, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
         Pixels, Render, RenderImage, ScrollWheelEvent, Styled as _, Window, canvas, div, img, px,
     };
     use std::cell::Cell;
@@ -493,6 +782,10 @@ mod view {
     struct Pointer {
         bounds: Cell<Option<Bounds<Pixels>>>,
         pressed: Cell<Option<((f32, f32), Instant)>>,
+        /// The press went down on the device itself (an emulator's
+        /// console): moves and the release follow it there.
+        live: Cell<bool>,
+        moved: Cell<Option<Instant>>,
         wheel: Cell<f32>,
         wheel_sent: Cell<Option<Instant>>,
     }
@@ -609,10 +902,26 @@ mod view {
                     x >= x0 && x < x0 + sw && y >= y0 && y < y0 + sh
                 };
                 let down = pointer.clone();
+                let down_device = device.clone();
                 window.on_mouse_event(move |e: &MouseDownEvent, phase, _, _| {
                     if phase == DispatchPhase::Bubble && e.button == MouseButton::Left && on_screen(e.position) {
-                        down.pressed.set(Some((to_device(e.position), Instant::now())));
+                        let at = to_device(e.position);
+                        down.pressed.set(Some((at, Instant::now())));
+                        down.live.set(touch(&down_device, Touch::Down, at));
                     }
+                });
+                let moving = pointer.clone();
+                let move_device = device.clone();
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, _| {
+                    if phase != DispatchPhase::Bubble || !moving.live.get() || moving.pressed.get().is_none() {
+                        return;
+                    }
+                    // A move a frame at most: enough to follow, few enough to keep up.
+                    if moving.moved.get().is_some_and(|t| t.elapsed() < Duration::from_millis(8)) {
+                        return;
+                    }
+                    moving.moved.set(Some(Instant::now()));
+                    touch(&move_device, Touch::Move, to_device(e.position));
                 });
                 let up = pointer.clone();
                 let up_serial = serial.clone();
@@ -622,8 +931,12 @@ mod view {
                         return;
                     }
                     if let Some((from, at)) = up.pressed.take() {
+                        let to = to_device(e.position);
+                        if up.live.replace(false) && touch(&up_device, Touch::Up, to) {
+                            return;
+                        }
                         let held = at.elapsed().as_millis() as u64;
-                        shell_send(&up_serial, &gesture_command(&up_device, from, to_device(e.position), held));
+                        shell_send(&up_serial, &gesture_command(&up_device, from, to, held));
                     }
                 });
                 let wheel = pointer.clone();
@@ -634,8 +947,8 @@ mod view {
                     }
                     let dy: f32 = e.delta.pixel_delta(px(20.)).y.into();
                     wheel.wheel.set(wheel.wheel.get() + dy);
-                    // input takes a moment to start: one swipe per 150ms, the
-                    // wheel added up meanwhile.
+                    // A swipe takes a moment: one per 150ms, the wheel added
+                    // up meanwhile.
                     if wheel.wheel_sent.get().is_some_and(|t| t.elapsed() < Duration::from_millis(150)) {
                         return;
                     }
@@ -647,7 +960,7 @@ mod view {
                     wheel.wheel_sent.set(Some(Instant::now()));
                     // Content follows the fingers: the wheel's pixels, on the device's scale.
                     let reach = (total * dh as f32 / sh).clamp(-(dh as f32) * 0.4, dh as f32 * 0.4);
-                    shell_send(&wheel_serial, &wheel_command(&device, (dw, dh), reach));
+                    super::wheel(&wheel_serial, &device, (dw, dh), reach);
                 });
             },
         )
@@ -716,6 +1029,44 @@ mod view {
 mod tests {
     use super::*;
 
+    /// Against a running emulator: VMAC_DEVICE=avd:NAME or emulator-NNNN.
+    #[test]
+    #[ignore]
+    fn an_emulator_takes_touches_keys_and_buttons_fast() {
+        let target = std::env::var("VMAC_DEVICE").unwrap();
+        let device = locate(&target).expect("the emulator is running");
+        let start = std::time::Instant::now();
+        assert!(touch(&device, Touch::Down, (672., 2400.)));
+        for i in 1..=10 {
+            assert!(touch(&device, Touch::Move, (672., 2400. - 120. * i as f32)));
+        }
+        assert!(touch(&device, Touch::Up, (672., 1200.)));
+        eprintln!("a 12-step drag: {:?}", start.elapsed());
+        let top = || {
+            let out = Command::new(adb()).args(["shell", "dumpsys", "activity", "activities"]).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.lines().find(|l| l.contains("topResumedActivity")).unwrap_or_default().to_string()
+        };
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(1500));
+        Command::new(adb()).args(["shell", "am", "start", "-W", "-a", "android.settings.SETTINGS"]).output().unwrap();
+        settle();
+        assert!(top().contains("settings"), "{}", top());
+        let start = std::time::Instant::now();
+        assert_eq!(button(&target, "home"), Ok(()));
+        eprintln!("home: {:?}", start.elapsed());
+        settle();
+        assert!(top().contains("launcher"), "home went home: {}", top());
+        let start = std::time::Instant::now();
+        // Typed where it lands (the launcher's search, maybe): no RET, which
+        // would open what it found.
+        assert_eq!(key(&target, "x", "hi there"), Ok(()));
+        assert_eq!(key(&target, "<left>", ""), Ok(()));
+        assert_eq!(key(&target, "DEL", ""), Ok(()));
+        assert_eq!(button(&target, "back"), Ok(()));
+        assert_eq!(button(&target, "home"), Ok(()));
+        eprintln!("text, two keys and two buttons: {:?}", start.elapsed());
+    }
+
     #[test]
     fn nal_units_split_as_bytes_arrive() {
         let mut s = NalSplitter::default();
@@ -753,6 +1104,19 @@ mod tests {
         assert_eq!(button_command(&ios, "home"), Ok(format!("{idb} ui button HOME --udid 'U-1'")));
         assert!(button_command(&ios, "volume-up").is_err());
         assert_eq!(locate("ios:U-1"), Some(ios.clone()));
+        assert_eq!(console_port("emulator-5556"), Some(5556));
+        assert_eq!(console_port("R5CT1234"), None);
+        assert_eq!(touch_command(Touch::Down, (672.4, 1500.)), "event mouse 672 1500 0 1");
+        assert_eq!(touch_command(Touch::Up, (10., 20.)), "event mouse 10 20 0 0");
+        assert_eq!(console_text_command("a b'").as_deref(), Some("event text a b'"));
+        assert_eq!(console_text_command("é"), None, "not ASCII: through input");
+        assert_eq!(evdev_code("home"), Some(102));
+        assert_eq!(evdev_code("x"), None);
+        // KeyboardEvent { codeType: Evdev, eventType: keypress, keyCode: 580 }, framed.
+        assert_eq!(key_press_message(580), [0, 0, 0, 0, 7, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc4, 0x04]);
+        let ini = "port.serial=5554\nport.adb=5555\ngrpc.port=8554\ngrpc.token=abc\n";
+        assert_eq!(parse_discovery(ini, 5554), Some((8554, "abc".to_string())));
+        assert_eq!(parse_discovery(ini, 5556), None, "another emulator's");
         let describe = r#"{"state": "Booted", "screen_dimensions": {"width": 1206, "height": 2622, "density": 3.0, "width_points": 402, "height_points": 874}}"#;
         assert_eq!(parse_describe(describe), Some(("Booted".into(), (402, 874))));
         assert_eq!(text_command("it's 100% done"), r"input text 'it'\''s%s100\%%sdone'");
