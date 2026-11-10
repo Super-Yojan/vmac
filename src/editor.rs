@@ -524,6 +524,12 @@ pub enum SessionRequest {
     /// Check the machines connected to before (SPC S m), or forget one.
     CheckMachines,
     ForgetMachine(String),
+    /// Check for a vmac release now, or install the latest (update.rs).
+    UpdateCheck,
+    Update,
+    /// Restart the server onto the newer vmac installed (`force`: even
+    /// with unsaved files or something running).
+    RestartServer { force: bool },
 }
 
 /// A comment shown in a diff buffer: (path, on the new side, line, label,
@@ -3636,6 +3642,24 @@ impl EditorState {
     }
 
     /// The terminals' buffer names, oldest first.
+    /// The terminals something is running in (a command, not a shell
+    /// waiting), by name.
+    pub fn running_terminals(&mut self) -> Vec<String> {
+        let ids: Vec<BufferId> = self
+            .terminals
+            .iter_mut()
+            .filter_map(|t| {
+                let shell = t.shell;
+                let running = match &mut t.backend {
+                    TermBackend::Local(pty) | TermBackend::Attached { pty, .. } => pty.running_command(shell),
+                    TermBackend::Plugin { .. } => false,
+                };
+                (running && !t.exited).then_some(t.buffer)
+            })
+            .collect();
+        ids.into_iter().filter_map(|id| self.buffer_by_id(id)).map(|b| b.name().to_string()).collect()
+    }
+
     pub fn terminal_names(&self) -> Vec<String> {
         self.terminals.iter().filter_map(|t| self.buffer_by_id(t.buffer)).map(|b| b.name().to_string()).collect()
     }

@@ -250,7 +250,9 @@ fn run(
                         crate::remote_agent::all_exited("the window running it closed");
                     }
                 }
-                Some(ToServer::Hello { target, cwd, viewport, agents, .. }) => {
+                Some(ToServer::Hello { version, target, cwd, viewport, agents }) => {
+                    // A newer vmac's window: this server restarts onto it (asked).
+                    server.newer_window(&version);
                     if agents {
                         agent_windows.push(id);
                         // At once: the keys after it may start an agent.
@@ -371,6 +373,10 @@ fn run(
         if last_reload.elapsed() >= RELOAD_POLL {
             last_reload = Instant::now();
             changed |= server.reload_if_changed();
+            // Updates are said, and the restart offered, to a window.
+            if clients.values().any(|c| c.hello) {
+                changed |= server.tend_update();
+            }
         }
         if changed {
             for client in clients.values_mut().filter(|c| c.hello) {

@@ -518,6 +518,27 @@ impl LocalPty {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Whether something is running in it: a program it was started with,
+    /// or a command its shell runs (the terminal's foreground process isn't
+    /// the shell; on Windows, which can't tell, a shell is taken as idle).
+    pub fn running_command(&mut self, shell: bool) -> bool {
+        if !self.alive() {
+            return false;
+        }
+        if !shell {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            match (self.master.process_group_leader(), self.child.process_id()) {
+                (Some(leader), Some(pid)) => leader as u32 != pid,
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        false
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
@@ -689,5 +710,29 @@ mod tests {
         let s = Screen::from_text(&padded);
         assert_eq!(s.lines, vec!["~", "→"]);
         assert_eq!(s.cursor, (1, 1), "after the arrow, not at column 199");
+    }
+
+    /// A shell waiting isn't busy; a command it runs is (what a restart
+    /// waits for).
+    #[cfg(unix)]
+    #[test]
+    fn a_command_running_in_a_shell_is_seen() {
+        let mut pty = LocalPty::start("sh", &std::env::temp_dir(), 10, 40).unwrap();
+        let wait = |pty: &mut LocalPty, want: bool| {
+            for _ in 0..100 {
+                if pty.running_command(true) == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(wait(&mut pty, false), "a shell waiting");
+        pty.send(b"sleep 30\n");
+        assert!(wait(&mut pty, true), "sleep running");
+        pty.send(&[3]);
+        assert!(wait(&mut pty, false), "interrupted");
+        assert!(pty.running_command(false), "a program it was started with counts while it runs");
+        pty.kill();
     }
 }

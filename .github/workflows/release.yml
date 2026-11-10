@@ -7,6 +7,7 @@
 #   vmac-macos-universal.zip.
 # - The server (vmac without the window) for the systems `vmac connect`
 #   installs it on: vmac-server-<target>, which `vmac connect` downloads.
+# - SHA256SUMS of them all, which `vmac update` checks downloads against.
 #
 # Run by hand (Actions > release > Run workflow): with a tag, it builds that
 # tag and attaches everything to its release (to redo a release's build);
@@ -202,3 +203,20 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           files: vmac-macos-universal.zip
+
+  # SHA256SUMS of every file the release has, which `vmac update` checks a
+  # download against before installing it. After the builds (those that
+  # worked: a failed target leaves its file out).
+  checksums:
+    needs: [linux, macos, linux-app, windows-app, macos-app]
+    if: ${{ always() && (inputs.tag != '' || startsWith(github.ref, 'refs/tags/')) }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'vmac-*'
+          sha256sum vmac-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

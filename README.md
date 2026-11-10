@@ -59,6 +59,29 @@ language servers, fish, `npx` and the agents). It needs `rsvg-convert` and
 ImageMagick (`brew install librsvg imagemagick`). Run it again after
 updating to rebuild the app.
 
+## Updating
+
+vmac checks for a new release once a day (in the window) and says when one
+is out; it never downloads one you didn't ask for. `SPC h u`, `:update` or
+`vmac update` installs it: the release's file for your system, checked
+against the release's `SHA256SUMS`, moved in place of the old one (the Mac
+app, a Linux release unpacked into a prefix, or `vmac.exe`). A vmac built
+with `cargo install` is rebuilt with cargo (in a terminal, from inside
+vmac). `vmac update --check` and `:update-check` only check; `vmac
+--version` says which vmac this is.
+
+Once a newer vmac is installed (by vmac or by hand), the vmac running waits
+until a restart would lose nothing (no unsaved files, no agent at work, no
+command running in a terminal; the modeline shows `↻ VERSION` meanwhile),
+then asks whether to restart onto it. Yes reopens your sessions, with their
+projects and files. No leaves it: `:restart-server` asks again, and
+`:restart-server!` restarts even with something unsaved or running. A
+server on another machine (`vmac connect`) is offered the same when a newer
+vmac connects to it, and restarts onto the build that vmac installs there.
+
+`vmac.set_update_check(false)` in `init.lua`, or `VMAC_NO_UPDATE=1`, turns
+the daily check off. Builds from a checkout never check.
+
 ## How it is split
 
 | Layer        | Where                                                | What                                                                           |

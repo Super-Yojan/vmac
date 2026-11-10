@@ -34,6 +34,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
     ("sessions.lua", include_str!("../lua/core/sessions.lua")),
+    ("update.lua", include_str!("../lua/core/update.lua")),
 ];
 
 /// The checkout's lua/core/, when running from one.
@@ -1626,6 +1627,14 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         .map(|m| vec![m.host.clone(), m.state.describe(), if m.connected { "connected".into() } else { String::new() }])
         .collect::<Vec<Vec<String>>>());
     prim!(reg, editor, "machines-check", |s| s.session_requests.push(SessionRequest::CheckMachines));
+    // Updates (update.rs): check now, install the latest, restart onto it.
+    prim!(reg, editor, "update-check", |s| s.session_requests.push(SessionRequest::UpdateCheck));
+    prim!(reg, editor, "update", |s| s.session_requests.push(SessionRequest::Update));
+    prim!(reg, editor, "restart-server", |s, force: Option<bool>| s
+        .session_requests
+        .push(SessionRequest::RestartServer { force: force.unwrap_or(false) }));
+    pure!(reg, "version", | | crate::update::current().to_string());
+    pure!(reg, "set-update-check", |on: bool| crate::update::set_check(on));
     prim!(reg, editor, "machine-forget", |s, host: String| s.session_requests.push(SessionRequest::ForgetMachine(host)));
     prim!(reg, editor, "picker-title", |s| s.picker.as_ref().map(|p| p.title().to_string()).unwrap_or_default());
 

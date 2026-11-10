@@ -7096,6 +7096,7 @@ dependencies = [
  "ropey 1.6.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "similar",
  "tree-sitter",
  "tree-sitter-bash",
