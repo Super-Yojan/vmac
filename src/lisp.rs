@@ -29,6 +29,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("agents.lua", include_str!("../lua/core/agents.lua")),
     ("git.lua", include_str!("../lua/core/git.lua")),
     ("github.lua", include_str!("../lua/core/github.lua")),
+    ("mobile.lua", include_str!("../lua/core/mobile.lua")),
     ("notes.lua", include_str!("../lua/core/notes.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
@@ -677,6 +678,46 @@ fn register_terminals(reg: &mut Registry, editor: &Editor) {
         .expect("a Lua function");
     reg.vmac.set("terminal_open", open).expect("set in vmac");
 
+    // vmac.terminal_run(name, program, args, cwd): runs program (with
+    // exactly these arguments) in the terminal named name, ending what it ran
+    // before, so the windows showing it show the new run; with no terminal of
+    // that name, in a new one in this window. False when it won't start.
+    let ed = editor.clone();
+    let run = reg
+        .lua
+        .create_function(move |_, (name, program, args, cwd): (String, String, Vec<String>, String)| {
+            let mut st = ed.lock();
+            let existing = st.buffer_id_named(&name).filter(|&id| st.terminals.iter().any(|t| t.buffer == id));
+            let (rows, cols) = match existing {
+                Some(id) => st.size_for(id),
+                None => st.selected_size(),
+            };
+            let pty = match crate::terminal::LocalPty::run(&program, &args, &[], Path::new(&cwd), rows, cols) {
+                Ok(pty) => pty,
+                Err(e) => {
+                    st.message = format!("{program}: {e}");
+                    return Ok(false);
+                }
+            };
+            match existing {
+                Some(id) => {
+                    if let Some(t) = st.terminal_for(id) {
+                        // The old program ends as its PTY is dropped.
+                        t.backend = crate::editor::TermBackend::Local(pty);
+                        t.exited = false;
+                        t.shell = false;
+                    }
+                }
+                None => {
+                    st.add_terminal(crate::editor::TermBackend::Local(pty));
+                    st.buffer_mut().set_name(name);
+                }
+            }
+            Ok(true)
+        })
+        .expect("a Lua function");
+    reg.vmac.set("terminal_run", run).expect("set in vmac");
+
     let ed = editor.clone();
     let send = reg
         .lua
@@ -806,6 +847,8 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         s.buffer().search_backward(&re, before.max(0) as usize).map_or(-1, |p| p as isize)
     });
     pure!(reg, "regex-quote", |text: String| regex::escape(&text));
+    // vmac.on_path(command): whether the command is on PATH.
+    pure!(reg, "on-path?", |command: String| crate::packages::on_path(&command));
     // The fuzzy picker. Lua opens it and decides what picking does.
     prim!(reg, editor, "project-root", |s| {
         let start = s
@@ -2097,6 +2140,136 @@ mod tests {
         assert!(!text(&editor).contains("Doing:"), "{}", text(&editor));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "ours\n");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mobile_finds_the_apps_asks_for_a_device_and_scheme_and_runs() {
+        let dir = std::env::temp_dir().join(format!("vmac-mobile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["App.xcodeproj", "android/app", "bin", "cache"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        assert!(crate::git::run(&dir, &["init", "-q", "-b", "main"], None).0);
+        std::fs::write(dir.join("App.xcodeproj/project.pbxproj"), "// !$*UTF8*$!\n").unwrap();
+        std::fs::write(dir.join("ContentView.swift"), "import SwiftUI\n").unwrap();
+        std::fs::write(dir.join("android/gradlew"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("android/settings.gradle.kts"), "include(\":app\")\n").unwrap();
+        std::fs::write(
+            dir.join("android/app/build.gradle.kts"),
+            "plugins { alias(libs.plugins.android.application) }\nandroid {\n  defaultConfig { applicationId = \"com.example.hello\" }\n}\n",
+        )
+        .unwrap();
+        // Stand-ins: xcodebuild lists two schemes and fails the build with
+        // an error; xcrun has one simulator; emulator one AVD; adb nothing.
+        let fake = |name: &str, body: &str| {
+            let path = dir.join("bin").join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path.display().to_string()
+        };
+        let swift = dir.join("ContentView.swift").display().to_string();
+        let xcodebuild = fake(
+            "xcodebuild",
+            &format!(
+                r#"case "$*" in
+  *-list*) echo '{{"project":{{"name":"App","schemes":["App","AppTests"]}}}}' ;;
+  *build*) echo '{swift}:3:7: error: cannot find Foo in scope'; exit 65 ;;
+esac"#
+            ),
+        );
+        let xcrun = fake(
+            "xcrun",
+            r#"echo '{"devices":{"com.apple.CoreSimulator.SimRuntime.iOS-26-0":[{"udid":"U-1","name":"iPhone 17","state":"Shutdown"}],"com.apple.CoreSimulator.SimRuntime.watchOS-26-0":[{"udid":"W","name":"Watch","state":"Shutdown"}]}}'"#,
+        );
+        let emulator = fake("emulator", "echo Pixel_9");
+        let adb = fake("adb", "echo 'List of devices attached'");
+
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&dir.join("ContentView.swift")).unwrap();
+        lisp.eval_lua(&format!(
+            "local M = core.mobile M.xcodebuild = {xcodebuild:?} M.xcrun = {xcrun:?} M.emulator_program = {emulator:?} \
+             M.adb_program = {adb:?} M.cache_path = {:?} M.data_path = {:?}",
+            dir.join("cache").display().to_string(),
+            dir.join("mobile.json").display().to_string()
+        ))
+        .unwrap();
+        let wait_for = |lisp: &mut Lisp, done: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !done() && start.elapsed().as_secs() < 10 {
+                lisp.run_events();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // Both apps are found: the Xcode project and the Gradle module.
+        let found = lisp
+            .eval_lua("local p = core.mobile.project() return p.ios[1].path .. ' ' .. p.android.module .. ' ' .. p.android.package")
+            .unwrap();
+        assert_eq!(found, "App.xcodeproj :app com.example.hello");
+
+        let picker_items = || editor.lock().picker.as_ref().map(|p| p.items().to_vec()).unwrap_or_default();
+        // SPC r r asks where to run (simulators and emulators), then which scheme.
+        lisp.run_command("mobile-run");
+        wait_for(&mut lisp, &|| picker_items().len() == 2);
+        let items = picker_items();
+        assert!(items.contains(&"iPhone 17  ·  iOS 26.0  (simulator)".to_string()), "{items:?}");
+        assert!(items.contains(&"Pixel_9  (Android emulator)".to_string()), "{items:?}");
+        typed(&mut lisp, "iPhone\n");
+        wait_for(&mut lisp, &|| picker_items().first().is_some_and(|i| i == "App"));
+        typed(&mut lisp, "App\n");
+
+        // The build runs in *run* below; its error is listed.
+        let script = std::fs::read_to_string(dir.join("cache").join(format!("vmac-mobile-{}.sh", std::process::id()))).unwrap();
+        assert!(script.contains("'-project' 'App.xcodeproj' -scheme 'App'") && script.contains("'id=U-1'"), "{script}");
+        assert!(editor.lock().terminal_names().contains(&"*run*".to_string()));
+        assert_eq!(editor.lock().buffer().name(), "ContentView.swift", "the code keeps the focus");
+        let log = dir.join("cache").join(format!("vmac-mobile-{}.log", std::process::id()));
+        wait_for(&mut lisp, &|| std::fs::read_to_string(&log).is_ok_and(|t| t.contains("error:")));
+        let problems = lisp
+            .eval_lua(&format!("local f = io.open({:?}) local t = f:read('a') f:close() return core.mobile.problems(t, {:?})[1]",
+                log.display().to_string(), dir.display().to_string()))
+            .unwrap();
+        assert_eq!(problems, "ContentView.swift:3:7  error: cannot find Foo in scope");
+
+        // The choices are remembered for the project.
+        let saved = std::fs::read_to_string(dir.join("mobile.json")).unwrap();
+        assert!(saved.contains("\"scheme\":\"App\"") && saved.contains("\"udid\":\"U-1\""), "{saved}");
+
+        // The Android script builds the module, then installs and launches it.
+        let android = lisp
+            .eval_lua("local M = core.mobile local p = M.project() return M.android_script(p, p.android, { avd = 'Pixel_9' }, false)")
+            .unwrap();
+        assert!(android.contains("./gradlew --console=plain ':app:assembleDebug'"), "{android}");
+        assert!(android.contains("':app:installDebug'") && android.contains("PKG='com.example.hello'"), "{android}");
+        assert!(android.contains("AVD='Pixel_9'"), "{android}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mobile_reads_kotlin_and_swift_build_problems() {
+        let (mut lisp, _editor) = lisp_with("");
+        let got = lisp
+            .eval_lua(
+                r#"local log = table.concat({
+  "e: file:///p/app/src/Main.kt:12:5 Unresolved reference 'foo'.",
+  "w: /p/app/src/Old.kt: (3, 1): 'x' is deprecated",
+  "/p/A.swift:1:2: warning: unused",
+  "/p/A.swift:4:9: error: expected '}'",
+  "/p/A.swift:4:9: error: expected '}'",
+  "BUILD FAILED",
+}, "\n")
+return table.concat(core.mobile.problems(log, "/p"), "|")"#,
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            "app/src/Main.kt:12:5  error: Unresolved reference 'foo'.|A.swift:4:9  error: expected '}'|\
+             app/src/Old.kt:3:1  warning: 'x' is deprecated|A.swift:1:2  warning: unused"
+        );
     }
 
     #[test]

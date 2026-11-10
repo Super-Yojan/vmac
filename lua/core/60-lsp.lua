@@ -11,8 +11,24 @@
 -- ~/.local/share/vmac. SPC h m or :packages lists what vmac can install
 -- (RET installs or removes one); :install NAME and :uninstall NAME do it by
 -- name. vmac.set_auto_install(false) in init.lua installs only when asked.
+--
+-- Swift uses sourcekit-lsp, which comes with Xcode (xcrun finds it); for an
+-- Xcode project it needs a buildServer.json, which :mobile-lsp-setup writes
+-- (mobile.lua). Kotlin uses JetBrains' kotlin-lsp when it's installed
+-- (brew install JetBrains/utils/kotlin-lsp), else kotlin-language-server,
+-- which vmac installs (it needs Java).
 
 local V = vmac
+
+local function swift_server()
+  if V.on_path("sourcekit-lsp") then return { "swift", "sourcekit-lsp" } end
+  return { "swift", "xcrun", "sourcekit-lsp" }
+end
+
+local function kotlin_server()
+  if V.on_path("kotlin-lsp") then return { "kotlin", "kotlin-lsp", "--stdio" } end
+  return { "kotlin", "kotlin-language-server" }
+end
 
 function core.lsp_servers()
   return {
@@ -32,6 +48,8 @@ function core.lsp_servers()
     { "json", "vscode-json-language-server", "--stdio" },
     { "toml", "taplo", "lsp", "stdio" },
     { "markdown", "marksman", "server" },
+    swift_server(),
+    kotlin_server(),
   }
 end
 

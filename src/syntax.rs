@@ -41,6 +41,8 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "ex" | "exs" => "elixir",
         "scala" | "sc" => "scala",
         "cs" => "c_sharp",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
         _ => return None,
     })
 }
@@ -294,6 +296,9 @@ mod tests {
         assert_eq!(language_for_path(Path::new("a/b.rs")), Some("rust"));
         assert_eq!(language_for_path(Path::new("x.tsx")), Some("tsx"));
         assert_eq!(language_for_path(Path::new("README.md")), Some("markdown"));
+        assert_eq!(language_for_path(Path::new("App/ContentView.swift")), Some("swift"));
+        assert_eq!(language_for_path(Path::new("MainActivity.kt")), Some("kotlin"));
+        assert_eq!(language_for_path(Path::new("build.gradle.kts")), Some("kotlin"));
         assert_eq!(language_for_path(Path::new("notes.txt")), None);
     }
 

@@ -32,6 +32,12 @@ pub struct Picker {
 }
 
 impl Picker {
+    /// Everything it lists, before filtering.
+    #[cfg(test)]
+    pub fn items(&self) -> &[String] {
+        &self.items
+    }
+
     pub fn new(title: String, items: Vec<String>, preview_root: Option<PathBuf>) -> Self {
         let mut picker =
             Self { title, items, matches: Vec::new(), selected: 0, query: None, preview_root };

@@ -58,10 +58,13 @@ pub struct Grammar {
     pub symbol: &'static str,
     /// A language whose highlights come first (C++ adds to C's).
     pub inherits: Option<&'static str>,
+    /// The branch to clone, when the default one lacks a generated
+    /// src/parser.c.
+    pub branch: &'static str,
 }
 
 const fn grammar(language: &'static str, repo: &'static str) -> Grammar {
-    Grammar { language, repo, subdir: "", symbol: language, inherits: None }
+    Grammar { language, repo, subdir: "", symbol: language, inherits: None, branch: "" }
 }
 
 pub const GRAMMARS: &[Grammar] = &[
@@ -79,6 +82,8 @@ pub const GRAMMARS: &[Grammar] = &[
     grammar("elixir", "elixir-lang/tree-sitter-elixir"),
     grammar("scala", "tree-sitter/tree-sitter-scala"),
     Grammar { symbol: "c_sharp", ..grammar("c_sharp", "tree-sitter/tree-sitter-c-sharp") },
+    Grammar { branch: "with-generated-files", ..grammar("swift", "alex-pinkus/tree-sitter-swift") },
+    grammar("kotlin", "fwcd/tree-sitter-kotlin"),
 ];
 
 fn rust_analyzer_asset(os: &str, arch: &str) -> Option<&'static [&'static str]> {
@@ -89,6 +94,11 @@ fn rust_analyzer_asset(os: &str, arch: &str) -> Option<&'static [&'static str]> 
         ("linux", "x86_64") => &["x86_64-unknown-linux-gnu.gz"],
         _ => return None,
     })
+}
+
+fn kotlin_ls_asset(_os: &str, _arch: &str) -> Option<&'static [&'static str]> {
+    // One zip for every platform: it runs on the JVM.
+    Some(&["server.zip"])
 }
 
 fn clangd_asset(os: &str, _arch: &str) -> Option<&'static [&'static str]> {
@@ -185,6 +195,16 @@ pub const SERVERS: &[Server] = &[
         languages: &["toml"],
         source: Source::Github { repo: "tamasfe/taplo", asset: taplo_asset, bin: "taplo" },
     },
+    Server {
+        name: "kotlin-language-server",
+        commands: &["kotlin-language-server"],
+        languages: &["kotlin"],
+        source: Source::Github {
+            repo: "fwcd/kotlin-language-server",
+            asset: kotlin_ls_asset,
+            bin: "bin/kotlin-language-server",
+        },
+    },
     Server { name: "python-lsp-server", commands: &["pylsp"], languages: &["python"], source: Source::Pip("python-lsp-server") },
 ];
 
@@ -211,7 +231,7 @@ fn grammar_dir(language: &str) -> Option<PathBuf> {
     data_dir().map(|d| d.join("grammars").join(language))
 }
 
-fn on_path(command: &str) -> bool {
+pub fn on_path(command: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
 }
@@ -624,7 +644,13 @@ fn install_grammar(g: &Grammar, step: &Step) -> Result<(), String> {
     std::fs::create_dir_all(build.parent().unwrap_or(&data)).map_err(|e| e.to_string())?;
     step.note(&format!("cloning {}", g.repo));
     let url = format!("https://github.com/{}", g.repo);
-    step.run("git", &["clone", "--depth", "1", &url, &build.display().to_string()], &data, &[("GIT_TERMINAL_PROMPT", "0")])?;
+    let build_arg = build.display().to_string();
+    let mut clone = vec!["clone", "--depth", "1"];
+    if !g.branch.is_empty() {
+        clone.extend(["--branch", g.branch]);
+    }
+    clone.extend([url.as_str(), build_arg.as_str()]);
+    step.run("git", &clone, &data, &[("GIT_TERMINAL_PROMPT", "0")])?;
     let top = if g.subdir.is_empty() { build.clone() } else { build.join(g.subdir) };
     let src = top.join("src");
     step.note(&format!("compiling the {} grammar", g.language));
