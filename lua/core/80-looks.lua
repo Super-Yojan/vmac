@@ -184,6 +184,7 @@ function core.modeline()
     { core.github and core.github.modeline_segment() or "", "dim" },
     { V.diagnostic_summary(), "error" },
     { V.lsp_status(), "dim" },
+    { core.update_segment and core.update_segment() or "", "accent" },
     { core.pending_count .. core.pending_keys, "dim" },
   }
 end

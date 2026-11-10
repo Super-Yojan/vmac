@@ -39,6 +39,7 @@ mod sys;
 mod terminal;
 #[cfg(feature = "gui")]
 mod themes;
+mod update;
 
 use buffer::Buffer;
 use editor::Editor;
@@ -65,6 +66,9 @@ usage: vmac [FILE]              edit FILE (or show the dashboard) in this window
        vmac ls --all            the same for this machine and every machine
                                 connected to before, and which are offline
        vmac kill-server         stop the server and everything in it
+       vmac update [--check]    install the latest release (--check: only say
+                                whether there's one); vmac checks once a day
+       vmac --version           which vmac this is
        vmac --server            run the server here, without a window
 
 Closing a window attached to the server, or :q, only detaches it: the
@@ -74,6 +78,7 @@ $XDG_RUNTIME_DIR or the temporary folder).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    update::remember_start(&args);
     let socket = daemon::socket_path();
     let fail = |e: &dyn std::fmt::Display| -> ! {
         eprintln!("vmac: {e}");
@@ -81,6 +86,8 @@ fn main() {
     };
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => println!("{USAGE}"),
+        Some("-V" | "--version") => println!("vmac {}", update::current()),
+        Some("update") => run_update(args.iter().any(|a| a == "--check")),
         Some("--server") => {
             packages::set_auto_install(true);
             // Windows on other machines get what's copied, and lend their clipboard.
@@ -158,6 +165,42 @@ fn main() {
     }
 }
 
+/// `vmac update`: says whether a newer release is out and, unless only
+/// checking, installs it.
+fn run_update(check_only: bool) {
+    let latest = update::latest().unwrap_or_else(|e| {
+        eprintln!("vmac: {e}");
+        std::process::exit(1);
+    });
+    if !update::newer(&latest, update::current()) {
+        println!("vmac {} is the latest", update::current());
+        return;
+    }
+    if check_only {
+        println!("vmac {latest} is out (this is {}): `vmac update` installs it", update::current());
+        return;
+    }
+    println!("installing vmac {latest}");
+    match update::install(&latest) {
+        Ok(update::Outcome::Installed(v)) => {
+            println!("vmac {v} is installed; running vmacs offer to restart onto it")
+        }
+        Ok(update::Outcome::Command(command)) => {
+            println!("{command}");
+            let mut words = command.split_whitespace();
+            let status = std::process::Command::new(words.next().unwrap_or("cargo")).args(words).status();
+            if !status.is_ok_and(|s| s.success()) {
+                eprintln!("vmac: that failed");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("vmac: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Sessions in columns: the active one starred, then each one's name,
 /// project, and buffers (and unsaved files).
 fn describe_sessions(active: &str, sessions: &[frame::SessionInfo]) -> String {
@@ -191,7 +234,12 @@ fn new_server(start: Option<(Buffer, bool)>) -> server::Server {
         let (editor, lisp) = new_session(Buffer::new("*scratch*"));
         session::Session::new(editor, lisp)
     });
-    server::Server::new(first, make).follow_cwd()
+    let mut server = server::Server::new(first, make).follow_cwd();
+    // Restarted onto a newer vmac: the sessions as they were.
+    if let Some(restore) = update::take_restore() {
+        server.restore(restore);
+    }
+    server
 }
 
 #[cfg(not(feature = "gui"))]

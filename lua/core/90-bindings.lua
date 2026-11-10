@@ -77,7 +77,7 @@ bind(K.normal, {
   { "SPC o n", "terminal-next" }, { "SPC o N", "terminal-previous" },
   { "SPC o l", "terminal-pick" }, { "SPC o k", "terminal-kill" },
   { "SPC h F", "font-picker" }, { "SPC h m", "package-manager" }, { "SPC h t", "theme-picker" },
-  { "SPC h p", "plugin-manager" },
+  { "SPC h p", "plugin-manager" }, { "SPC h u", "update" },
   { "SPC m a", "table-align" }, { "SPC m p", "preview" }, { "SPC m s", "pdf-forward-search" }, { "SPC t s", "toggle-pdf-follow" },
   { "SPC t m", "markdown-conceal" },
   -- Language servers

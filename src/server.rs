@@ -82,6 +82,9 @@ pub enum WindowRequest {
     /// Check how the remembered machines are, or forget one.
     CheckMachines,
     ForgetMachine(String),
+    /// This server is going away to restart on a newer vmac (it saved its
+    /// sessions to open again): start the window again on it.
+    Restart,
 }
 
 impl Host for Server {
@@ -95,7 +98,7 @@ impl Host for Server {
         Server::quit_requested(self)
     }
     fn reload_if_changed(&mut self) -> bool {
-        Server::reload_if_changed(self)
+        Server::reload_if_changed(self) | self.tend_update()
     }
     fn pump_terminals(&mut self) -> bool {
         Server::pump_terminals(self)
@@ -159,6 +162,12 @@ pub struct Server {
     window_requests: Vec<WindowRequest>,
     /// What came of what another machine asked (a kill).
     notices: Vec<String>,
+    /// Releases checked for and installed, and the restart onto a newer
+    /// vmac: what's holding it back (said when it changes), and the version
+    /// offered (once).
+    update: crate::update::Tracker,
+    update_waiting: Vec<String>,
+    update_offered: Option<String>,
 }
 
 impl Server {
@@ -174,6 +183,9 @@ impl Server {
             foreign: Vec::new(),
             window_requests: Vec::new(),
             notices: Vec::new(),
+            update: crate::update::Tracker::new(),
+            update_waiting: Vec::new(),
+            update_offered: None,
         };
         let name = {
             let st = first.editor().lock();
@@ -398,7 +410,165 @@ impl Server {
                 let said = self.kill(&name, force);
                 self.message(said);
             }
+            SessionRequest::UpdateCheck => {
+                self.update.check(true);
+                self.message("Checking for a new vmac...".into());
+            }
+            SessionRequest::Update => {
+                let msg = if self.update.install() { "Installing the latest vmac..." } else { "Already installing vmac" };
+                self.message(msg.into());
+            }
+            SessionRequest::RestartServer { force } => {
+                let busy = self.busy();
+                if !force && !busy.is_empty() {
+                    self.message(format!("Not restarting: {} (:restart-server! restarts anyway)", busy.join(", ")));
+                } else {
+                    self.restart();
+                }
+            }
         }
+    }
+
+    // ---- Updates (update.rs)
+
+    /// A window of a newer vmac attached: offer to restart onto it.
+    pub fn newer_window(&mut self, version: &str) {
+        if let Some(event) = self.update.newer_window(version) {
+            self.update_event(event);
+        }
+    }
+
+    /// Checks and installs under way, and the restart once a newer vmac is
+    /// installed: when nothing would be lost, the active session asks
+    /// whether to restart. True when the screen changed.
+    pub fn tend_update(&mut self) -> bool {
+        let events = self.update.tend();
+        let mut changed = !events.is_empty();
+        for event in events {
+            self.update_event(event);
+        }
+        let Some(version) = self.update.installed.clone() else { return changed };
+        if self.update_offered.as_ref() == Some(&version) {
+            return changed;
+        }
+        let busy = self.busy();
+        if busy != self.update_waiting {
+            if !busy.is_empty() {
+                self.event("update-waiting", vec![version.clone(), busy.join(", ")]);
+                changed = true;
+            }
+            self.update_waiting = busy.clone();
+        }
+        if busy.is_empty() {
+            self.update_offered = Some(version.clone());
+            self.event("update-ready", vec![version]);
+            changed = true;
+        }
+        changed
+    }
+
+    fn update_event(&mut self, event: crate::update::Event) {
+        use crate::update::Event;
+        match event {
+            Event::Out(v) => self.event("update-out", vec![v]),
+            Event::UpToDate => self.event("update-latest", vec![crate::update::current().into()]),
+            Event::Installed(v) => {
+                // Asked again (a newer one still): offered afresh.
+                self.update_waiting.clear();
+                self.event("update-installed", vec![v]);
+            }
+            Event::Run(command) => self.event("update-run", vec![command]),
+            Event::Failed(why) => self.event("update-failed", vec![why]),
+        }
+    }
+
+    /// Raises a Lua event (core.events[name]) in the active session.
+    fn event(&mut self, name: &str, args: Vec<String>) {
+        self.active_session().editor().lock().push_event(name, args);
+    }
+
+    /// What a restart would lose: unsaved files, an agent at work, commands
+    /// running in terminals (each said with its session's name).
+    pub fn busy(&self) -> Vec<String> {
+        let several = self.list.len() > 1;
+        let mut reasons = Vec::new();
+        for e in &self.list {
+            let mut st = e.session.editor().lock();
+            let within = if several { format!(" in {}", e.name) } else { String::new() };
+            let unsaved = st
+                .buffer_ids()
+                .into_iter()
+                .filter(|b| st.buffer_by_id(*b).is_some_and(|b| b.is_modified() && b.file().is_some()))
+                .count();
+            if unsaved > 0 {
+                let s = if unsaved == 1 { "" } else { "s" };
+                reasons.push(format!("{unsaved} unsaved file{s}{within}"));
+            }
+            if st.agent.as_ref().is_some_and(|a| a.state == crate::agent::State::Running) {
+                reasons.push(format!("the agent working{within}"));
+            }
+            let running = st.running_terminals();
+            if !running.is_empty() {
+                reasons.push(format!("{} running{within}", running.join(", ")));
+            }
+        }
+        reasons
+    }
+
+    /// Saves the sessions to open again, and asks the window to start
+    /// again on the newer vmac (which stops this server).
+    fn restart(&mut self) {
+        let restore = self.restore_state();
+        if let Err(e) = crate::update::save_restore(restore) {
+            self.message(format!("Couldn't save the sessions to reopen: {e}"));
+            return;
+        }
+        self.window_requests.push(WindowRequest::Restart);
+    }
+
+    /// The sessions as they are: names, projects, files open.
+    pub fn restore_state(&self) -> crate::update::Restore {
+        let sessions = self
+            .list
+            .iter()
+            .map(|e| {
+                let st = e.session.editor().lock();
+                let files = st.buffer_ids().into_iter().filter_map(|b| st.buffer_by_id(b)?.file().cloned()).collect();
+                crate::update::RestoreSession { name: e.name.clone(), project: st.project.clone(), files }
+            })
+            .collect();
+        let active = self.list.iter().find(|e| e.id == self.active).map(|e| e.name.clone()).unwrap_or_default();
+        crate::update::Restore { active, sessions, written: 0 }
+    }
+
+    /// Opens the sessions a restart saved: each with its project and files.
+    pub fn restore(&mut self, restore: crate::update::Restore) {
+        for (i, saved) in restore.sessions.iter().enumerate() {
+            // The first goes in the session there is.
+            if i > 0 {
+                self.create(&saved.name);
+            } else {
+                let id = self.active;
+                let name = self.unique(&saved.name, Some(id));
+                self.entry(id).name = name;
+            }
+            let session = self.active_session();
+            let mut st = session.editor().lock();
+            if let Some(root) = &saved.project {
+                let _ = st.project_open(root);
+                st.session_requests.retain(|r| !matches!(r, SessionRequest::Rename(_)));
+            }
+            for file in &saved.files {
+                if file.is_file() {
+                    let _ = st.open_file(file);
+                }
+            }
+        }
+        if let Some(id) = self.by_name(&restore.active) {
+            self.switch(id);
+        }
+        self.message(format!("Restarted on vmac {}", crate::update::current()));
+        self.serve_requests();
     }
 
     /// In a session just made (the active one): opens the project and the
@@ -641,6 +811,72 @@ mod tests {
         assert_eq!(s.names().1, ["main", "scratch"], "refused: an unsaved file");
         eval_lua(&mut s, "vmac.session_kill('scratch', true)");
         assert_eq!(s.names(), ("main".into(), vec!["main".into()]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn update_events(server: &mut Server) -> Vec<(String, Vec<String>)> {
+        server.active_session().editor().lock().take_events().into_iter().filter(|(n, _)| n.starts_with("update-")).collect()
+    }
+
+    #[test]
+    fn a_newer_vmac_is_offered_once_nothing_would_be_lost() {
+        let dir = std::env::temp_dir().join(format!("vmac-server-update-{}", std::process::id()));
+        let alpha = project(&dir, "alpha");
+        let mut s = server();
+        eval_lua(&mut s, &format!("vmac.find_file({:?})", alpha.join("main.rs").display().to_string()));
+        s.handle(Input::Key { key: "x".into(), text: "x".into() });
+        assert_eq!(s.busy(), ["1 unsaved file"]);
+
+        // A newer window attached: waiting on the unsaved file, said once.
+        s.newer_window("99.0.0");
+        s.tend_update();
+        let events = update_events(&mut s);
+        assert!(events.contains(&("update-installed".into(), vec!["99.0.0".into()])), "{events:?}");
+        assert!(events.contains(&("update-waiting".into(), vec!["99.0.0".into(), "1 unsaved file".into()])), "{events:?}");
+        s.tend_update();
+        assert!(update_events(&mut s).is_empty());
+
+        // Restarting by hand is refused while something would be lost.
+        eval_lua(&mut s, "vmac.restart_server(false)");
+        assert!(s.active_session().editor().lock().message.starts_with("Not restarting: 1 unsaved file"));
+        assert!(s.take_window_requests().is_empty());
+
+        // Saved: asked, once.
+        eval_lua(&mut s, "vmac.save_buffer()");
+        assert!(s.busy().is_empty());
+        s.tend_update();
+        assert_eq!(update_events(&mut s), [("update-ready".to_string(), vec!["99.0.0".to_string()])]);
+        s.tend_update();
+        assert!(update_events(&mut s).is_empty());
+        // An older or the same window changes nothing.
+        s.newer_window("0.0.1");
+        s.newer_window("99.0.0");
+        s.tend_update();
+        assert!(update_events(&mut s).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_restart_reopens_the_sessions_projects_and_files() {
+        let dir = std::env::temp_dir().join(format!("vmac-server-restore-{}", std::process::id()));
+        let (alpha, beta) = (project(&dir, "alpha"), project(&dir, "beta"));
+        let mut s = server();
+        eval_lua(&mut s, &format!("vmac.project_open({:?})", alpha.display().to_string()));
+        eval_lua(&mut s, &format!("vmac.find_file({:?})", alpha.join("main.rs").display().to_string()));
+        eval_lua(&mut s, &format!("vmac.project_open({:?})", beta.display().to_string()));
+        s.handle(Input::Key { key: "ESC".into(), text: String::new() });
+        eval_lua(&mut s, "vmac.session_switch('alpha')");
+        let saved = s.restore_state();
+        assert_eq!(saved.active, "alpha");
+        assert_eq!(saved.sessions.len(), 2);
+
+        let mut fresh = server();
+        fresh.restore(saved);
+        assert_eq!(fresh.names(), ("alpha".into(), vec!["alpha".into(), "beta".into()]));
+        assert!(shown(&mut fresh).contains("// alpha"));
+        assert_eq!(fresh.active_session().editor().lock().project.as_ref(), Some(&alpha));
+        eval_lua(&mut fresh, "vmac.session_switch('beta')");
+        assert_eq!(fresh.active_session().editor().lock().project.as_ref(), Some(&beta));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

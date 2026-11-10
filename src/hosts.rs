@@ -183,7 +183,9 @@ impl Hosts {
                 Err(e) => self.notice = Some(format!("{host}: {e}")),
             }
         }
-        for i in 0..self.machines.len() {
+        let mut i = 0;
+        while i < self.machines.len() {
+            let mut removed = false;
             for request in self.machines[i].host.take_window_requests() {
                 changed = true;
                 match request {
@@ -205,11 +207,34 @@ impl Hosts {
                             format!("{host} wasn't remembered")
                         });
                     }
+                    // This window's own server: the window starts again on
+                    // the new vmac. Another machine's: connected to again,
+                    // its server restarted on the build this window installs.
+                    WindowRequest::Restart if i == 0 => crate::update::relaunch(),
+                    WindowRequest::Restart => {
+                        let address = self.machines[i].address.clone();
+                        self.machines.remove(i);
+                        if self.active >= i {
+                            self.active = self.active.saturating_sub(1).min(self.machines.len() - 1);
+                        }
+                        self.notice = Some(format!("Restarting vmac on {address}..."));
+                        let done = self.connect.clone();
+                        std::thread::spawn(move || {
+                            let result = crate::remote::connect(&address, None, true).map_err(|e| e.to_string());
+                            let _ = done.send((address, result));
+                        });
+                        // The rest of its requests went with it.
+                        removed = true;
+                        break;
+                    }
                     WindowRequest::Kill { name, force } => match self.find(&name, i) {
                         Some((machine, session)) => self.machines[machine].host.kill_session(&session, force),
                         None => self.notice = Some(format!("No session {name}")),
                     },
                 }
+            }
+            if !removed {
+                i += 1;
             }
         }
         // What came of kills asked of other machines.
