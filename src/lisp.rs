@@ -1004,6 +1004,10 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "tab-count", |s| s.tab_count() as isize);
     prim!(reg, editor, "tab-index", |s| s.tab_index() as isize + 1);
     prim!(reg, editor, "tab-names", |s| s.tab_names());
+    // The buffer tab bar: the project's open files.
+    prim!(reg, editor, "buffer-tab-next", |s, n: isize| s.buffer_tab_next(n));
+    prim!(reg, editor, "buffer-tab-names", |s| s.buffer_tabs().into_iter().map(|(_, name)| name).collect::<Vec<_>>());
+    prim!(reg, editor, "set-buffer-tabs", |s, on: bool| s.buffer_tabs_shown = on);
     prim!(reg, editor, "window-in-direction?", |s, dir: String| s.window_in_direction(&dir).is_some());
     prim!(reg, editor, "select-window-in-direction", |s, dir: String| {
         match s.window_in_direction(&dir) {

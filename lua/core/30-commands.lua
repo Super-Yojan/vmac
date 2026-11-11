@@ -278,6 +278,17 @@ V.command("buffer-kill", function() V.kill_buffer(false) end)
 V.command("buffer-kill-force", function() V.kill_buffer(true) end)
 V.command("buffer-new", function() core.choose_new() end)
 
+-- The buffer tab bar: with two or more of the project's files open, they
+-- line up along the top (a click shows one). SPC b ] / SPC b [ go to the
+-- next / previous of them; vmac.set_buffer_tabs(false) hides the bar.
+local function buffer_tab(n)
+  return function()
+    if V.buffer_tab_next(n) then core.state = "normal" else V.message("No files open in this project") end
+  end
+end
+V.command("buffer-tab-next", buffer_tab(1))
+V.command("buffer-tab-previous", buffer_tab(-1))
+
 -- A new buffer asks what it's for: a terminal, an empty buffer to edit, or
 -- a file. `side` ("below", "right") splits the window first, once chosen.
 core.new_choices = { "Terminal", "Editor", "Open file" }

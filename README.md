@@ -166,6 +166,10 @@ name order. Its state and functions are in the global `core` table.
   `C-w a` (`SPC w a`) splits that way onto the same buffer. Closing a window
   gives its room to its neighbour, and a shell that exits closes its window
   when every other terminal is on screen.
+- **Buffer tabs:** with two or more of the project's files open, they line
+  up in a bar along the top (the current one highlighted, a changed one with
+  a dot); click one to show it, or `SPC b ]` / `SPC b [` for the next and
+  previous. `vmac.set_buffer_tabs(false)` hides the bar.
 - **Tabs:** each tab has its own windows and splits (buffers and terminals
   are shared, as in Vim; the file tree stays). `Cmd-Shift-T` (`s-T`) or
   `SPC TAB n` opens one with a terminal, `:tabnew [FILE]` one on this buffer

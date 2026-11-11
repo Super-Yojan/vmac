@@ -428,6 +428,9 @@ pub struct EditorState {
     /// the cursor's line).
     pub line_numbers: String,
     pub markdown_preview: bool,
+    /// The buffer tab bar (the project's open files along the top), shown
+    /// while two or more are open.
+    pub buffer_tabs_shown: bool,
     /// PDF pages drawn in the theme's colors rather than black on white.
     pub pdf_themed: bool,
     /// Each PDF buffer's latest scrolls asked for by keys, numbered.
@@ -674,6 +677,7 @@ impl EditorState {
             markdown_rendered: false,
             line_numbers: "off".into(),
             markdown_preview: false,
+            buffer_tabs_shown: true,
             pdf_themed: true,
             media_scroll: Default::default(),
             device_buffers: Default::default(),
@@ -1065,6 +1069,61 @@ impl EditorState {
         let order = self.window_order();
         let i = order.iter().position(|&w| w == new)?;
         i.checked_sub(1).map(|i| order[i]).filter(|&w| !self.is_sidebar(w))
+    }
+
+    // ---- Buffer tabs
+
+    /// The files open in this project (the current file's), in the order
+    /// they were opened: their buffers and names (just the file's name, or
+    /// its path in the project when two share a name).
+    pub fn buffer_tabs(&self) -> Vec<(BufferId, String)> {
+        let root = self.agent_root();
+        let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let files: Vec<(BufferId, PathBuf)> = self
+            .buffers
+            .iter()
+            .filter_map(|(id, b)| Some((*id, abs(b.file()?))))
+            .filter(|(_, f)| f.starts_with(&root))
+            .collect();
+        let name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        files
+            .iter()
+            .map(|(id, f)| {
+                let shared = files.iter().filter(|(_, g)| name(g) == name(f)).count() > 1;
+                let label = if shared {
+                    f.strip_prefix(&root).map(|r| r.display().to_string()).unwrap_or_else(|_| name(f))
+                } else {
+                    name(f)
+                };
+                (*id, label)
+            })
+            .collect()
+    }
+
+    /// The buffer the buffer tab bar shows as current: the selected
+    /// window's (the last file window's while the sidebar is selected).
+    pub fn buffer_tab_current(&self) -> BufferId {
+        let id = if self.is_sidebar(self.selected) { self.last_main } else { self.selected };
+        self.window_by_id(id).map_or(self.window().buffer, |w| w.buffer)
+    }
+
+    /// Shows the file `n` buffer tabs on (negative: back), wrapping around;
+    /// from a buffer that isn't one (a terminal), the first or the last.
+    /// False when the project has no files open.
+    pub fn buffer_tab_next(&mut self, n: isize) -> bool {
+        let tabs = self.buffer_tabs();
+        if tabs.is_empty() {
+            return false;
+        }
+        let len = tabs.len() as isize;
+        let here = self.window().buffer;
+        let to = match tabs.iter().position(|(id, _)| *id == here) {
+            Some(i) => (i as isize + n).rem_euclid(len),
+            None if n > 0 => 0,
+            None => len - 1,
+        };
+        self.show_buffer(tabs[to as usize].0);
+        true
     }
 
     // ---- Tabs
@@ -4082,6 +4141,34 @@ mod tests {
         let one = s.selected_window();
         s.split_window_auto();
         assert_eq!(s.window_rects().iter().find(|(w, _)| *w == one).unwrap().1.w, 0.5);
+    }
+
+    #[test]
+    fn buffer_tabs_are_the_projects_open_files() {
+        let dir = std::env::temp_dir().join(format!("vmac-buffer-tabs-{}", std::process::id()));
+        let other = std::env::temp_dir().join(format!("vmac-buffer-tabs-other-{}", std::process::id()));
+        for d in [dir.join(".git"), dir.join("sub"), other.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for f in [dir.join("a.rs"), dir.join("b.rs"), dir.join("sub/a.rs"), other.join("c.rs")] {
+            std::fs::write(f, "x").unwrap();
+        }
+        let mut s = state("x");
+        for f in ["a.rs", "b.rs", "sub/a.rs"] {
+            s.open_file(&dir.join(f)).unwrap();
+        }
+        s.open_file(&other.join("c.rs")).unwrap();
+        s.open_file(&dir.join("b.rs")).unwrap();
+        let names: Vec<String> = s.buffer_tabs().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["a.rs", "b.rs", "sub/a.rs"], "another folder's file and *a* aren't in it");
+        assert!(s.buffer_tab_next(1));
+        assert!(s.buffer().file().unwrap().ends_with("sub/a.rs"));
+        assert!(s.buffer_tab_next(1));
+        assert!(s.buffer().file().unwrap().ends_with("a.rs"), "wraps around");
+        s.buffer_tab_next(-1);
+        assert!(s.buffer().file().unwrap().ends_with("sub/a.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]

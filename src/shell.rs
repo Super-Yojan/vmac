@@ -1339,7 +1339,7 @@ impl Render for Shell {
 
         // The tabs, along the top when there are two or more: the one shown
         // stands out, and a click shows another.
-        let tab_bar = (frame.tab_bar > 0.).then(|| {
+        let tab_bar = (!frame.tabs.is_empty()).then(|| {
             let t = cx.theme();
             let (border, active_bg, fg, muted) = (t.border, t.status_bar, t.foreground, t.muted_foreground);
             h_flex()
@@ -1347,7 +1347,7 @@ impl Render for Shell {
                 .left_0()
                 .top_0()
                 .w_full()
-                .h(px(frame.tab_bar))
+                .h(px(ROW_HEIGHT))
                 .overflow_hidden()
                 .border_b_1()
                 .border_color(border)
@@ -1372,6 +1372,49 @@ impl Render for Shell {
                             cx.listener(move |shell, _, _, cx| {
                                 cx.stop_propagation();
                                 shell.send(Input::SelectTab { index: i }, cx);
+                            }),
+                        )
+                }))
+        });
+
+        // The project's open files, below the tabs: the current one stands
+        // out, a changed one has a dot, and a click shows one.
+        let buffer_bar = (!frame.buffer_tabs.is_empty()).then(|| {
+            let t = cx.theme();
+            let (border, active_bg, bg, fg, muted, accent) =
+                (t.border, t.background, t.status_bar, t.foreground, t.muted_foreground, t.primary);
+            let top = if frame.tabs.is_empty() { 0. } else { ROW_HEIGHT };
+            h_flex()
+                .absolute()
+                .left_0()
+                .top(px(top))
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .overflow_hidden()
+                .bg(bg)
+                .border_b_1()
+                .border_color(border)
+                .children(frame.buffer_tabs.iter().map(|b| {
+                    let buffer = b.buffer;
+                    h_flex()
+                        .h_full()
+                        .px(px(12.))
+                        .gap(px(6.))
+                        .max_w(px(220.))
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .border_r_1()
+                        .border_color(border)
+                        .when(b.current, |d| d.bg(active_bg).text_color(fg).border_t_2().border_color(accent))
+                        .when(!b.current, |d| d.text_color(muted))
+                        .child(b.name.clone())
+                        .when(b.modified, |d| d.child(div().text_color(accent).child("•")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _, cx| {
+                                cx.stop_propagation();
+                                shell.send(Input::SelectBuffer { buffer }, cx);
                             }),
                         )
                 }))
@@ -1502,7 +1545,7 @@ impl Render for Shell {
             .font_family(font.unwrap_or_else(|| theme.mono_font_family.clone()))
             .text_size(px(FONT_SIZE))
             .line_height(px(ROW_HEIGHT))
-            .child(div().relative().w_full().h(px(area)).children(windows).children(preview).children(tab_bar).children(handles))
+            .child(div().relative().w_full().h(px(area)).children(windows).children(preview).children(tab_bar).children(buffer_bar).children(handles))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
             .children(whichkey)
             .children(hover)
