@@ -159,7 +159,20 @@ name order. Its state and functions are in the global `core` table.
 - **Windows:** `C-w v` splits beside, `C-w s` below (or `SPC w v/s`, `:vs FILE`,
   `:sp FILE`); `C-w h/j/k/l` moves, `C-w w` cycles, `C-w c` closes, `C-w o`
   keeps only this one. Each window has its own cursor. `:q` closes a window
-  and quits from the last; `:qa` quits.
+  (the last one in a tab closes the tab) and quits from the last; `:qa` quits.
+- **Tiling, bspwm-style:** `Cmd-Enter` (`s-RET`), `SPC o s` or `C-w n` opens a
+  terminal by splitting the window you're in along its longer side (wide:
+  side by side, tall: stacked), so each new one halves the last in a spiral.
+  `C-w a` (`SPC w a`) splits that way onto the same buffer. Closing a window
+  gives its room to its neighbour, and a shell that exits closes its window
+  when every other terminal is on screen.
+- **Tabs:** each tab has its own windows and splits (buffers and terminals
+  are shared, as in Vim; the file tree stays). `Cmd-Shift-T` (`s-T`) or
+  `SPC TAB n` opens one with a terminal, `:tabnew [FILE]` one on this buffer
+  (`SPC TAB N`); `Cmd-1`...`Cmd-9` or `SPC TAB 1`...`9` go to a tab,
+  `Cmd-}`/`Cmd-{` (from files), `SPC TAB ]`/`[`, `:tabn`/`:tabp` the next and
+  previous, `SPC TAB TAB` or `:tabs` picks one, `SPC TAB d` or `:tabc` closes
+  it. With two or more, a bar along the top shows them; click one to show it.
 - **Editing:** `i a I A o O`, `x`, `p P`, `u`, `C-r`. Insert: type; `ESC` back.
 - **System clipboard:** yanks and deletes also copy to it, and `p P` paste
   what was copied last anywhere (text copied in another app wins over an

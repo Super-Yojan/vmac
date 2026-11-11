@@ -81,6 +81,10 @@ local function split(where)
   end
 end
 
+local function typing_if_terminal()
+  core.state = V.terminal_here() and "insert" or "normal"
+end
+
 local function alias(names, fn)
   for _, name in ipairs(names) do core.ex_commands[name] = fn end
 end
@@ -105,6 +109,17 @@ alias({ "new" }, function() core.choose_new("below") end)
 alias({ "vnew" }, function() core.choose_new("right") end)
 alias({ "on", "only" }, function() V.delete_other_windows() end)
 alias({ "clo", "close" }, function() core.call_binding("window-close") end)
+alias({ "tabnew", "tabe", "tabedit" }, function(arg)
+  V.tab_new()
+  if arg ~= "" then V.find_file(arg) end
+  typing_if_terminal()
+end)
+alias({ "tabc", "tabclose" }, function() core.call_binding("tab-close") end)
+alias({ "tabn", "tabnext" }, function(arg)
+  if arg ~= "" and tonumber(arg) then core.call_binding("tab-" .. arg) else core.call_binding("tab-next") end
+end)
+alias({ "tabp", "tabprevious", "tabN" }, function() core.call_binding("tab-previous") end)
+alias({ "tabs" }, function() core.call_binding("tab-pick") end)
 alias({ "lua", "eval" }, function(arg) core.eval(arg) end)
 alias({ "term", "terminal" }, function(arg)
   if V.terminal_open("", arg) then core.state = "insert" end
@@ -289,16 +304,71 @@ V.command("window-down", function() V.select_window_in_direction("down") end)
 V.command("window-next", function() V.other_window(1) end)
 V.command("window-previous", function() V.other_window(-1) end)
 V.command("window-close", function()
-  if not V.delete_window() then V.message("Can't close the last window") end
+  if V.delete_window() then return end
+  -- The last window of a tab closes the tab, as in Vim.
+  if not V.tab_close() then V.message("Can't close the last window") end
 end)
 V.command("window-only", function() V.delete_other_windows() end)
 -- Drag a border between windows with the mouse to size them; C-w = (or
 -- SPC w =) makes them all the same size again.
 V.command("window-balance", function() V.balance_windows() end)
 
--- :q closes the window, and quits from the last one.
+-- :q closes the window (the last one in a tab closes the tab), and quits
+-- from the last one.
 V.command("quit-window", function()
-  if not V.delete_window() then V.quit_editor() end
+  if not V.delete_window() and not V.tab_close() then V.quit_editor() end
+end)
+
+---- Tiling and tabs
+--
+-- New windows can tile the way bspwm does: each splits the window you're in
+-- along its longer side (a wide window side by side, a tall one stacked),
+-- so opening several halves the space again and again in a spiral. s-RET
+-- (Cmd-Enter), SPC o s or C-w n opens a terminal that way; C-w a splits
+-- that way onto the same buffer (:split-auto). Closing a window gives its
+-- room back to its neighbour; a shell that exits closes its window when
+-- every other terminal is on screen already.
+--
+-- Tabs each hold their own windows and splits (buffers and terminals are
+-- every tab's). s-T (Cmd-Shift-T) or SPC TAB n opens one with a terminal,
+-- :tabnew one on this buffer; s-1 ... s-9 or SPC TAB 1 ... 9 go to a tab,
+-- s-} / s-{ (from files), SPC TAB ] / [ or :tabn / :tabp the next and
+-- previous, SPC TAB d or :tabc closes this one (closing its last window
+-- does too). With two or more, a bar along the top shows them; a click on
+-- one shows it.
+
+V.command("split-auto", function() V.split_window("auto") end)
+V.command("terminal-spawn", function()
+  V.split_window("auto")
+  if V.terminal_open("", "") then
+    core.state = "insert"
+  else
+    V.delete_window()
+  end
+end)
+
+V.command("tab-new", function()
+  V.tab_new()
+  if V.terminal_open("", "") then core.state = "insert" else typing_if_terminal() end
+end)
+V.command("tab-new-here", function() V.tab_new() typing_if_terminal() end)
+V.command("tab-close", function()
+  if V.tab_close() then typing_if_terminal() else V.message("Can't close the last tab") end
+end)
+V.command("tab-next", function() V.tab_next(1) typing_if_terminal() end)
+V.command("tab-previous", function() V.tab_next(-1) typing_if_terminal() end)
+for i = 1, 9 do
+  V.command("tab-" .. i, function()
+    if V.tab_select(i) then typing_if_terminal() else V.message("No tab " .. i) end
+  end)
+end
+V.command("tab-pick", function()
+  local names = {}
+  for i, name in ipairs(V.tab_names()) do names[#names + 1] = i .. " " .. name end
+  core.pick("Tab", names, "", function(choice)
+    V.tab_select(tonumber(choice:match("^(%d+)")))
+    typing_if_terminal()
+  end)
 end)
 
 ---- Fonts

@@ -74,6 +74,8 @@ pub enum Input {
     PdfDoubleClick { window: WindowId, page: usize, x: f32, y: f32 },
     /// Whether the system is in dark mode.
     Appearance { dark: bool },
+    /// A click on a tab in the tab bar (from 0).
+    SelectTab { index: usize },
     /// The theme's text and background colors (0xRRGGBB), for terminal
     /// programs that ask.
     TerminalColors { foreground: u32, background: u32 },
@@ -116,6 +118,15 @@ pub struct Frame {
     pub sessions: Vec<SessionInfo>,
     #[serde(default)]
     pub session: String,
+    /// The tabs' names and the one shown (from 0). With two or more, the
+    /// tab bar takes `tab_bar` pixels at the top of the windows' area
+    /// (their places already leave it).
+    #[serde(default)]
+    pub tabs: Vec<String>,
+    #[serde(default)]
+    pub tab: usize,
+    #[serde(default)]
+    pub tab_bar: f32,
 }
 
 /// A session, as the switcher and `vmac ls` describe it.

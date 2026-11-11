@@ -201,6 +201,17 @@ pub enum Layout {
     Split(Axis, Vec<Layout>, Vec<f32>),
 }
 
+/// A tab that isn't shown: its windows and how they're split, which one is
+/// selected, and the one files open in from the sidebar. The tab shown keeps
+/// these in `EditorState` itself (the sidebar is every tab's).
+#[derive(Debug, Clone)]
+struct Tab {
+    layout: Layout,
+    windows: Vec<Window>,
+    selected: WindowId,
+    last_main: WindowId,
+}
+
 /// The smallest share of the editing area a border can be dragged to leave
 /// a window.
 const MIN_SHARE: f32 = 0.05;
@@ -355,6 +366,10 @@ pub struct EditorState {
     pub sidebar_width: f32,
     /// The last selected window in the layout, where files open from the sidebar.
     last_main: WindowId,
+    /// Every tab, in order: None is the one shown (`tab`), whose windows
+    /// are the ones above.
+    tabs: Vec<Option<Tab>>,
+    tab: usize,
     pub minibuffer: Buffer,
     pub minibuffer_prompt: Option<String>,
     pub message: String,
@@ -625,6 +640,8 @@ impl EditorState {
             sidebar: None,
             sidebar_width: 0.22,
             last_main: 2,
+            tabs: vec![None],
+            tab: 0,
             minibuffer: Buffer::new("*minibuffer*"),
             minibuffer_prompt: None,
             message: String::new(),
@@ -875,7 +892,8 @@ impl EditorState {
         }
         let fallback = self.buffers[0].0;
         let point = self.buffer_by_id(fallback).map(Buffer::point).unwrap_or(0);
-        for w in self.windows.iter_mut().filter(|w| w.buffer == id) {
+        let hidden = self.tabs.iter_mut().flatten().flat_map(|t| t.windows.iter_mut());
+        for w in self.windows.iter_mut().chain(hidden).filter(|w| w.buffer == id) {
             w.buffer = fallback;
             w.point = point;
             w.scroll_top = 0;
@@ -998,6 +1016,176 @@ impl EditorState {
         let target = self.selected;
         self.layout.split(target, id, axis);
         self.select_window(id);
+    }
+
+    /// Splits the selected window the way bspwm tiles: along its longer
+    /// side (a wide window side by side, a tall one stacked), so each new
+    /// window halves the one it came from. The new one is selected.
+    pub fn split_window_auto(&mut self) {
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
+        let axis = self.longer_side(self.selected);
+        let (rows, cols) = (self.window().rows, self.window().cols);
+        self.split_window(axis);
+        // Half the size each until the view lays them out again (a terminal
+        // opened in the new one starts at about its size).
+        let halve = |w: &mut Window| match axis {
+            Axis::Row => w.cols = cols / 2,
+            Axis::Column => w.rows = rows / 2,
+        };
+        let new = self.selected;
+        let old = self.last_split_from(new);
+        for id in [Some(new), old].into_iter().flatten() {
+            if let Some(w) = self.window_by_id_mut(id) {
+                halve(w);
+            }
+        }
+    }
+
+    /// Which way to split a window so that the halves are closest to
+    /// square: `Row` (side by side) when it is wider than tall. Its size on
+    /// screen is its rows and columns once laid out (a column is about
+    /// 0.42 of a row's height), else its share of the editing area.
+    fn longer_side(&self, id: WindowId) -> Axis {
+        let laid_out = self.window_by_id(id).filter(|w| w.rows > 0 && w.cols > 0);
+        let (width, height) = match laid_out {
+            Some(w) => (w.cols as f32 * crate::frame::CHAR_WIDTH * crate::frame::FONT_SIZE, (w.rows + 1) as f32 * crate::frame::ROW_HEIGHT),
+            None => {
+                let rect = self.window_rects().into_iter().find(|(w, _)| *w == id).map(|(_, r)| r);
+                // As fractions of a 16:10 screen.
+                rect.map_or((1., 0.), |r| (r.w * 1.6, r.h))
+            }
+        };
+        if width >= height { Axis::Row } else { Axis::Column }
+    }
+
+    /// The window `new` was just split off: the one before it in the order.
+    fn last_split_from(&self, new: WindowId) -> Option<WindowId> {
+        let order = self.window_order();
+        let i = order.iter().position(|&w| w == new)?;
+        i.checked_sub(1).map(|i| order[i]).filter(|&w| !self.is_sidebar(w))
+    }
+
+    // ---- Tabs
+    //
+    // Each tab has its own windows and splits; buffers (and terminals) are
+    // every tab's, as in Vim. The sidebar stays across tabs.
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// The tab shown, from 0.
+    pub fn tab_index(&self) -> usize {
+        self.tab
+    }
+
+    /// What the tab bar says for each tab: the selected window's buffer,
+    /// and how many windows the tab has when more than one.
+    pub fn tab_names(&self) -> Vec<String> {
+        let name = |windows: &[Window], selected: WindowId| {
+            let buffer = windows.iter().find(|w| w.id == selected).and_then(|w| self.buffer_by_id(w.buffer));
+            let name = buffer.map(|b| b.name().to_string()).unwrap_or_default();
+            let n = windows.iter().filter(|w| !self.is_sidebar(w.id)).count();
+            if n > 1 { format!("{name} +{}", n - 1) } else { name }
+        };
+        self.tabs
+            .iter()
+            .map(|t| match t {
+                Some(t) => name(&t.windows, t.selected),
+                None => {
+                    let selected = if self.is_sidebar(self.selected) { self.last_main } else { self.selected };
+                    name(&self.windows, selected)
+                }
+            })
+            .collect()
+    }
+
+    /// Takes the tab shown out of the editor: its windows (not the
+    /// sidebar), with the selected one's point saved.
+    fn stash_tab(&mut self) -> Tab {
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
+        let point = self.buffer().point();
+        self.window_mut().point = point;
+        let sidebar = self.sidebar;
+        let (windows, kept): (Vec<Window>, Vec<Window>) =
+            std::mem::take(&mut self.windows).into_iter().partition(|w| Some(w.id) != sidebar);
+        self.windows = kept;
+        Tab {
+            layout: std::mem::replace(&mut self.layout, Layout::Leaf(0)),
+            windows,
+            selected: self.selected,
+            last_main: self.last_main,
+        }
+    }
+
+    /// Shows a tab taken out by `stash_tab`.
+    fn show_tab(&mut self, t: Tab) {
+        self.windows.extend(t.windows);
+        self.layout = t.layout;
+        self.selected = t.selected;
+        self.last_main = t.last_main;
+        let point = self.window().point;
+        self.buffer_mut().goto_char(point);
+    }
+
+    /// Opens a tab after this one, on the selected window's buffer, and
+    /// shows it.
+    pub fn tab_new(&mut self) {
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
+        let id = self.fresh_id();
+        let mut window = self.window().clone();
+        window.id = id;
+        window.point = self.buffer().point();
+        let old = self.stash_tab();
+        self.tabs[self.tab] = Some(old);
+        self.tab += 1;
+        self.tabs.insert(self.tab, None);
+        self.show_tab(Tab { layout: Layout::Leaf(id), windows: vec![window], selected: id, last_main: id });
+    }
+
+    /// Shows the tab at `index` (from 0); false when there's none.
+    pub fn tab_select(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        if index != self.tab {
+            let old = self.stash_tab();
+            self.tabs[self.tab] = Some(old);
+            let t = self.tabs[index].take().expect("a tab not shown is stashed");
+            self.tab = index;
+            self.show_tab(t);
+        }
+        true
+    }
+
+    /// Moves `n` tabs on (negative: back), wrapping around.
+    pub fn tab_next(&mut self, n: isize) {
+        let len = self.tabs.len() as isize;
+        self.tab_select((self.tab as isize + n).rem_euclid(len) as usize);
+    }
+
+    /// Closes the tab shown and its windows (their buffers stay open), and
+    /// shows the next one, or the one before the last. False for the last tab.
+    pub fn tab_close(&mut self) -> bool {
+        if self.tabs.len() < 2 {
+            return false;
+        }
+        if self.is_sidebar(self.selected) {
+            self.select_main_window();
+        }
+        let sidebar = self.sidebar;
+        self.windows.retain(|w| Some(w.id) == sidebar);
+        self.tabs.remove(self.tab);
+        self.tab = self.tab.min(self.tabs.len() - 1);
+        let t = self.tabs[self.tab].take().expect("a tab not shown is stashed");
+        self.show_tab(t);
+        true
     }
 
     /// Shows a file in a new window to the right of this one, leaving the
@@ -3685,17 +3873,45 @@ impl EditorState {
     /// window shows another buffer).
     pub fn close_terminal(&mut self, id: BufferId) {
         self.last_terminal = self.last_terminal.filter(|&t| t != id);
-        let next = self.recent_terminal().filter(|&t| t != id).or_else(|| {
-            self.terminals.iter().rev().find(|t| t.buffer != id && !t.exited).map(|t| t.buffer)
-        });
+        let candidates: Vec<BufferId> = self
+            .recent_terminal()
+            .into_iter()
+            .chain(self.terminals.iter().rev().filter(|t| !t.exited).map(|t| t.buffer))
+            .filter(|&t| t != id)
+            .collect();
         let selected = self.selected;
         let showing: Vec<WindowId> = self.windows.iter().filter(|w| w.buffer == id).map(|w| w.id).collect();
         for w in showing {
             self.select_window(w);
-            match next {
-                Some(n) => self.show_buffer(n),
-                None => {
+            // Another terminal no window shows takes its place; with every
+            // terminal on screen already (tiled), the window closes and its
+            // neighbours take the room, unless it's the last.
+            let shown: std::collections::HashSet<BufferId> = self.windows.iter().map(|w| w.buffer).collect();
+            let hidden = candidates.iter().copied().find(|t| !shown.contains(t));
+            let alone = self.window_order().iter().filter(|&&w| !self.is_sidebar(w)).count() < 2;
+            match (hidden, candidates.first()) {
+                (Some(n), _) => self.show_buffer(n),
+                (None, Some(&n)) if alone => self.show_buffer(n),
+                _ => {
                     self.close_window();
+                }
+            }
+        }
+        // In tabs not shown, windows on it close (the last one in a tab
+        // shows another buffer, below).
+        for t in self.tabs.iter_mut().flatten() {
+            let mut gone: Vec<WindowId> = t.windows.iter().filter(|w| w.buffer == id).map(|w| w.id).collect();
+            gone.truncate(t.windows.len().saturating_sub(1).min(gone.len()));
+            for w in gone {
+                t.layout.remove(w);
+                t.windows.retain(|x| x.id != w);
+                let mut left = Vec::new();
+                t.layout.leaves(&mut left);
+                if t.selected == w {
+                    t.selected = left[0];
+                }
+                if t.last_main == w {
+                    t.last_main = t.selected;
                 }
             }
         }
@@ -3834,6 +4050,88 @@ mod tests {
         assert_eq!(s.window_in_direction("up"), Some(right));
         assert_eq!(s.window_in_direction("left"), Some(first));
         assert_eq!(s.window_in_direction("right"), None);
+    }
+
+    #[test]
+    fn auto_splits_tile_like_bspwm() {
+        let mut s = state("x");
+        let first = s.selected_window();
+        // Laid out wide: side by side; then the right half, taller than
+        // wide, stacks; then its bottom half goes side by side again.
+        s.window_mut().rows = 40;
+        s.window_mut().cols = 200;
+        s.split_window_auto();
+        let second = s.selected_window();
+        assert_eq!(s.window_by_id(first).unwrap().cols, 100, "halved until laid out again");
+        s.window_mut().rows = 40;
+        s.window_mut().cols = 60;
+        s.split_window_auto();
+        let third = s.selected_window();
+        s.window_mut().rows = 10;
+        s.window_mut().cols = 60;
+        s.split_window_auto();
+        let fourth = s.selected_window();
+        let rects = s.window_rects();
+        let r = |id| rects.iter().find(|(w, _)| *w == id).unwrap().1;
+        assert_eq!(r(first), Rect { x: 0., y: 0., w: 0.5, h: 1. });
+        assert_eq!(r(second), Rect { x: 0.5, y: 0., w: 0.5, h: 0.5 });
+        assert_eq!(r(third), Rect { x: 0.5, y: 0.5, w: 0.25, h: 0.5 });
+        assert_eq!(r(fourth), Rect { x: 0.75, y: 0.5, w: 0.25, h: 0.5 });
+        // Not laid out yet: by its share of the area (the whole: wide).
+        let mut s = state("x");
+        let one = s.selected_window();
+        s.split_window_auto();
+        assert_eq!(s.window_rects().iter().find(|(w, _)| *w == one).unwrap().1.w, 0.5);
+    }
+
+    #[test]
+    fn tabs_keep_their_own_windows() {
+        let mut s = state("x");
+        let first = s.selected_window();
+        s.split_window(Axis::Row);
+        let right = s.selected_window();
+        s.buffer_mut().goto_char(1);
+        assert_eq!(s.tab_count(), 1);
+        s.tab_new();
+        assert_eq!((s.tab_count(), s.tab_index()), (2, 1));
+        assert_eq!(s.window_order().len(), 1, "a new tab has one window");
+        assert_eq!(s.window().buffer, s.window_by_id(s.selected_window()).unwrap().buffer);
+        let other = s.add_buffer(Buffer::new("b"));
+        s.show_buffer(other);
+        s.split_window_auto();
+        assert_eq!(s.tab_names(), vec!["a +1".to_string(), "b +1".to_string()]);
+        // Back: the same windows, the same one selected, its point back.
+        s.tab_next(1);
+        assert_eq!(s.tab_index(), 0, "wraps around");
+        assert_eq!(s.window_order(), vec![first, right]);
+        assert_eq!(s.selected_window(), right);
+        assert_eq!(s.buffer().point(), 1);
+        // The sidebar is every tab's.
+        let tree = s.add_buffer(Buffer::new("*tree*"));
+        s.open_sidebar(tree);
+        assert!(s.tab_select(1));
+        assert!(s.sidebar().is_some());
+        assert_eq!(s.window_order().len(), 3, "the sidebar and this tab's two");
+        // Closing a tab shows the one before it (the last one stays).
+        assert!(s.tab_close());
+        assert_eq!((s.tab_count(), s.tab_index()), (1, 0));
+        assert_eq!(s.selected_window(), right);
+        assert!(!s.tab_close());
+        assert!(!s.tab_select(1));
+    }
+
+    #[test]
+    fn killing_a_buffer_fixes_windows_in_other_tabs() {
+        let mut s = state("x");
+        let other = s.add_buffer(Buffer::new("b"));
+        s.show_buffer(other);
+        s.tab_new();
+        let a = s.buffer_id_named("a").unwrap();
+        s.show_buffer(a);
+        s.kill_buffer_id(other, true).unwrap();
+        s.tab_select(0);
+        assert_ne!(s.window().buffer, other);
+        assert!(s.buffer_by_id(s.window().buffer).is_some());
     }
 
     #[test]

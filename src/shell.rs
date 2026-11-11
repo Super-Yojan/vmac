@@ -1337,6 +1337,46 @@ impl Render for Shell {
             })
             .collect();
 
+        // The tabs, along the top when there are two or more: the one shown
+        // stands out, and a click shows another.
+        let tab_bar = (frame.tab_bar > 0.).then(|| {
+            let t = cx.theme();
+            let (border, active_bg, fg, muted) = (t.border, t.status_bar, t.foreground, t.muted_foreground);
+            h_flex()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w_full()
+                .h(px(frame.tab_bar))
+                .overflow_hidden()
+                .border_b_1()
+                .border_color(border)
+                .children(frame.tabs.iter().enumerate().map(|(i, name)| {
+                    let shown = i == frame.tab;
+                    h_flex()
+                        .h_full()
+                        .px(px(12.))
+                        .gap(px(6.))
+                        .max_w(px(260.))
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .border_r_1()
+                        .border_color(border)
+                        .when(shown, |d| d.bg(active_bg).text_color(fg))
+                        .when(!shown, |d| d.text_color(muted))
+                        .child(div().text_color(muted).child(format!("{}", i + 1)))
+                        .child(name.clone())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _, cx| {
+                                cx.stop_propagation();
+                                shell.send(Input::SelectTab { index: i }, cx);
+                            }),
+                        )
+                }))
+        });
+
         let theme = cx.theme();
         // K's documentation, by the cursor: below its line, or above when near the bottom.
         let hover = frame.hover.clone().zip(frame.cursor_at).map(|(doc, (x, y, line_height))| {
@@ -1415,9 +1455,9 @@ impl Render for Shell {
             div()
                 .absolute()
                 .left(px(p.left))
-                .top_0()
+                .top(px(frame.tab_bar))
                 .w(px(p.width))
-                .h(px(area))
+                .h(px(area - frame.tab_bar))
                 .border_l_1()
                 .border_color(theme.border)
                 .bg(theme.background)
@@ -1462,7 +1502,7 @@ impl Render for Shell {
             .font_family(font.unwrap_or_else(|| theme.mono_font_family.clone()))
             .text_size(px(FONT_SIZE))
             .line_height(px(ROW_HEIGHT))
-            .child(div().relative().w_full().h(px(area)).children(windows).children(preview).children(handles))
+            .child(div().relative().w_full().h(px(area)).children(windows).children(preview).children(tab_bar).children(handles))
             .child(div().h(px(ROW_HEIGHT)).px(px(8.)).child(echo))
             .children(whichkey)
             .children(hover)
