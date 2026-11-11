@@ -24,6 +24,10 @@ pub struct Session {
     /// the width of the last frame.
     sidebar_px: f32,
     width: f32,
+    /// The last frame's windows' height and its tab bar's, for borders
+    /// dragged in it.
+    area: f32,
+    tab_bar: f32,
 }
 
 /// A button held down: in a window's text (dragging selects), or reported
@@ -47,6 +51,8 @@ impl Session {
             custom: HashSet::new(),
             sidebar_px: SIDEBAR_WIDTH,
             width: 1.,
+            area: 1.,
+            tab_bar: 0.,
         }
     }
 
@@ -123,6 +129,15 @@ impl Session {
                     crate::frame::Border::Right => crate::editor::Axis::Row,
                     crate::frame::Border::Bottom => crate::editor::Axis::Column,
                 };
+                // The window drags in the whole area; the layout fills
+                // what's below the tab bar.
+                let to = match border {
+                    crate::frame::Border::Bottom => {
+                        let room = (self.area - self.tab_bar).max(1.);
+                        ((to * self.area - self.tab_bar) / room).clamp(0., 1.)
+                    }
+                    crate::frame::Border::Right => to,
+                };
                 st.move_window_border(window, axis, to);
             }
             Input::Wheel { window, lines, line, col, mods } => {
@@ -179,6 +194,9 @@ impl Session {
                 st.theme_names = themes;
             }
             Input::Appearance { dark } => self.editor.lock().system_dark = dark,
+            Input::SelectTab { index } => {
+                self.editor.lock().tab_select(index);
+            }
             Input::TerminalColors { foreground, background } => crate::terminal::set_colors(foreground, background),
         }
     }
@@ -276,7 +294,10 @@ impl Session {
         let mut st = self.editor.lock();
         self.width = width.max(1.);
         st.sidebar_width = (self.sidebar_px / self.width).clamp(0.08, 0.6);
-        let rects = st.window_rects();
+        // With two or more tabs, the tab bar takes a row at the top.
+        let tab_bar = if st.tab_count() > 1 { ROW_HEIGHT } else { 0. };
+        (self.area, self.tab_bar) = (area, tab_bar);
+        let rects: Vec<_> = st.window_rects().into_iter().map(|(id, r)| (id, below_tab_bar(r, tab_bar, area))).collect();
         for (id, r) in &rects {
             st.fit_window(*id, window_rows(r, area));
         }
@@ -763,6 +784,9 @@ impl Session {
             buffers: st.buffer_ids(),
             sessions: Vec::new(),
             session: String::new(),
+            tabs: if tab_bar > 0. { st.tab_names() } else { Vec::new() },
+            tab: st.tab_index(),
+            tab_bar,
         };
         drop(st);
         self.custom = custom;
@@ -899,6 +923,16 @@ fn fit_lines(mut top: usize, cursor: usize, end: usize, room: f32, height: impl 
 }
 
 /// Text rows a window of this size shows: its height less its modeline.
+/// A window's place in the layout, moved into the part of the area below
+/// the tab bar (`tab_bar` of `area` pixels).
+fn below_tab_bar(r: Rect, tab_bar: f32, area: f32) -> Rect {
+    if tab_bar <= 0. || area <= tab_bar {
+        return r;
+    }
+    let room = (area - tab_bar) / area;
+    Rect { y: tab_bar / area + r.y * room, h: r.h * room, ..r }
+}
+
 fn window_rows(r: &Rect, area_height: f32) -> usize {
     ((r.h * area_height / ROW_HEIGHT) as usize).saturating_sub(1).max(1)
 }
@@ -922,6 +956,31 @@ mod tests {
     }
 
     const VIEW: Viewport = Viewport { width: 800., height: 600. };
+
+    #[test]
+    fn a_second_tab_brings_the_tab_bar() {
+        let mut s = session_with("one\ntwo\n");
+        let frame = s.frame(VIEW);
+        assert_eq!((frame.tab_bar, frame.windows[0].top), (0., 0.));
+        assert!(frame.tabs.is_empty());
+        s.editor.lock().tab_new();
+        s.editor.lock().split_window(crate::editor::Axis::Column);
+        let frame = s.frame(VIEW);
+        assert_eq!(frame.tab_bar, ROW_HEIGHT);
+        assert_eq!(frame.tabs, vec!["test".to_string(), "test +1".to_string()]);
+        assert_eq!(frame.tab, 1);
+        let (top, bottom) = (&frame.windows[0], &frame.windows[1]);
+        assert_eq!(top.top, ROW_HEIGHT, "windows start below the bar");
+        assert!((bottom.top + bottom.height - frame.area).abs() < 0.01, "and still reach the echo area");
+        // A border dragged to the middle of the area lands there.
+        let id = top.id;
+        s.handle(Input::Resize { window: id, border: Border::Bottom, to: 0.5 });
+        let frame = s.frame(VIEW);
+        assert!((frame.windows[0].top + frame.windows[0].height - frame.area / 2.).abs() < 0.5);
+        // A click on the first tab shows it.
+        s.handle(Input::SelectTab { index: 0 });
+        assert_eq!(s.editor.lock().tab_index(), 0);
+    }
 
     fn lines(frame: &Frame) -> &[FrameLine] {
         match &frame.windows[0].content {

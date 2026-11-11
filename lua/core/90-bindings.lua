@@ -116,6 +116,12 @@ bind(K.normal, {
   { "SPC w k", "window-up" }, { "SPC w l", "window-right" },
   { "SPC w w", "window-next" }, { "SPC w d", "window-close" },
   { "SPC w c", "window-close" }, { "SPC w o", "window-only" },
+  -- Tiling (bspwm-style) and tabs
+  { "s-RET", "terminal-spawn" }, { "SPC o s", "terminal-spawn" }, { "C-w n", "terminal-spawn" },
+  { "C-w a", "split-auto" }, { "SPC w a", "split-auto" },
+  { "s-T", "tab-new" }, { "SPC TAB n", "tab-new" }, { "SPC TAB N", "tab-new-here" },
+  { "SPC TAB d", "tab-close" }, { "SPC TAB ]", "tab-next" }, { "SPC TAB [", "tab-previous" },
+  { "SPC TAB TAB", "tab-pick" }, { "s-}", "tab-next" }, { "s-{", "tab-previous" },
   -- Scrolling
   { "C-d", "scroll-half-down" }, { "C-u", "scroll-half-up" },
   { "C-f", "scroll-page-down" }, { "C-b", "scroll-page-up" },
@@ -168,3 +174,16 @@ bind(K.picker_normal, {
   { "C-d", "picker-page-down" }, { "C-u", "picker-page-up" },
   { "RET", "minibuffer-exit" }, { "q", "keyboard-quit" }, { "ESC", "keyboard-quit" },
 })
+
+-- Tabs by number, and spawning a tiled terminal, from anywhere: s-1 ... s-9
+-- and SPC TAB 1 ... 9; s-RET and s-T also while typing into a terminal.
+for i = 1, 9 do
+  K.normal["s-" .. i] = "tab-" .. i
+  K.normal["SPC TAB " .. i] = "tab-" .. i
+  core.define_key("terminal", "s-" .. i, "tab-" .. i)
+  core.define_key("terminal_normal", "s-" .. i, "tab-" .. i)
+end
+for _, map in ipairs({ "terminal", "terminal_normal" }) do
+  core.define_key(map, "s-RET", "terminal-spawn")
+  core.define_key(map, "s-T", "tab-new")
+end

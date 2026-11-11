@@ -990,9 +990,20 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     });
 
     // Windows: split, move between, close; scrolling.
-    prim!(reg, editor, "split-window", |s, side: String| s.split_window(
-        if side == "below" { crate::editor::Axis::Column } else { crate::editor::Axis::Row }
-    ));
+    // "right", "below", or "auto": along the window's longer side, as bspwm tiles.
+    prim!(reg, editor, "split-window", |s, side: String| match side.as_str() {
+        "auto" => s.split_window_auto(),
+        "below" => s.split_window(crate::editor::Axis::Column),
+        _ => s.split_window(crate::editor::Axis::Row),
+    });
+    // Tabs, each with its own windows: indexes from 1 in Lua.
+    prim!(reg, editor, "tab-new", |s| s.tab_new());
+    prim!(reg, editor, "tab-close", |s| s.tab_close());
+    prim!(reg, editor, "tab-next", |s, n: isize| s.tab_next(n));
+    prim!(reg, editor, "tab-select", |s, n: isize| n >= 1 && s.tab_select(n as usize - 1));
+    prim!(reg, editor, "tab-count", |s| s.tab_count() as isize);
+    prim!(reg, editor, "tab-index", |s| s.tab_index() as isize + 1);
+    prim!(reg, editor, "tab-names", |s| s.tab_names());
     prim!(reg, editor, "window-in-direction?", |s, dir: String| s.window_in_direction(&dir).is_some());
     prim!(reg, editor, "select-window-in-direction", |s, dir: String| {
         match s.window_in_direction(&dir) {
@@ -5428,6 +5439,46 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         assert_eq!(editor.lock().window_count(), 1);
         assert_eq!(editor.lock().buffer().name(), "test");
         assert_eq!(lisp.cursor_shape(), "box", "back in normal state");
+    }
+
+    #[test]
+    fn terminals_spawn_tiled_and_tabs_hold_them() {
+        let (mut lisp, editor) = lisp_with("text");
+        lisp.eval_lua("vmac.set_terminal_shell('/bin/sh')").unwrap();
+        lisp.dispatch_key("s-RET", "");
+        lisp.dispatch_key("s-RET", "");
+        {
+            let mut st = editor.lock();
+            assert_eq!(st.window_count(), 3);
+            assert_eq!(st.terminals.len(), 2);
+            assert!(st.terminal_here().is_some());
+        }
+        assert_eq!(lisp.cursor_shape(), "bar", "typing into the new terminal");
+        // With every terminal on screen, exit closes its window.
+        typed(&mut lisp, "exit\n");
+        assert!(pump_terminals_until(&mut lisp, &editor, |st| st.terminals.len() == 1), "exit ends it");
+        assert_eq!(editor.lock().window_count(), 2, "its window closes");
+        // s-T: a tab with a terminal of its own; s-1 back to the first.
+        lisp.dispatch_key("s-T", "");
+        assert_eq!(editor.lock().tab_count(), 2);
+        assert_eq!(editor.lock().window_count(), 1);
+        assert_eq!(editor.lock().terminals.len(), 2);
+        lisp.dispatch_key("s-1", "");
+        assert_eq!(editor.lock().tab_index(), 0);
+        assert_eq!(editor.lock().window_count(), 2);
+        // :q in the last window of a tab closes the tab, not vmac.
+        lisp.dispatch_key("s-2", "");
+        lisp.dispatch_key("ESC", "");
+        assert_eq!(editor.lock().tab_index(), 1);
+        typed(&mut lisp, ":q\n");
+        let tabs = editor.lock().tab_count();
+        assert_eq!(tabs, 1);
+        assert!(!editor.lock().quit_requested);
+        typed(&mut lisp, ":tabnew\n");
+        assert_eq!(editor.lock().tab_count(), 2);
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, ":tabc\n");
+        assert_eq!(editor.lock().tab_count(), 1);
     }
 
     #[test]
