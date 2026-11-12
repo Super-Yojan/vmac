@@ -3619,6 +3619,14 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         typed(&mut lisp, "anew.txt\n");
         assert!(root.join("src/new.txt").exists(), "added next to main.rs, in src/");
         assert!(tree_text(&editor).contains("    new.txt"));
+        {
+            let st = editor.lock();
+            assert_eq!(st.buffer().name(), "new.txt", "the new file opened");
+            assert!(!st.is_sidebar(st.selected_window()), "in the main window");
+        }
+        lisp.dispatch_key("C-w", "");
+        lisp.dispatch_key("h", "h");
+        assert!({ let st = editor.lock(); st.is_sidebar(st.selected_window()) });
         typed(&mut lisp, "rrenamed.txt\n");
         assert!(root.join("src/renamed.txt").exists());
         assert!(!root.join("src/new.txt").exists());
@@ -3628,6 +3636,11 @@ vmac.map("operator", "}", core.operator_motion("next-blank-line"))
         assert!(!root.join("src/renamed.txt").exists());
         typed(&mut lisp, "gganotes/\n");
         assert!(root.join("notes").is_dir(), "a trailing / makes a folder");
+        assert!({ let st = editor.lock(); st.is_sidebar(st.selected_window()) }, "a folder stays in the tree");
+        typed(&mut lisp, "ggadeep/er/x.rs\n");
+        assert!(root.join("deep/er/x.rs").exists(), "the folders on the way are made");
+        assert!(tree_text(&editor).contains("      x.rs"), "and opened to show it: {}", tree_text(&editor));
+        assert_eq!(editor.lock().buffer().name(), "x.rs");
         std::fs::remove_dir_all(&root).ok();
     }
 

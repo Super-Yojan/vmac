@@ -124,7 +124,8 @@ name order. Its state and functions are in the global `core` table.
   folders, opened down to the current file (.gitignore'd files hidden). Every
   motion works in it (`j k gg G /`); `RET`/`o` open a file or toggle a folder,
   `l`/`h` open/close a folder (`h` on a closed one goes to its parent), `a` adds
-  a file (end with `/` for a folder), `r` renames, `d` deletes (asks first),
+  a file in the folder at the cursor and opens it (end with `/` for a folder;
+  `lib/x.rs` makes the folders on the way), `r` renames, `d` deletes (asks first),
   `R` refreshes, `q` closes. `C-w h`/`C-w l` move between it and your files.
   Files git sees as changed show git's letter beside them (`M` modified,
   `A` added, `?` untracked, `D` deleted, `U` conflicted) in color, and folders
