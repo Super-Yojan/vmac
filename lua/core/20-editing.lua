@@ -401,21 +401,212 @@ V.command("insert-line-end", function()
   V.goto_char(core.line_end())
   core.state = "insert"
 end)
+---- Typing code: indentation and bracket pairs
+--
+-- RET keeps the line's indentation, one level deeper after an opening
+-- bracket (or a ":" ending a line of Python), and opens up a pair typed
+-- empty: {|} becomes three lines, the cursor indented on the middle one.
+-- o and O indent the same way. A closing bracket typed first on its line
+-- lines up with the line that opened it. DEL in the indentation deletes a
+-- level.
+--
+-- Typing ( [ { " ' ` also types the closing one; typing the closing one
+-- where it already is steps over it, and DEL between an empty pair deletes
+-- both. In init.lua: vmac.set_auto_pairs(false) turns pairs off, and
+-- vmac.set_indent_unit("  ") makes a level two spaces (a buffer whose line
+-- is indented with tabs indents with tabs). The highlight on the bracket
+-- matching the one at the cursor: vmac.set_show_matching_bracket(false).
+
+core.indent_unit = "    "
+core.auto_pairs = true
+core.show_matching_bracket = true
+core.pairs = { ["("] = ")", ["["] = "]", ["{"] = "}", ['"'] = '"', ["'"] = "'", ["`"] = "`" }
+local closing = { [")"] = true, ["]"] = true, ["}"] = true }
+
+function V.set_auto_pairs(on) core.auto_pairs = on ~= false end
+function V.set_indent_unit(unit) core.indent_unit = unit end
+function V.set_show_matching_bracket(on) core.show_matching_bracket = on ~= false end
+
+-- The file's extension ("rs", "py"), or "" for a buffer without a file.
+function core.file_extension()
+  return ((V.buffer_file_name() or ""):match("%.([^./]+)$") or ""):lower()
+end
+
+-- Prose, where ' is an apostrophe: Markdown, text, and buffers without a file.
+local function prose()
+  local ext = core.file_extension()
+  return (V.buffer_file_name() or "") == "" or ext == "md" or ext == "markdown" or ext == "txt"
+end
+
+-- The indentation (leading spaces and tabs) of the line at pos.
+function core.indentation_at(pos)
+  local s = core.line_start_at(pos)
+  local text = V.buffer_substring(s, core.line_end_at(pos))
+  return text:match("^[ \t]*")
+end
+
+-- One level more than `indent`: a tab where the line is indented with tabs.
+local function unit_for(indent)
+  if indent:sub(1, 1) == "\t" then return "\t" end
+  return core.indent_unit
+end
+
+-- Whether a line, up to the cursor, opens a block, so the next line is a
+-- level deeper. Redefine it for other languages.
+function core.opens_block(before)
+  local last = before:match("(%S)%s*$")
+  if last == "(" or last == "[" or last == "{" then return true end
+  return last == ":" and core.file_extension() == "py"
+end
+
+-- Replaces the indentation of the line at pos, keeping the cursor on the
+-- same text.
+local function set_indentation(pos, indent)
+  local s = core.line_start_at(pos)
+  local old = core.indentation_at(pos)
+  if old == indent then return end
+  local p = V.point()
+  V.delete_region(s, s + core.length(old))
+  V.goto_char(s)
+  V.insert(indent)
+  V.goto_char(math.max(s, p - core.length(old) + core.length(indent)))
+end
+
+function core.newline_and_indent()
+  local p = V.point()
+  local s, e = core.line_start_at(p), core.line_end_at(p)
+  local before = V.buffer_substring(s, p)
+  local rest = V.buffer_substring(p, e)
+  local indent = before:match("^[ \t]*")
+  if before == indent and rest:match("^[ \t]*$") then
+    -- A line of only indentation is left empty; the new one keeps it.
+    V.delete_region(s, e)
+    V.goto_char(s)
+    V.insert("\n" .. indent)
+    return
+  end
+  -- The text moving down loses the spaces it started with.
+  local spaces = core.length(rest:match("^[ \t]*"))
+  if spaces > 0 and before ~= indent then V.delete_region(p, p + spaces) end
+  if before == indent then
+    -- In the indentation: the line moves down as it is.
+    V.goto_char(s)
+    V.insert("\n")
+    V.goto_char(p + 1)
+    return
+  end
+  if not core.opens_block(before) then
+    V.insert("\n" .. indent)
+    return
+  end
+  V.insert("\n" .. indent .. unit_for(indent))
+  -- Between a pair ({|}): the closing one goes on a line of its own.
+  local next_char = V.char_at(V.point())
+  if closing[next_char] then
+    local here = V.point()
+    V.insert("\n" .. indent)
+    V.goto_char(here)
+  end
+end
+
+V.command("newline", function()
+  if core.state == "insert" and not V.minibuffer_active() then core.newline_and_indent() else V.insert("\n") end
+end)
+
 V.command("open-below", function()
+  local indent = core.indentation_at(V.point())
+  local deeper = core.opens_block(V.buffer_substring(core.line_start(), core.line_end()))
   V.goto_char(core.line_end())
-  V.insert("\n")
+  V.insert("\n" .. indent .. (deeper and unit_for(indent) or ""))
   core.state = "insert"
 end)
 V.command("open-above", function()
+  local indent = core.indentation_at(V.point())
   V.goto_char(core.line_start())
-  V.insert("\n")
+  V.insert(indent .. "\n")
   V.forward_char(-1)
   core.state = "insert"
 end)
 
-V.command("newline", function() V.insert("\n") end)
 V.command("indent", function() V.insert("    ") end)
-V.command("delete-backward", function() V.delete_backward_char(1) end)
+
+-- Types `text` in insert state: brackets and quotes in pairs, a closing
+-- bracket over the one already there, lined up when it's first on its line.
+function core.self_insert(text)
+  local p = V.point()
+  local next_char = V.char_at(p)
+  local prev_char = p > 0 and V.char_at(p - 1) or ""
+  local pairs_on = core.auto_pairs and not V.buffer_read_only() and (V.buffer_file_name() or "") ~= ""
+  if pairs_on and (closing[text] or (core.pairs[text] == text)) and next_char == text then
+    -- Step over the closing one already there.
+    V.forward_char(1)
+    return
+  end
+  local close = pairs_on and core.pairs[text]
+  if close and close ~= text then
+    -- An opening bracket: paired before a space, the line's end or a closing bracket.
+    if next_char == "" or next_char:match("%s") or closing[next_char] or next_char == ";" or next_char == "," then
+      V.insert(text .. close)
+      V.forward_char(-1)
+      return
+    end
+  elseif close then
+    -- A quote: paired between spaces or brackets, not in a word (don't, x').
+    local word = function(c) return c ~= "" and V.word_char(c) end
+    local opens_ok = prev_char == "" or prev_char:match("[%s%(%[{=,:]") ~= nil
+    local closes_ok = next_char == "" or next_char:match("%s") or closing[next_char] or next_char == "," or next_char == ";"
+    if not (text == "'" and prose()) and opens_ok and closes_ok and not word(prev_char) then
+      V.insert(text .. text)
+      V.forward_char(-1)
+      return
+    end
+  end
+  V.insert(text)
+  -- A closing bracket first on its line lines up with its opening one.
+  if closing[text] and V.buffer_substring(core.line_start(), V.point() - 1):match("^[ \t]*$") then
+    local open = V.matching_bracket(V.point() - 1)
+    if open then set_indentation(V.point(), core.indentation_at(open)) end
+  end
+end
+
+-- DEL: between an empty pair deletes both; in the indentation, a level.
+V.command("delete-backward", function()
+  local p = V.point()
+  if core.state ~= "insert" or V.minibuffer_active() or p == 0 then
+    V.delete_backward_char(1)
+    return
+  end
+  local prev_char, next_char = V.char_at(p - 1), V.char_at(p)
+  if core.auto_pairs and core.pairs[prev_char] == next_char and next_char ~= "" then
+    V.delete_region(p - 1, p + 1)
+    return
+  end
+  local before = V.buffer_substring(core.line_start(), p)
+  local unit = core.indent_unit
+  if before ~= "" and before:match("^ +$") and unit:match("^ +$") then
+    local n = core.length(before) % core.length(unit)
+    V.delete_backward_char(n == 0 and core.length(unit) or n)
+    return
+  end
+  V.delete_backward_char(1)
+end)
+
+-- The bracket at the cursor (in insert state, else the one just before it)
+-- and the one it pairs with, for Rust to highlight; {} when there's none.
+function core.bracket_match()
+  if not core.show_matching_bracket or V.minibuffer_active() or V.terminal_here()
+    or V.buffer_name() == core.tree_buffer then
+    return {}
+  end
+  local p = V.point()
+  local other = V.matching_bracket(p)
+  if not other and core.state == "insert" and p > 0 then
+    p = p - 1
+    other = V.matching_bracket(p)
+  end
+  if not other then return {} end
+  return { p, other }
+end
 V.command("delete-forward", function() V.delete_char(1) end)
 V.command("char-left", function() V.forward_char(-1) end)
 V.command("char-right", function() V.forward_char(1) end)

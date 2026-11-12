@@ -295,6 +295,7 @@ impl Session {
         let markdown_raw = self.lisp.markdown_raw();
         let selection = self.lisp.selection();
         let pattern = self.lisp.search_highlight();
+        let brackets = self.lisp.bracket_match();
         let mut modeline = Some(self.lisp.modeline());
         let syntax_theme = self.lisp.syntax_theme();
         let face_specs = self.lisp.face_specs();
@@ -521,6 +522,15 @@ impl Session {
                     out.extend(buffer.faces().iter().filter(|f| f.0 < start + line_len && f.1 > start).map(
                         |(a, b, face)| (a.saturating_sub(start), b.saturating_sub(start), resolve_face(face, &face_specs)),
                     ));
+                    // The bracket pair at the cursor, in the window you're in.
+                    if is_selected && !is_sidebar {
+                        out.extend(
+                            brackets
+                                .iter()
+                                .filter(|&&b| b >= start && b < start + line_len)
+                                .map(|&b| (b - start, b - start + 1, resolve_face("match-paren", &face_specs))),
+                        );
+                    }
                     out
                 };
                 let styles: Vec<_> = (lo..hi).map(styles_of).collect();

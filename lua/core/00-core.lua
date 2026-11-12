@@ -375,8 +375,12 @@ function core.dispatch_binding(key, text)
   elseif core.pending_keys == "" and core.device_insert() then
     core.device_type(key, text)
   elseif core.pending_keys == "" and core.inserting() and text ~= "" then
-    V.insert(text)
-    if core.state == "insert" and not V.minibuffer_active() then core.after_self_insert(text) end
+    if core.state == "insert" and not V.minibuffer_active() then
+      core.self_insert(text)
+      core.after_self_insert(text)
+    else
+      V.insert(text)
+    end
   else
     core.pending_keys = ""
     core.pending_count = ""

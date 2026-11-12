@@ -487,6 +487,13 @@ impl Lisp {
             .collect()
     }
 
+    /// The bracket at the cursor and the one it pairs with, in characters
+    /// (empty when the cursor isn't on a bracket with a partner).
+    pub fn bracket_match(&mut self) -> Vec<usize> {
+        let positions = self.call::<Vec<isize>>("bracket_match", ()).unwrap_or_default();
+        positions.into_iter().filter(|p| *p >= 0).map(|p| p as usize).collect()
+    }
+
     /// The pattern whose matches the window highlights, or "" for none.
     pub fn search_highlight(&mut self) -> String {
         self.call::<String>("search_highlight", ()).unwrap_or_default()
@@ -829,6 +836,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "delete-region", |s, a: isize, b: isize| s
         .current()
         .delete_range(a.max(0) as usize, b.max(0) as usize));
+    prim!(reg, editor, "matching-bracket", |s, pos: isize| {
+        if pos < 0 {
+            return None;
+        }
+        s.current().matching_bracket(pos as usize, 200_000).map(|p| p as isize)
+    });
     prim!(reg, editor, "char-class", |s, pos: isize| s
         .current()
         .char_class(pos.max(0) as usize)
@@ -5683,5 +5696,132 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
             lisp.modeline(),
             vec![Segment { text: "custom".into(), face: "accent".into() }]
         );
+    }
+
+    /// A file (named `name`, holding `text`) open in a fresh editor.
+    fn lisp_with_file(name: &str, text: &str) -> (Lisp, Editor, PathBuf) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vmac-typing-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        std::fs::write(&file, text).unwrap();
+        let (lisp, editor) = lisp_with("");
+        editor.lock().open_file(&file).unwrap();
+        (lisp, editor, dir)
+    }
+
+    #[test]
+    fn return_keeps_the_indentation_and_goes_deeper_after_a_bracket() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "    let x = 1;");
+        typed(&mut lisp, "A\nlet y = 2;");
+        assert_eq!(text(&editor), "    let x = 1;\n    let y = 2;");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "ccfn f() {\nbody");
+        assert_eq!(text(&editor), "    let x = 1;\n    fn f() {\n        body\n    }");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn return_between_a_pair_puts_the_closing_one_on_its_own_line() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "fn f() ");
+        typed(&mut lisp, "A{\nx");
+        assert_eq!(text(&editor), "fn f() {\n    x\n}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_closing_bracket_first_on_its_line_lines_up_with_its_opening_one() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "if x {\n    y();\n    ");
+        lisp.eval_lua("vmac.goto_char(vmac.point_max())").unwrap();
+        typed(&mut lisp, "a}");
+        assert_eq!(text(&editor), "if x {\n    y();\n}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn o_indents_like_return_and_python_colons_go_deeper() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.py", "def f():\n    pass");
+        typed(&mut lisp, "ox");
+        assert_eq!(text(&editor), "def f():\n    x\n    pass");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "Gox");
+        assert_eq!(text(&editor), "def f():\n    x\n    pass\n    x");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn return_on_a_blank_indented_line_leaves_it_empty() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "    a");
+        typed(&mut lisp, "A\n\nb");
+        assert_eq!(text(&editor), "    a\n\n    b");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn brackets_and_quotes_close_themselves() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "");
+        typed(&mut lisp, "if(a[0]");
+        assert_eq!(text(&editor), "f(a[0])", "( and [ closed themselves; ] stepped over");
+        assert_eq!(point(&editor), 6);
+        typed(&mut lisp, ")");
+        assert_eq!(text(&editor), "f(a[0])", "typing ) over ) steps over it");
+        assert_eq!(point(&editor), 7);
+        typed(&mut lisp, " \"s\"");
+        assert_eq!(text(&editor), "f(a[0]) \"s\"");
+        // Not before a word, nor an apostrophe inside one.
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "0i(");
+        assert_eq!(text(&editor), "(f(a[0]) \"s\"");
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, "A it'");
+        assert_eq!(text(&editor), "(f(a[0]) \"s\" it'");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn del_in_an_empty_pair_deletes_both_and_in_indentation_a_level() {
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "x");
+        typed(&mut lisp, "A(");
+        assert_eq!(text(&editor), "x()");
+        lisp.dispatch_key("DEL", "");
+        assert_eq!(text(&editor), "x");
+        typed(&mut lisp, "{\n");
+        assert_eq!(text(&editor), "x{\n    \n}");
+        lisp.dispatch_key("DEL", "");
+        assert_eq!(text(&editor), "x{\n\n}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_pairs_can_be_turned_off_and_stay_out_of_buffers_without_files() {
+        let (mut lisp, editor) = lisp_with("");
+        typed(&mut lisp, "i(");
+        assert_eq!(text(&editor), "(");
+        let (mut lisp, editor, dir) = lisp_with_file("a.rs", "");
+        lisp.eval_lua("vmac.set_auto_pairs(false)").unwrap();
+        typed(&mut lisp, "i(");
+        assert_eq!(text(&editor), "(");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_bracket_matching_the_one_at_the_cursor_is_highlighted() {
+        let (mut lisp, editor) = lisp_with("f(a, (b)) x");
+        at(&mut lisp, &editor, 1);
+        assert_eq!(lisp.bracket_match(), vec![1, 8]);
+        at(&mut lisp, &editor, 7);
+        assert_eq!(lisp.bracket_match(), vec![7, 5]);
+        at(&mut lisp, &editor, 3);
+        assert_eq!(lisp.bracket_match(), Vec::<usize>::new());
+        // Typing, the bracket just before the cursor counts.
+        at(&mut lisp, &editor, 9);
+        typed(&mut lisp, "i");
+        assert_eq!(lisp.bracket_match(), vec![8, 1]);
+        lisp.dispatch_key("ESC", "");
+        lisp.eval_lua("vmac.set_show_matching_bracket(false)").unwrap();
+        at(&mut lisp, &editor, 1);
+        assert_eq!(lisp.bracket_match(), Vec::<usize>::new());
     }
 }

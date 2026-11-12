@@ -191,6 +191,48 @@ impl Buffer {
         if pos < self.len() { self.text.char(pos).to_string() } else { String::new() }
     }
 
+    /// Where the bracket at `pos` (one of `()[]{}`) is closed or opened,
+    /// counting nesting. None when `pos` isn't on a bracket, or its partner
+    /// isn't within `limit` characters (so a huge file stays quick).
+    pub fn matching_bracket(&self, pos: usize, limit: usize) -> Option<usize> {
+        let (open, close, forward) = match self.text.get_char(pos)? {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => return None,
+        };
+        let mut depth = 0usize;
+        if forward {
+            for (i, ch) in self.text.chars_at(pos + 1).take(limit).enumerate() {
+                if ch == open {
+                    depth += 1;
+                } else if ch == close {
+                    if depth == 0 {
+                        return Some(pos + 1 + i);
+                    }
+                    depth -= 1;
+                }
+            }
+        } else {
+            let mut chars = self.text.chars_at(pos);
+            for at in (pos.saturating_sub(limit)..pos).rev() {
+                let ch = chars.prev()?;
+                if ch == close {
+                    depth += 1;
+                } else if ch == open {
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                    depth -= 1;
+                }
+            }
+        }
+        None
+    }
+
     /// What kind of character is at `pos`: "word" (letters, digits, _),
     /// "space", "newline", "punct", or "eof" past the end.
     pub fn char_class(&self, pos: usize) -> &'static str {
