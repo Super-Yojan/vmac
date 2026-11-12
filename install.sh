@@ -9,7 +9,7 @@
 set -eu
 
 repo="https://github.com/Super-Yojan/vmac"
-version="${VMAC_VERSION:-v0.0.9}"
+version="${VMAC_VERSION:-v0.0.10}"
 
 say() { printf 'vmac: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
