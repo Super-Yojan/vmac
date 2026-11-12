@@ -100,7 +100,7 @@ core.completion_insert_keys = {
   RET = with_completion(V.completion_accept, "newline"),
   TAB = with_completion(V.completion_accept, "table-next-cell"),
   DEL = function()
-    V.delete_backward_char(1)
+    core.call_binding("delete-backward")
     V.completion_refresh()
   end,
 }

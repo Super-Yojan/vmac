@@ -155,6 +155,10 @@ V.command("tree-open", function()
   reveal(file)
   render()
   if not goto_path(file) then V.goto_char(0) end
+  if not tree.hinted then
+    tree.hinted = true
+    V.message("a new file  r rename  d delete  R refresh  q close")
+  end
 end)
 
 V.command("tree-close", function() V.sidebar_close() end)
@@ -214,6 +218,8 @@ local function target_dir()
   return core.dirname(e[1])
 end
 
+-- a: a new file (or folder, ending in /) in the folder at the cursor;
+-- "src/x.rs" makes the folders on the way. The file opens.
 V.command("tree-add", function()
   local dir = target_dir()
   core.read("New file in " .. core.basename(dir) .. "/ (end with / for a folder): ", function(name)
@@ -221,9 +227,17 @@ V.command("tree-add", function()
     local path = dir .. "/" .. name
     if V.create_path(path) then
       expand(dir)
+      reveal(without_slash(path))
       render()
       goto_path(without_slash(path))
-      V.message("created " .. name)
+      if name:sub(-1) == "/" then
+        V.message("created " .. name)
+      else
+        -- A new file opens in the main window, ready to type in.
+        V.select_main_window()
+        V.find_file(path)
+        V.message("created " .. name)
+      end
     end
   end)
 end)

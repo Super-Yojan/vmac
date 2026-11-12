@@ -104,6 +104,8 @@ function core.default_face_specs()
     { "md-quote", color = "dim", italic = true },
     { "md-list", color = "accent", bold = true },
     { "md-rule", color = "dim" },
+    -- The bracket pair at the cursor
+    { "match-paren", color = "accent", background = "subtle", bold = true, underline = true },
     -- The agent buffer
     { "agent-user", color = "strong" },
     { "agent-heading", bold = true },

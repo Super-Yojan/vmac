@@ -120,11 +120,27 @@ name order. Its state and functions are in the global `core` table.
 - **Search:** `/` and `?` (regex, smartcase, wraps around), `n N`, `*` and `#`
   for the word under the cursor. Matches highlight as you type and stay
   highlighted until `ESC` or `:noh`. Operators take them too (`d/foo`, `dn`).
+- **Search the project:** `SPC s p` (or `SPC /`, `:rg PATTERN`) runs
+  [ripgrep](https://github.com/BurntSushi/ripgrep) over the project (smart
+  case, .gitignore respected) and lists every match in the picker, previewed;
+  typing narrows them and `RET` opens the file there. `SPC *` searches for the
+  word at the cursor. Without `rg` installed, `grep -rn` does it.
+  `vmac.set_search_args({ "--hidden" })` passes more to rg.
+- **Typing code:** `RET` (and `o`, `O`) keeps the line's indentation, a level
+  deeper after an opening bracket (or a `:` ending a line of Python); `{|}`
+  opens up onto three lines. A closing bracket typed first on its line lines
+  up with its opening one, and `DEL` in the indentation deletes a level.
+  `( [ { " ' `` ` `` type their closing one, typed over when you get there;
+  `DEL` in an empty pair deletes both (`vmac.set_auto_pairs(false)` turns
+  pairs off, `vmac.set_indent_unit("  ")` makes a level two spaces). The
+  bracket matching the one at the cursor is highlighted (the `match-paren`
+  face; `vmac.set_show_matching_bracket(false)` hides it).
 - **File tree:** `SPC o p` opens and closes a sidebar with the project's
   folders, opened down to the current file (.gitignore'd files hidden). Every
   motion works in it (`j k gg G /`); `RET`/`o` open a file or toggle a folder,
   `l`/`h` open/close a folder (`h` on a closed one goes to its parent), `a` adds
-  a file (end with `/` for a folder), `r` renames, `d` deletes (asks first),
+  a file in the folder at the cursor and opens it (end with `/` for a folder;
+  `lib/x.rs` makes the folders on the way), `r` renames, `d` deletes (asks first),
   `R` refreshes, `q` closes. `C-w h`/`C-w l` move between it and your files.
   Files git sees as changed show git's letter beside them (`M` modified,
   `A` added, `?` untracked, `D` deleted, `U` conflicted) in color, and folders
