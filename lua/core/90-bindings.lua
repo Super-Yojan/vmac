@@ -101,6 +101,7 @@ bind(K.normal, {
   { "SPC b b", "switch-buffer" }, { "SPC ,", "switch-buffer" },
   { "SPC b n", "buffer-next" }, { "SPC b p", "buffer-previous" },
   { "] b", "buffer-next" }, { "[ b", "buffer-previous" },
+  { "SPC b ]", "buffer-tab-next" }, { "SPC b [", "buffer-tab-previous" },
   { "SPC b k", "buffer-kill" }, { "SPC b d", "buffer-kill" }, { "SPC b N", "buffer-new" },
   -- Windows
   { "C-w v", "split-right" }, { "C-w s", "split-below" },

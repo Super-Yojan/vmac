@@ -76,6 +76,8 @@ pub enum Input {
     Appearance { dark: bool },
     /// A click on a tab in the tab bar (from 0).
     SelectTab { index: usize },
+    /// A click on a file in the buffer tab bar.
+    SelectBuffer { buffer: BufferId },
     /// The theme's text and background colors (0xRRGGBB), for terminal
     /// programs that ask.
     TerminalColors { foreground: u32, background: u32 },
@@ -127,6 +129,21 @@ pub struct Frame {
     pub tab: usize,
     #[serde(default)]
     pub tab_bar: f32,
+    /// The project's open files, in the buffer tab bar below the tabs'
+    /// (empty when it isn't shown); `tab_bar` includes its row.
+    #[serde(default)]
+    pub buffer_tabs: Vec<BufferTab>,
+}
+
+/// A file in the buffer tab bar.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BufferTab {
+    pub buffer: BufferId,
+    pub name: String,
+    /// The one in the selected window.
+    pub current: bool,
+    /// Changed and not saved.
+    pub modified: bool,
 }
 
 /// A session, as the switcher and `vmac ls` describe it.

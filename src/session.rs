@@ -197,6 +197,15 @@ impl Session {
             Input::SelectTab { index } => {
                 self.editor.lock().tab_select(index);
             }
+            Input::SelectBuffer { buffer } => {
+                let mut st = self.editor.lock();
+                if st.is_sidebar(st.selected_window()) {
+                    st.select_main_window();
+                }
+                if st.buffer_by_id(buffer).is_some() {
+                    st.show_buffer(buffer);
+                }
+            }
             Input::TerminalColors { foreground, background } => crate::terminal::set_colors(foreground, background),
         }
     }
@@ -294,8 +303,26 @@ impl Session {
         let mut st = self.editor.lock();
         self.width = width.max(1.);
         st.sidebar_width = (self.sidebar_px / self.width).clamp(0.08, 0.6);
-        // With two or more tabs, the tab bar takes a row at the top.
-        let tab_bar = if st.tab_count() > 1 { ROW_HEIGHT } else { 0. };
+        // With two or more tabs, the tab bar takes a row at the top; with
+        // two or more of the project's files open, the buffer tab bar
+        // another, below it.
+        let current = st.buffer_tab_current();
+        let buffer_tabs: Vec<BufferTab> = if st.buffer_tabs_shown {
+            st.buffer_tabs()
+                .into_iter()
+                .map(|(buffer, name)| BufferTab {
+                    buffer,
+                    name,
+                    current: buffer == current,
+                    modified: st.buffer_by_id(buffer).is_some_and(|b| b.is_modified()),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let buffer_tabs = if buffer_tabs.len() > 1 { buffer_tabs } else { Vec::new() };
+        let rows = usize::from(st.tab_count() > 1) + usize::from(!buffer_tabs.is_empty());
+        let tab_bar = rows as f32 * ROW_HEIGHT;
         (self.area, self.tab_bar) = (area, tab_bar);
         let rects: Vec<_> = st.window_rects().into_iter().map(|(id, r)| (id, below_tab_bar(r, tab_bar, area))).collect();
         for (id, r) in &rects {
@@ -784,7 +811,8 @@ impl Session {
             buffers: st.buffer_ids(),
             sessions: Vec::new(),
             session: String::new(),
-            tabs: if tab_bar > 0. { st.tab_names() } else { Vec::new() },
+            tabs: if st.tab_count() > 1 { st.tab_names() } else { Vec::new() },
+            buffer_tabs,
             tab: st.tab_index(),
             tab_bar,
         };
@@ -956,6 +984,32 @@ mod tests {
     }
 
     const VIEW: Viewport = Viewport { width: 800., height: 600. };
+
+    #[test]
+    fn two_open_files_bring_the_buffer_tab_bar() {
+        let dir = std::env::temp_dir().join(format!("vmac-buffer-bar-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("one.txt"), "1").unwrap();
+        std::fs::write(dir.join("two.txt"), "2").unwrap();
+        let mut s = session_with("");
+        s.editor.lock().open_file(&dir.join("one.txt")).unwrap();
+        let frame = s.frame(VIEW);
+        assert!(frame.buffer_tabs.is_empty(), "one file: no bar");
+        assert_eq!(frame.tab_bar, 0.);
+        s.editor.lock().open_file(&dir.join("two.txt")).unwrap();
+        let frame = s.frame(VIEW);
+        let names: Vec<_> = frame.buffer_tabs.iter().map(|b| (b.name.as_str(), b.current)).collect();
+        assert_eq!(names, vec![("one.txt", false), ("two.txt", true)]);
+        assert_eq!((frame.tab_bar, frame.windows[0].top), (ROW_HEIGHT, ROW_HEIGHT));
+        // Under a second tab's bar.
+        s.editor.lock().tab_new();
+        assert_eq!(s.frame(VIEW).tab_bar, 2. * ROW_HEIGHT);
+        // A click shows the file.
+        let one = frame.buffer_tabs[0].buffer;
+        s.handle(Input::SelectBuffer { buffer: one });
+        assert_eq!(s.editor.lock().window().buffer, one);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_second_tab_brings_the_tab_bar() {
