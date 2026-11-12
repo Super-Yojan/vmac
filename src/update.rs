@@ -153,8 +153,34 @@ pub fn detect(exe: &Path, cargo_home: Option<&Path>, manifest: &Path, gui: bool)
 
 // ---- Releases
 
-/// The newest release's version ("0.0.9").
+/// The newest release's version ("0.0.9"), once it's ready to install: a
+/// release appears before its build finishes, and its SHA256SUMS comes
+/// last, so until that's up it isn't out yet.
 pub fn latest() -> Result<String, String> {
+    let version = latest_tag()?;
+    if !ready(&version) {
+        return Err(format!("vmac {version} is still being built; try again in a few minutes"));
+    }
+    Ok(version)
+}
+
+/// Whether release `version` has its SHA256SUMS (its build is done).
+fn ready(version: &str) -> bool {
+    let url = format!("{}/releases/download/v{version}/SHA256SUMS", repo());
+    if let Some(path) = url.strip_prefix("file://") {
+        return Path::new(path).is_file();
+    }
+    Command::new("curl")
+        .args(["-fsSLI", "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }, "--max-time", "20"])
+        .arg(&url)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The newest release's tag, as a version, whether or not it's built.
+fn latest_tag() -> Result<String, String> {
     let url = format!("{}/releases/latest", repo());
     // file:// (tests): a file holding the version.
     if let Some(path) = url.strip_prefix("file://") {
@@ -245,7 +271,7 @@ fn install_release(how: &Install, version: &str, name: &str) -> Result<(), Strin
         let file = work.join(name);
         download(&format!("{base}/{name}"), &file)?;
         let sums = work.join("SHA256SUMS");
-        download(&format!("{base}/SHA256SUMS"), &sums).map_err(|_| format!("release v{version} has no SHA256SUMS to check it against"))?;
+        download(&format!("{base}/SHA256SUMS"), &sums).map_err(|_| format!("release v{version} has no SHA256SUMS yet (it's still being built?); try again in a few minutes"))?;
         verify(&file, name, &std::fs::read_to_string(&sums).map_err(|e| e.to_string())?)?;
         let unpacked = work.join("new");
         std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
@@ -751,6 +777,21 @@ mod tests {
         assert_eq!(detect(&prefix.join("bin/vmac"), Some(&cargo), &manifest, false), Install::Server);
         assert!(Install::Cargo.checks() && !Install::Checkout.checks() && !Install::Server.checks());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_release_isnt_out_until_its_sums_are() {
+        let repo = std::env::temp_dir().join(format!("vmac-ready-{}", std::process::id()));
+        let download = repo.join("releases/download/v9.9.9");
+        std::fs::create_dir_all(&download).unwrap();
+        // SAFETY: the only test reading VMAC_UPDATE_URL.
+        unsafe { std::env::set_var("VMAC_UPDATE_URL", format!("file://{}", repo.display())) };
+        std::fs::write(repo.join("releases/latest"), "v9.9.9\n").unwrap();
+        assert!(latest().unwrap_err().contains("still being built"));
+        std::fs::write(download.join("SHA256SUMS"), "").unwrap();
+        assert_eq!(latest().unwrap(), "9.9.9");
+        unsafe { std::env::remove_var("VMAC_UPDATE_URL") };
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
