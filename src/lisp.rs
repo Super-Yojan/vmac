@@ -33,6 +33,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("notes.lua", include_str!("../lua/core/notes.lua")),
     ("options.lua", include_str!("../lua/core/options.lua")),
     ("review.lua", include_str!("../lua/core/review.lua")),
+    ("search.lua", include_str!("../lua/core/search.lua")),
     ("sessions.lua", include_str!("../lua/core/sessions.lua")),
     ("update.lua", include_str!("../lua/core/update.lua")),
 ];
@@ -5836,5 +5837,58 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         lisp.eval_lua("vmac.set_show_matching_bracket(false)").unwrap();
         at(&mut lisp, &editor, 1);
         assert_eq!(lisp.bracket_match(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn search_turns_rg_and_grep_lines_into_picker_items() {
+        let (mut lisp, _editor) = lisp_with("");
+        let mut item = |line: &str| lisp.eval_lua(&format!("return core.search.item({line:?}) or 'nil'")).unwrap();
+        assert_eq!(item("./src/a.rs:12:5:    let x = 1;  "), "src/a.rs:12:5  let x = 1;");
+        assert_eq!(item("./lib/b.py:3:def f():"), "lib/b.py:3:1  def f():", "grep has no column");
+        assert_eq!(item("Binary file matches"), "nil");
+    }
+
+    /// Runs Rust's side of vmac.spawn until `done` says so (or 5 seconds).
+    fn until(lisp: &mut Lisp, mut done: impl FnMut() -> bool) -> bool {
+        (0..250).any(|_| {
+            lisp.run_events();
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        })
+    }
+
+    #[test]
+    fn spc_s_p_searches_the_project_and_opens_a_match() {
+        let (mut lisp, editor, root) = tree_project("search");
+        std::fs::write(root.join("src/util/mod.rs"), "pub fn helper() {}\n\nfn other() { helper() }\n").unwrap();
+        std::fs::write(root.join("target/junk.rs"), "helper\n").unwrap();
+        typed(&mut lisp, " sphelper\n");
+        let picked = until(&mut lisp, || editor.lock().picker.is_some());
+        assert!(picked, "{}", editor.lock().message.clone());
+        let items: Vec<String> =
+            editor.lock().picker.as_ref().unwrap().matches().iter().map(|m| m.item.clone()).collect();
+        assert_eq!(items.len(), 2, "target/ is ignored: {items:?}");
+        assert!(items.iter().all(|i| i.starts_with("src/util/mod.rs:")), "{items:?}");
+        assert!(items.contains(&"src/util/mod.rs:3:14  fn other() { helper() }".to_string()), "{items:?}");
+        typed(&mut lisp, "other");
+        lisp.dispatch_key("RET", "");
+        {
+            let st = editor.lock();
+            assert_eq!(st.buffer().name(), "mod.rs");
+            assert_eq!((st.buffer().line(), st.buffer().column()), (2, 13));
+        }
+        // Without ripgrep, grep finds them.
+        lisp.eval_lua("core.search.program = 'no-such-rg'").unwrap();
+        typed(&mut lisp, ":rg other\n");
+        let picked = until(&mut lisp, || editor.lock().picker.is_some());
+        assert!(picked, "{}", editor.lock().message.clone());
+        let items: Vec<String> =
+            editor.lock().picker.as_ref().unwrap().matches().iter().map(|m| m.item.clone()).collect();
+        assert_eq!(items, vec!["src/util/mod.rs:3:1  fn other() { helper() }".to_string()]);
+        lisp.dispatch_key("ESC", "");
+        std::fs::remove_dir_all(&root).ok();
     }
 }
