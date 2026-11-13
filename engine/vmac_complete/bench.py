@@ -30,7 +30,7 @@ from . import backends
 from .cache import SequenceCache
 from .documents import Document, Edit
 from .engine import Engine, Request
-from .prompt import PromptConfig
+from .prompt import PromptConfig, resolve_fim
 
 CODE_EXT = {".rs": "rust", ".py": "python", ".lua": "lua", ".go": "go", ".ts": "typescript", ".js": "javascript", ".c": "c", ".java": "java"}
 
@@ -159,10 +159,10 @@ def fim_tokens(backend: backends.Backend) -> list[str]:
 
 def bench_fim(backend: backends.Backend, files: list[Path], n: int, rng: random.Random, root: str, base: PromptConfig) -> dict:
     modes = ["prefix"]
-    if backend.special(base.fim_middle) is not None:
+    if resolve_fim(base, backend.special):
         modes += ["spm", "psm"]
     samples = pick_lines(files, n, rng)
-    out = {"fim_tokens_in_vocab": fim_tokens(backend), "tried": modes, "n": len(samples), "modes": {}}
+    out = {"fim_tokens_in_vocab": fim_tokens(backend), "fim_tokens_used": [base.fim_prefix, base.fim_suffix, base.fim_middle] if len(modes) > 1 else [], "tried": modes, "n": len(samples), "modes": {}}
     for mode in modes:
         cfg = PromptConfig(**{**base.__dict__, "mode": mode})
         em, es, ms = [], [], []
@@ -242,7 +242,7 @@ def report_md(r: dict) -> str:
                 f"| from nothing | {t['fresh_ms_p50']} | {t['fresh_ms_p95']} | {t['fresh_fed_mean']} |", ""]
     if "fim" in r:
         f = r["fim"]
-        out += ["## Fill in the middle", "", f"{f['n']} hidden lines. FIM tokens in the vocabulary: {', '.join(f['fim_tokens_in_vocab']) or 'none'}.", "",
+        out += ["## Fill in the middle", "", f"{f['n']} hidden lines. FIM tokens used: {' '.join(f.get('fim_tokens_used') or []) or 'none'}.", "",
                 "| layout | exact match % | edit similarity % | ms p50 |", "|---|---|---|---|"]
         for mode, x in f["modes"].items():
             out.append(f"| {mode} | {x['exact_match']} | {x['edit_similarity']} | {x['ms_p50']} |")

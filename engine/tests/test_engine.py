@@ -176,3 +176,13 @@ def test_edit_to_unknown_doc_asks_for_resync():
     s = Server(out=out, make_backend=lambda p: FakeBackend(), log=io.StringIO())
     s.handle({"method": "edit", "params": {"doc": 9, "revision": 1, "edits": []}})
     assert out.wait_for(lambda m: m.get("method") == "resync")["params"]["doc"] == 9
+
+
+def test_fim_tokens_found_under_other_spellings():
+    from vmac_complete.prompt import resolve_fim
+
+    vocab = {"<|fim_pre|>": 1, "<|fim_suf|>": 2, "<|fim_mid|>": 3}
+    cfg = PromptConfig()
+    assert resolve_fim(cfg, vocab.get)
+    assert (cfg.fim_prefix, cfg.fim_suffix, cfg.fim_middle) == ("<|fim_pre|>", "<|fim_suf|>", "<|fim_mid|>")
+    assert not resolve_fim(PromptConfig(), {}.get)

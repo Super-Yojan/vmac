@@ -17,7 +17,7 @@ from typing import Any, Callable, TextIO
 from . import backends
 from .documents import Documents, Edit
 from .engine import Engine, Request
-from .prompt import PromptConfig
+from .prompt import PromptConfig, resolve_fim
 
 
 class Server:
@@ -130,10 +130,11 @@ class Server:
             # FIM layouts need the model's FIM tokens; without them (and
             # unless asked for anyway), complete from the prefix alone.
             asked = (params.get("prompt") or {}).get("mode")
-            if cfg.mode != "prefix" and asked is None and backend.special(cfg.fim_middle) is None:
+            has_fim = resolve_fim(cfg, backend.special)
+            if cfg.mode != "prefix" and asked is None and not has_fim:
                 cfg.mode = "prefix"
             self.engine = Engine(backend, cfg, params.get("root"))
-            self.send({"id": mid, "result": {"ready": True, "backend": backend.name, "model": backend.model, "mode": cfg.mode}})
+            self.send({"id": mid, "result": {"ready": True, "backend": backend.name, "model": backend.model, "mode": cfg.mode, "fim": [cfg.fim_prefix, cfg.fim_suffix, cfg.fim_middle] if has_fim else None}})
             self.status("ready", backend.model)
         except Exception as e:
             print(traceback.format_exc(), file=self.log, flush=True)

@@ -49,6 +49,29 @@ class PromptConfig:
         return c
 
 
+# FIM token spellings models use: (prefix, suffix, middle).
+FIM_SPELLINGS = [
+    ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>"),  # Qwen, StarCoder 2
+    ("<|fim_pre|>", "<|fim_suf|>", "<|fim_mid|>"),  # LFM3
+    ("<fim_prefix>", "<fim_suffix>", "<fim_middle>"),  # StarCoder
+    ("<｜fim▁begin｜>", "<｜fim▁hole｜>", "<｜fim▁end｜>"),  # DeepSeek-Coder
+    ("<PRE>", "<SUF>", "<MID>"),  # Code Llama
+]
+
+
+def resolve_fim(cfg: PromptConfig, special) -> bool:
+    """Points `cfg` at the FIM tokens the model has (`special(text)` gives a
+    token's id or None), keeping configured ones if the model has them.
+    False when it has none."""
+    if special(cfg.fim_middle) is not None and special(cfg.fim_prefix) is not None:
+        return True
+    for pre, suf, mid in FIM_SPELLINGS:
+        if special(pre) is not None and special(suf) is not None and special(mid) is not None:
+            cfg.fim_prefix, cfg.fim_suffix, cfg.fim_middle = pre, suf, mid
+            return True
+    return False
+
+
 @dataclass
 class Prompt:
     # (text, special): special parts are single special tokens.
