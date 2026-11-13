@@ -1,6 +1,6 @@
 # Ghost-text autocomplete with cached KV
 
-Status: draft for review. Nothing here is built yet.
+Status: draft for review. A prototype of M0 and M1 is in [engine/](../../../engine/) and `src/complete.rs`.
 
 vmac gets inline (ghost text) completions from a small local model, Liquid's
 LFM3-1.7B, with the whole repository as context, at keystroke speed on a

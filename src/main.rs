@@ -7,6 +7,7 @@
 mod agent;
 mod buffer;
 mod clipboard;
+mod complete;
 mod daemon;
 mod device;
 mod editor;

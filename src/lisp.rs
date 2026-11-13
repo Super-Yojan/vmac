@@ -23,6 +23,7 @@ const LUA_CORE_FILES: &[(&str, &str)] = &[
     ("40-tree.lua", include_str!("../lua/core/40-tree.lua")),
     ("50-dashboard.lua", include_str!("../lua/core/50-dashboard.lua")),
     ("60-lsp.lua", include_str!("../lua/core/60-lsp.lua")),
+    ("65-autocomplete.lua", include_str!("../lua/core/65-autocomplete.lua")),
     ("70-agent.lua", include_str!("../lua/core/70-agent.lua")),
     ("80-looks.lua", include_str!("../lua/core/80-looks.lua")),
     ("90-bindings.lua", include_str!("../lua/core/90-bindings.lua")),
@@ -1212,6 +1213,30 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     prim!(reg, editor, "completion-move", |s, n: isize| s.completion_move(n));
     prim!(reg, editor, "completion-accept", |s| s.completion_accept());
     prim!(reg, editor, "completion-close", |s| s.completion = None);
+
+    // Ghost text: completions from the model beside vmac (complete.rs).
+    prim!(reg, editor, "autocomplete-request", |s| s.autocomplete_request());
+    prim!(reg, editor, "autocomplete-configure", |s, enabled: bool, command: Vec<String>, backend: String, model: String, layout: String, debounce_ms: u64, stop: String, max_tokens: u32| {
+        s.autocomplete_configure(crate::complete::Config {
+            enabled,
+            command,
+            backend,
+            model,
+            layout,
+            debounce: std::time::Duration::from_millis(debounce_ms),
+            stop,
+            max_tokens,
+        })
+    });
+    prim!(reg, editor, "autocomplete-status", |s| s.completer.status.clone());
+    prim!(reg, editor, "autocomplete-stats", |s| s.completer.stats.as_ref().map(|v| v.to_string()).unwrap_or_default());
+    prim!(reg, editor, "ghost-active?", |s| {
+        let b = s.buffer();
+        s.completer.visible(s.window().buffer, b.revision(), b.point()).is_some()
+    });
+    prim!(reg, editor, "ghost-accept", |s, how: Option<String>| s.ghost_accept(how.as_deref().unwrap_or("all")));
+    prim!(reg, editor, "ghost-type-through", |s, text: String| s.ghost_type_through(&text));
+    prim!(reg, editor, "ghost-dismiss", |s| s.ghost_dismiss());
     pure!(reg, "word-char?", |text: String| text.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_'));
     prim!(reg, editor, "jump-back", |s| {
         if !s.jump_back() {
@@ -4977,6 +5002,53 @@ for line in sys.stdin:
         assert_eq!(editor.lock().buffer().line(), 2, "went to the second reference");
         lisp.dispatch_key("C-o", "");
         assert_eq!(editor.lock().buffer().line(), 0, "and C-o comes back");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pumps completions until `done`, for up to ten seconds.
+    fn pump_ghost_until(editor: &Editor, done: impl Fn(&EditorState) -> bool) -> bool {
+        for _ in 0..500 {
+            editor.lock().autocomplete_pump();
+            if done(&editor.lock()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn ghost_text_shows_types_through_and_tab_takes_it() {
+        let dir = std::env::temp_dir().join(format!("vmac-ghost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.py");
+        std::fs::write(&file, "x = 1").unwrap();
+        let (mut lisp, editor) = lisp_with("");
+        editor.lock().open_file(&file).unwrap();
+        // The real engine, with no model: it completes "def " as "main():\n    pass".
+        let engine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine");
+        let boot = format!("import sys; sys.path.insert(0, {:?}); from vmac_complete.__main__ import main; main(['--backend', 'fake'])", engine.display().to_string());
+        lisp.eval(&format!("vmac.set_autocomplete({{ enabled = true, backend = 'fake', command = {{ 'python3', '-c', {boot:?} }} }})")).unwrap();
+        typed(&mut lisp, "Godef ");
+        let ghost = |st: &EditorState| {
+            let b = st.buffer();
+            st.completer.visible(st.window().buffer, b.revision(), b.point()).map(str::to_string)
+        };
+        assert!(pump_ghost_until(&editor, |st| ghost(st).is_some()), "a completion came: {:?}", editor.lock().completer);
+        assert_eq!(ghost(&editor.lock()).as_deref(), Some("main():\n    pass"));
+        typed(&mut lisp, "ma");
+        assert_eq!(ghost(&editor.lock()).as_deref(), Some("in():\n    pass"), "typed through");
+        lisp.dispatch_key("M-f", "");
+        assert_eq!(ghost(&editor.lock()).as_deref(), Some("():\n    pass"), "a word taken");
+        lisp.dispatch_key("TAB", "");
+        assert_eq!(editor.lock().buffer().text().to_string(), "x = 1\ndef main():\n    pass");
+        assert!(ghost(&editor.lock()).is_none());
+        // Something else typed drops it; ESC too.
+        typed(&mut lisp, "\n");
+        typed(&mut lisp, "def ");
+        assert!(pump_ghost_until(&editor, |st| ghost(st).is_some()));
+        lisp.dispatch_key("ESC", "");
+        assert!(ghost(&editor.lock()).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

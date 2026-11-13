@@ -397,6 +397,8 @@ pub struct EditorState {
     jumps: Vec<(BufferId, usize)>,
     /// The completion popup while typing, if open.
     pub completion: Option<Completion>,
+    /// Ghost-text completions from the model beside vmac (complete.rs).
+    pub completer: crate::complete::Completer,
     /// Running terminals, and the backend new ones use ("local", or a
     /// plugin's). Plugin terminals to end, for the Lisp side (it runs Lua).
     pub terminals: Vec<Terminal>,
@@ -662,6 +664,7 @@ impl EditorState {
             whichkey: None,
             jumps: Vec::new(),
             completion: None,
+            completer: Default::default(),
             code_actions: Vec::new(),
             terminals: Vec::new(),
             terminal_backend: "local".into(),
