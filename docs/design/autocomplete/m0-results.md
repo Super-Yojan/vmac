@@ -74,3 +74,37 @@ something plausible but different).
   compare a FIM-trained coding model of similar size under the same engine
   (to know what LFM3 is giving up), fine-tune LFM3 for FIM (M2), or stay
   prefix-only and see how much repo context (M3) lifts it.
+
+## Comparison: Qwen2.5-Coder-1.5B (FIM-trained)
+
+The same bench (same 200 lines, same seed) with
+`mlx-community/Qwen2.5-Coder-1.5B-4bit`, a coding model of similar size
+trained for FIM in PSM order:
+
+| | LFM3-1.7B | Qwen2.5-Coder-1.5B |
+|---|---|---|
+| prefill tok/s (7K context) | 1,258 | 1,337 |
+| decode tok/s | 82–94 | 111–137 |
+| typing, cache kept, p50 / p95 | 12 / 42 ms | 9 / 33 ms |
+| FIM exact match: prefix only | 8.5% | 11.0% |
+| FIM exact match: SPM | 3.5% | 2.5% |
+| FIM exact match: PSM | 0.0% | **13.5%** |
+| FIM edit similarity, best layout | 45% (prefix) | 50% (PSM) |
+
+What it shows:
+
+- **The gap is about 5 points of exact match** (8.5% against 13.5%) on this
+  test, with no repo context. Both models are weak here because the test is
+  hard (any line, exact match, nothing from other files); the gap matters
+  more than the level.
+- **SPM is bad on both.** Qwen was trained on PSM only. The design's
+  suffix-first layout, which makes every keystroke an append, needs a model
+  trained in that order. With PSM, every key changes the prefix, which sits
+  before the suffix, so the suffix's tokens are fed again on every key. A
+  short suffix (the rest of the line and a few lines, ~64 tokens) keeps that
+  to about 50 ms per key at these speeds.
+- Speed is close; Qwen decodes about 40% faster.
+
+So a FIM fine-tune of LFM3 (M2) would buy two things at once: fill in the
+middle, and SPM order, which keeps typing an append. Until then, the choice
+is LFM3 prefix-only or a PSM model with a short suffix.
