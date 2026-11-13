@@ -1,0 +1,22 @@
+[project]
+name = "vmac-complete"
+version = "0.1.0"
+description = "vmac's completion engine: ghost-text completions from a local model, with its KV cache kept between keystrokes"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+dependencies = []
+
+[project.optional-dependencies]
+# Apple silicon. LFM3 loads through mlx-vlm (0.7.11 or later).
+mlx = ["mlx>=0.29", "mlx-vlm>=0.7.11", "mlx-lm>=0.28"]
+test = ["pytest"]
+
+[project.scripts]
+vmac-complete = "vmac_complete.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["vmac_complete"]

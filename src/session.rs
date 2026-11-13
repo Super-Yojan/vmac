@@ -84,7 +84,9 @@ impl Session {
 
     /// Reads terminals' screens into their buffers.
     pub fn pump_terminals(&mut self) -> bool {
-        !self.editor.lock().terminals.is_empty() && self.lisp.pump_terminals()
+        // Completions are read on this timer too: it's the fast one.
+        let completed = self.editor.lock().autocomplete_pump();
+        completed | (!self.editor.lock().terminals.is_empty() && self.lisp.pump_terminals())
     }
 
     /// Syncs files with their language servers, reads what they and the
@@ -482,6 +484,10 @@ impl Session {
                 let point = st.window_point(*id);
                 let cur_line = text.char_to_line(point);
                 let cur_col = point - text.line_to_char(cur_line);
+                // A completion shown after the cursor (complete.rs).
+                let ghost = (is_selected && !is_sidebar && !minibuffer_open)
+                    .then(|| st.completer.visible(w.buffer, buffer.revision(), point).map(str::to_string))
+                    .flatten();
 
                 // Styles for every line that could be on screen: from the top (or
                 // the cursor, if above) through as many normal-height rows as fit.
@@ -619,6 +625,10 @@ impl Session {
                         .map(|i| {
                             let raw = text.line(i).to_string();
                             let (line, cols) = layout_line(raw.trim_end_matches(['\n', '\r']), ops_of(i));
+                            let (line, cols, ghost_span) = match ghost.as_deref().filter(|_| i == cur_line) {
+                                Some(g) => with_ghost(line, cols, cur_col, g),
+                                None => (line, cols, None),
+                            };
                             let to_screen = |col: usize| cols.get(col).copied().unwrap_or(col);
                             let start = text.line_to_char(i);
                             // The selected range touching this line (a block has one per line);
@@ -652,9 +662,13 @@ impl Session {
                                 height,
                                 matches: match_columns(&line, search.as_ref()),
                                 cursor: (is_selected && !is_sidebar && i == cur_line && !minibuffer_open)
-                                    .then_some(to_screen(cur_col)),
+                                    .then_some(ghost_span.map_or(to_screen(cur_col), |(at, _)| at)),
                                 selected,
-                                styles: styles[i - lo].iter().map(|(a, b, f)| (to_screen(*a), to_screen(*b), f.clone())).collect(),
+                                styles: styles[i - lo]
+                                    .iter()
+                                    .map(|(a, b, f)| (to_screen(*a), to_screen(*b), f.clone()))
+                                    .chain(ghost_span.map(|(a, b)| (a, b, ghost_face())))
+                                    .collect(),
                                 diagnostics: line_diagnostics,
                                 number,
                                 number_current: i == cur_line,
@@ -875,6 +889,41 @@ fn line_scale(styles: &[(usize, usize, Face)]) -> f32 {
 /// A line's length in characters, without its line break.
 fn text_line_len(text: &ropey::Rope, line: usize) -> usize {
     text.line(line).to_string().trim_end_matches(['\n', '\r']).chars().count()
+}
+
+/// How ghost text looks: dim and slanted.
+fn ghost_face() -> crate::frame::Face {
+    crate::frame::Face {
+        color: Some("dim".into()),
+        background: None,
+        scale: 1.,
+        bold: false,
+        italic: true,
+        underline: false,
+        sans: false,
+    }
+}
+
+/// Ghost text put into a laid-out line before character `col` (the
+/// cursor's): the line as shown, its columns with everything from the
+/// cursor on moved right, and where the ghost text is. A completion of
+/// several lines shows on one, its line breaks as ↵ (TAB takes them all).
+fn with_ghost(line: String, mut cols: Vec<usize>, col: usize, ghost: &str) -> (String, Vec<usize>, Option<(usize, usize)>) {
+    let shown: String = ghost.trim_end().replace('\t', "    ").replace('\n', " ↵ ").chars().take(160).collect();
+    let width = shown.chars().count();
+    if width == 0 {
+        return (line, cols, None);
+    }
+    let len = line.chars().count();
+    let at = cols.get(col).copied().unwrap_or(len);
+    let mut out: String = line.chars().take(at).collect();
+    out.extend(std::iter::repeat_n(' ', at.saturating_sub(len)));
+    out.push_str(&shown);
+    out.extend(line.chars().skip(at));
+    for c in cols.iter_mut().skip(col) {
+        *c += width;
+    }
+    (out, cols, Some((at, at + width)))
 }
 
 /// Column ranges where the search pattern matches in a line of text.
@@ -1442,5 +1491,16 @@ mod tests {
         let re = regex::Regex::new("b+").unwrap();
         assert_eq!(match_columns("éabbxb", Some(&re)), vec![(2, 4), (5, 6)]);
         assert_eq!(match_columns("abc", None), vec![]);
+    }
+
+    #[test]
+    fn ghost_text_goes_in_at_the_cursor() {
+        let (line, cols) = layout_line("foo(x)", &[]);
+        let (line, cols, span) = with_ghost(line, cols, 5, "y, z");
+        assert_eq!(line, "foo(xy, z)");
+        assert_eq!(span, Some((5, 9)));
+        assert_eq!(&cols[..7], &[0, 1, 2, 3, 4, 9, 10], "the ) moved past it");
+        let (line, _, _) = with_ghost("ab".into(), display_columns("ab"), 2, "c\n  d");
+        assert_eq!(line, "abc ↵   d");
     }
 }

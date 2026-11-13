@@ -383,6 +383,7 @@ end)
 V.command("normal-state", function()
   core.state = "normal"
   V.completion_close()
+  V.ghost_dismiss()
   if core.block_insert then finish_block_insert() end
   if core.in_markdown_table() then V.align_table(0) end
   if V.point() > core.line_start() then V.forward_char(-1) end
