@@ -27,6 +27,7 @@ locally at all.
 | [06-latency.md](06-latency.md) | The latency budget, per keystroke and per context switch |
 | [07-evaluation.md](07-evaluation.md) | How we know it beats plain RAG: baselines, benchmarks, edit replays |
 | [08-milestones.md](08-milestones.md) | Phases, each with something that ships and a go/no-go |
+| [m0-results.md](m0-results.md) | M0 measured on a Mac: 12 ms per keystroke with the cache kept, rotation exact, FIM not usable as released |
 
 ## Decisions this draft makes
 
