@@ -128,20 +128,25 @@ class MLXBackend(Backend):
 
     @staticmethod
     def _load(model: str):
-        try:
+        """mlx-vlm for LFM3 (mlx-lm can't load it yet), mlx-lm for the rest
+        (coding models like Qwen2.5-Coder, for comparison)."""
+        if "lfm3" in model.lower():
             from mlx_vlm import load
 
             m, processor = load(model)
-            lm = getattr(m, "language_model", m)
-            tok = getattr(processor, "tokenizer", processor)
-            return lm, tok
-        except Exception as vlm_error:  # not a model mlx-vlm knows
-            try:
-                from mlx_lm import load as lm_load
+            return getattr(m, "language_model", m), getattr(processor, "tokenizer", processor)
+        try:
+            from mlx_lm import load as lm_load
 
-                return lm_load(model)
+            return lm_load(model)
+        except Exception as lm_error:  # perhaps one only mlx-vlm knows
+            try:
+                from mlx_vlm import load
+
+                m, processor = load(model)
+                return getattr(m, "language_model", m), getattr(processor, "tokenizer", processor)
             except Exception:
-                raise vlm_error
+                raise lm_error
 
     def encode(self, text: str) -> list[int]:
         return list(self.tokenizer.encode(text, add_special_tokens=False))
