@@ -90,8 +90,27 @@ end
 -- to a command's name or a function.
 function V.map(state, keys, command) core.define_key(state, keys, command) end
 
+-- The leader key. It leads in normal state only, like a major mode's keys
+-- in Emacs: on files, the tree, the dashboard, and a terminal's normal state
+-- (splits, moving between terminals, tabs, sessions). While you type into a
+-- terminal it never leads, so its programs (shells, neovim, htop) always get
+-- the key. vmac.set_terminal_leader(false) keeps it from leading in a
+-- terminal's normal state too.
+core.leader = "SPC"
+core.terminal_leader = true
+function V.set_terminal_leader(on) core.terminal_leader = on and true or false end
+
+-- Whether `key` (a binding's key sequence) starts with the leader.
+function core.leader_key(key)
+  return key == core.leader or core.starts_with(key, core.leader .. " ")
+end
+
+-- Whether a chain of keymaps hides the leader's bindings.
+local function hides(chain, key) return chain.no_leader and core.leader_key(key) end
+
 -- The first binding of `seq` in a chain of keymaps.
 function core.lookup(chain, seq)
+  if hides(chain, seq) then return nil end
   for _, map in ipairs(chain) do
     local binding = map[seq]
     if binding ~= nil then return binding end
@@ -101,6 +120,7 @@ end
 
 -- Whether some binding continues the sequence.
 function core.is_prefix(chain, seq)
+  if hides(chain, seq) then return false end
   local p = seq .. " "
   for _, map in ipairs(chain) do
     for key in pairs(map) do
@@ -198,8 +218,8 @@ function core.current_keymaps()
   local k = core.keymaps
   local plain = not V.minibuffer_active()
   local normal = core.state == "normal" and plain
-  if core.terminal_insert() then return { k.terminal } end
-  if core.terminal_normal() then return { k.terminal_normal, k.normal } end
+  if core.terminal_insert() then return { k.terminal, no_leader = true } end
+  if core.terminal_normal() then return { k.terminal_normal, k.normal, no_leader = not core.terminal_leader } end
   if core.device_insert() then return { k.device_insert } end
   if normal and V.device_here() then return { k.device, k.normal } end
   if normal and V.buffer_name() == core.tree_buffer then return { k.tree, k.normal } end

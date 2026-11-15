@@ -483,5 +483,11 @@ end
 core.define_key("terminal_normal", "g t", "terminal-next")
 core.define_key("terminal_normal", "g T", "terminal-previous")
 for _, key in ipairs({ "i", "a", "I", "A", "o", "O" }) do core.define_key("terminal_normal", key, "terminal-type") end
+-- In a terminal's normal state, q hides it (back to the file, or closes its
+-- window below) and X ends it; C-` toggles the terminal below from
+-- anywhere, as in VS Code.
+core.define_key("terminal_normal", "q", "terminal-toggle")
+core.define_key("terminal_normal", "X", "terminal-kill")
+for _, map in ipairs({ "normal", "terminal", "terminal_normal" }) do core.define_key(map, "C-`", "terminal-toggle") end
 core.define_key("terminal_normal", "p", "terminal-paste")
 core.define_key("terminal_normal", "P", "terminal-paste")

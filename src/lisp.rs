@@ -5460,16 +5460,50 @@ vmac.command("word-count", function() vmac.message(util.count(vmac.buffer_string
         assert!(pump_terminals_until(&mut lisp, &editor, |st| st.terminals.len() == 2), "exit closes it");
         assert!(!editor.lock().buffer_names().contains(&"build".to_string()));
         assert!(editor.lock().terminal_here().is_some(), "another terminal shows in its place");
-        // SPC o k ends this one; the last one gone, its window closes.
+        // X ends this one (the leader doesn't lead in a terminal); the last
+        // one gone, its window closes.
         lisp.dispatch_key("ESC", "");
-        typed(&mut lisp, " ok");
+        typed(&mut lisp, "X");
         assert_eq!(editor.lock().terminals.len(), 1);
         lisp.dispatch_key("ESC", "");
-        typed(&mut lisp, " ok");
+        typed(&mut lisp, "X");
         assert!(editor.lock().terminals.is_empty());
         assert_eq!(editor.lock().window_count(), 1);
         assert_eq!(editor.lock().buffer().name(), "test");
         assert_eq!(lisp.cursor_shape(), "box", "back in normal state");
+    }
+
+    #[test]
+    fn the_leader_leads_in_normal_state_only() {
+        let (mut lisp, editor) = lisp_with("text");
+        lisp.eval_lua("vmac.set_terminal_shell('/bin/sh')").unwrap();
+        typed(&mut lisp, " oT");
+        assert!(editor.lock().terminal_here().is_some());
+        // Typing into the terminal, SPC is the program's.
+        typed(&mut lisp, "echo a b\n");
+        assert!(pump_terminals_until(&mut lisp, &editor, |st| st.buffer().text().to_string().contains("a b\n")), "the space reached the shell");
+        // In the terminal's normal state it leads: a split with another terminal.
+        lisp.dispatch_key("ESC", "");
+        typed(&mut lisp, " os");
+        assert_eq!(editor.lock().window_count(), 2);
+        assert_eq!(editor.lock().terminals.len(), 2);
+        // ...and moving between them.
+        lisp.dispatch_key("ESC", "");
+        let here = editor.lock().buffer().name().to_string();
+        typed(&mut lisp, " wa");
+        typed(&mut lisp, " ww");
+        assert_ne!(editor.lock().buffer().name(), here);
+        // Lua can keep it from leading in a terminal at all.
+        lisp.eval_lua("vmac.set_terminal_leader(false)").unwrap();
+        assert!(editor.lock().terminal_here().is_some());
+        let n = editor.lock().terminals.len();
+        typed(&mut lisp, " oT");
+        assert_eq!(editor.lock().terminals.len(), n, "SPC o T made no terminal");
+        // q hides a terminal (normal state again: o typed into it).
+        lisp.dispatch_key("ESC", "");
+        let windows = editor.lock().window_count();
+        typed(&mut lisp, "q");
+        assert_eq!(editor.lock().window_count(), windows - 1);
     }
 
     #[test]
