@@ -33,7 +33,14 @@ pub enum ToServer {
         viewport: Viewport,
         #[serde(default)]
         agents: bool,
+        /// Start fresh (`vmac`, `vmac PATH`): a blank session that starts as
+        /// a terminal, opening `target` (a path) when there is one.
+        #[serde(default)]
+        start: bool,
     },
+    /// `vmac PATH` run in a terminal of session `session` (its
+    /// VMAC_SESSION): show it there, and hang up.
+    Open { session: u64, path: PathBuf },
     Input(Input),
     Resize(Viewport),
     /// What's on the clipboard of the machine the window runs on (sent by
@@ -91,7 +98,7 @@ pub enum ToClient {
 /// Bumped when the messages change in a way older servers can't read: each
 /// version has its own socket, so a newer window never talks to an older
 /// server (stop that one with its own `vmac kill-server`).
-const PROTOCOL: u32 = 8;
+const PROTOCOL: u32 = 9;
 
 /// Where the server listens: $VMAC_SOCKET, or `vmac/default` in
 /// $XDG_RUNTIME_DIR, or in a folder of your own in the temporary folder.
@@ -243,14 +250,20 @@ fn run(
             let Some(client) = clients.get_mut(&id) else { continue };
             match message {
                 None => {
+                    let was_window = client.hello;
                     clients.remove(&id);
+                    // The last window detached: blank sessions end, and the
+                    // server too when that leaves none.
+                    if was_window && !clients.values().any(|c| c.hello) && server.detached() {
+                        return Ok(());
+                    }
                     agent_windows.retain(|w| *w != id);
                     if agent_window == Some(id) {
                         agent_window = None;
                         crate::remote_agent::all_exited("the window running it closed");
                     }
                 }
-                Some(ToServer::Hello { version, target, cwd, viewport, agents }) => {
+                Some(ToServer::Hello { version, target, cwd, viewport, agents, start }) => {
                     // A newer vmac's window: this server restarts onto it (asked).
                     server.newer_window(&version);
                     if agents {
@@ -267,7 +280,22 @@ fn run(
                     // No folder (a window on another machine): the home folder.
                     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
                     let cwd = if cwd.as_os_str().is_empty() { home } else { cwd };
-                    server.attach(target.as_deref(), &cwd);
+                    if start {
+                        let path = target.filter(|t| !t.is_empty()).map(|t| cwd.join(t));
+                        server.start(&cwd, path.as_deref());
+                    } else {
+                        server.attach(target.as_deref(), &cwd);
+                    }
+                    changed = true;
+                }
+                Some(ToServer::Open { session, path }) => {
+                    // It waits for the answer, then hangs up.
+                    client.send(&if server.open_from_terminal(session, &path) {
+                        ToClient::Bye("Opened".into())
+                    } else {
+                        ToClient::Notice(format!("no session {session} on this server"))
+                    });
+                    clients.remove(&id);
                     changed = true;
                 }
                 Some(ToServer::Input(input)) => {
@@ -364,6 +392,10 @@ fn run(
                 client.send(&ToClient::Bye("Detached".into()));
             }
             clients.clear();
+            if server.detached() {
+                std::thread::sleep(Duration::from_millis(50));
+                return Ok(());
+            }
         }
         changed |= server.pump_terminals();
         if last_lsp.elapsed() >= LSP_POLL {
@@ -463,20 +495,39 @@ impl Client {
         Self::over(Box::new(stream.try_clone()?), Box::new(stream), target, cwd, None)
     }
 
+    /// Connects to the server on `socket` starting fresh: a blank session
+    /// that starts as a terminal (and opens `path`, from the current folder).
+    pub fn start(socket: &Path, path: Option<String>) -> std::io::Result<Self> {
+        let stream = UnixStream::connect(socket)?;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        Self::connect(Box::new(stream.try_clone()?), Box::new(stream), path, cwd, None, true)
+    }
+
     /// Attaches over a connection to a server: `reader` and `writer`, which
     /// `carrier` (ssh) may provide; folders in `target` are relative to
     /// `cwd` (empty: the server's home folder). A carrier means the server
     /// is on another machine.
     pub fn over(
         reader: Box<dyn std::io::Read + Send>,
-        mut writer: Box<dyn Write + Send>,
+        writer: Box<dyn Write + Send>,
         target: Option<String>,
         cwd: PathBuf,
         carrier: Option<std::process::Child>,
     ) -> std::io::Result<Self> {
+        Self::connect(reader, writer, target, cwd, carrier, false)
+    }
+
+    fn connect(
+        reader: Box<dyn std::io::Read + Send>,
+        mut writer: Box<dyn Write + Send>,
+        target: Option<String>,
+        cwd: PathBuf,
+        carrier: Option<std::process::Child>,
+        start: bool,
+    ) -> std::io::Result<Self> {
         let viewport = Viewport { width: 1320., height: 840. };
         let remote = carrier.is_some();
-        let hello = ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd, viewport, agents: remote };
+        let hello = ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd, viewport, agents: remote, start };
         send_line(&mut writer, &hello)?;
         let (tx, incoming) = channel();
         read_lines(reader, (), tx);
@@ -581,7 +632,7 @@ impl Client {
         let target = self.frame.as_ref().map(|f| f.session.clone()).filter(|s| !s.is_empty());
         let viewport = self.viewport.unwrap_or(Viewport { width: 1320., height: 840. });
         let hello =
-            ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd: PathBuf::new(), viewport, agents: self.remote };
+            ToServer::Hello { version: env!("CARGO_PKG_VERSION").into(), target, cwd: PathBuf::new(), viewport, agents: self.remote, start: false };
         self.frame_value = None;
         self.foreign.clear();
         self.machines.clear();
@@ -892,6 +943,21 @@ pub fn list(socket: &Path) -> std::io::Result<(String, Vec<crate::frame::Session
     Err(std::io::Error::other("the server didn't say"))
 }
 
+/// `vmac PATH` in a terminal of session `session` on the server at
+/// `socket`: shown there (the terminal docks below). Errs when no server
+/// answers.
+pub fn open_in_session(socket: &Path, session: u64, path: PathBuf) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    send_line(&mut stream, &ToServer::Open { session, path })?;
+    // It answers Bye when done, and why when it couldn't.
+    let mut line = String::new();
+    let _ = BufReader::new(stream).read_line(&mut line);
+    match serde_json::from_str::<ToClient>(&line) {
+        Ok(ToClient::Notice(why)) => Err(std::io::Error::other(why)),
+        _ => Ok(()),
+    }
+}
+
 /// Tells the server on `socket` to stop.
 pub fn kill(socket: &Path) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
@@ -1067,6 +1133,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `vmac` opens a window on a blank session that starts as a terminal;
+    /// `vmac .` in that terminal opens the file finder there; the window
+    /// closing ends the blank session, and with it the server.
+    #[test]
+    fn a_window_starts_blank_and_its_closing_ends_the_server() {
+        let dir = std::env::temp_dir().join(format!("vmac-daemon-start-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("proj/.git")).unwrap();
+        std::fs::write(dir.join("proj/main.rs"), "fn main() {}\n").unwrap();
+        let socket = dir.join("socket");
+        let windows = {
+            let (socket, dir) = (socket.clone(), dir.clone());
+            std::thread::spawn(move || {
+                while UnixStream::connect(&socket).is_err() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let stream = UnixStream::connect(&socket).unwrap();
+                let mut client =
+                    Client::connect(Box::new(stream.try_clone().unwrap()), Box::new(stream), None, dir.clone(), None, true).unwrap();
+                let started = client.frame(VIEW).picker.map(|p| p.title);
+                keys(&mut client, &["ESC"]);
+                open_in_session(&socket, 1, dir.join("proj")).unwrap();
+                let missing = open_in_session(&socket, 99, dir.join("proj")).is_err();
+                keys(&mut client, &["m"]);
+                let finder = client.frame(VIEW).picker.map(|p| p.title);
+                drop(client);
+                (started, finder, missing)
+            })
+        };
+        let make = || {
+            let session = fresh();
+            Server::new(session, Box::new(fresh))
+        };
+        serve(make, &socket).unwrap();
+        let (started, finder, missing) = windows.join().unwrap();
+        assert_eq!(started.as_deref(), Some("Start"));
+        assert_eq!(finder.as_deref(), Some("Find file"));
+        assert!(missing, "an unknown session says so");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The connection drops (a network change): the window makes it again
     /// and is back on its session, what was typed still there.
     #[test]
@@ -1145,7 +1251,7 @@ mod tests {
 
     #[test]
     fn messages_survive_the_wire() {
-        let hello = ToServer::Hello { version: "1".into(), target: Some("x".into()), cwd: "/tmp".into(), viewport: VIEW, agents: false };
+        let hello = ToServer::Hello { version: "1".into(), target: Some("x".into()), cwd: "/tmp".into(), viewport: VIEW, agents: false, start: false };
         let line = serde_json::to_string(&hello).unwrap();
         assert_eq!(serde_json::from_str::<ToServer>(&line).unwrap(), hello);
     }

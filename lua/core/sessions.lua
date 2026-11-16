@@ -156,3 +156,73 @@ vmac.map("normal", "SPC S n", "session-new-command")
 vmac.map("normal", "SPC S r", "session-rename-command")
 vmac.map("normal", "SPC S k", "session-kill-command")
 vmac.map("normal", "SPC S K", "session-kill-force-command")
+
+---- Starting as a terminal
+--
+-- vmac starts as a terminal filling the window, in a blank session (one
+-- that ends when the window closes), and offers to:
+--   New persistent session   name it; it keeps running (its terminals
+--                            too) when the window closes, like tmux's
+--   Find a session           fuzzy-search the sessions running, and go
+--                            there (the blank one ends)
+--   Blank session            stay as you are (ESC does too)
+-- In a vmac terminal, `vmac` or `vmac .` opens the editor on that folder
+-- with its files in the fuzzy finder, and `vmac FILE` opens FILE; the
+-- terminal docks below like VS Code's. SPC o t hides or brings it back.
+--
+-- core.start_as = "dashboard" starts on the dashboard instead (still in a
+-- blank session); core.docked_terminal_share is how much of the window the
+-- docked terminal keeps (0.3).
+
+core.start_as = core.start_as or "terminal"
+core.docked_terminal_share = core.docked_terminal_share or 0.3
+
+local NEW, FIND, BLANK = "New persistent session", "Find a session", "Blank session"
+
+local function back_to_terminal()
+  if vmac.terminal_here() then core.state = "insert" end
+end
+
+vmac.command("start-picker", function()
+  vmac.pick("Start", { NEW, FIND, BLANK }, function(choice)
+    if choice == NEW then
+      local folder = (vmac.session_project() ~= "" and vmac.session_project() or vmac.project_root()):match("([^/]+)/*$") or "main"
+      vmac.prompt("Session name: ", function(name)
+        vmac.session_persist(name ~= "" and name or folder)
+        back_to_terminal()
+      end, folder)
+      return
+    elseif choice == FIND then
+      local list, names = rows(not_here)
+      if #list == 0 then
+        vmac.message("No other sessions yet: this one stays blank")
+        return back_to_terminal()
+      end
+      vmac.pick("Find a session", list, function(row) vmac.session_adopt(names[row]) end)
+      return
+    end
+    back_to_terminal()
+  end)
+end)
+
+-- The server calls this in a window's new blank session: a terminal filling
+-- the window and the start picker, or `path` opened (`vmac PATH`).
+function core.start_in_terminal(path, is_dir)
+  if core.start_as == "dashboard" and not path then return core.call_binding("dashboard") end
+  if vmac.terminal_open("", "") then core.state = "insert" end
+  if path then return core.open_from_terminal(path, is_dir) end
+  core.call_binding("start-picker")
+end
+
+-- `vmac PATH` run in a terminal of this session (the server calls this):
+-- the terminal docks below, and PATH opens above it.
+function core.open_from_terminal(path, is_dir)
+  if vmac.terminal_here() then vmac.dock_terminal(core.docked_terminal_share) end
+  core.state = "normal"
+  if not is_dir then return vmac.find_file(path) end
+  local project = vmac.session_project()
+  -- A session's first folder is its project (and names it); another
+  -- folder's files are only found, so the session stays where it is.
+  if project == "" then vmac.project_open(path) end
+  core.find_file_in((path:gsub("/+$", "")))
+end

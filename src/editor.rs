@@ -404,6 +404,11 @@ pub struct EditorState {
     /// The shell a terminal runs when given no command: fish when it's
     /// installed, else the login shell ($SHELL).
     pub terminal_shell: String,
+    /// What a local terminal's program gets in its environment, beside the
+    /// editor's (VMAC_SESSION, so `vmac` run in it opens here), and the
+    /// folder a terminal starts in when the buffer has no file (else home).
+    pub terminal_env: Vec<(String, String)>,
+    pub terminal_dir: Option<PathBuf>,
     /// The editor's font (None: the theme's monospace font), and the font
     /// families installed, which the view fills in.
     pub font: Option<String>,
@@ -519,6 +524,8 @@ pub struct EditorState {
     /// The machines the window knows (connected to before), and how each is.
     pub machines: Vec<crate::machines::MachineInfo>,
     pub session_requests: Vec<SessionRequest>,
+    /// This session ends when the window detaches (the server says).
+    pub session_blank: bool,
     pub in_server: bool,
     pub session_per_project: bool,
 }
@@ -548,6 +555,11 @@ pub enum SessionRequest {
     /// Restart the server onto the newer vmac installed (`force`: even
     /// with unsaved files or something running).
     RestartServer { force: bool },
+    /// Keep this session when the window detaches (a blank session ends
+    /// then), under this name.
+    Persist(String),
+    /// Show this other session instead, and end this one if it's blank.
+    Adopt(String),
 }
 
 /// A comment shown in a diff buffer: (path, on the new side, line, label,
@@ -666,6 +678,8 @@ impl EditorState {
             terminals: Vec::new(),
             terminal_backend: "local".into(),
             terminal_shell: default_shell(),
+            terminal_env: Vec::new(),
+            terminal_dir: None,
             font: None,
             fonts: Vec::new(),
             theme_mode: "system".into(),
@@ -724,6 +738,7 @@ impl EditorState {
             session_details: Vec::new(),
             machines: Vec::new(),
             session_requests: Vec::new(),
+            session_blank: false,
             in_server: false,
             session_per_project: true,
         }
@@ -3871,6 +3886,38 @@ impl EditorState {
 
     pub fn terminal_for(&mut self, buffer: BufferId) -> Option<&mut Terminal> {
         self.terminals.iter_mut().find(|t| t.buffer == buffer)
+    }
+
+    /// Docks the selected terminal below, the way VS Code's terminal sits
+    /// under the editor: its window splits, the terminal keeps the bottom
+    /// `share` of it, and the top shows the last file (or *scratch*) and is
+    /// selected. False when the selected window isn't a terminal.
+    pub fn dock_terminal(&mut self, share: f32) -> bool {
+        if self.terminal_here().is_none() {
+            return false;
+        }
+        let top = self.selected;
+        let terminal = self.window().buffer;
+        let terminals: Vec<BufferId> = self.terminals.iter().map(|t| t.buffer).collect();
+        let not_terminal = |id: &BufferId| !terminals.contains(id);
+        let newest_file = self.buffers.iter().rev().find(|(id, b)| not_terminal(id) && b.file().is_some()).map(|(id, _)| *id);
+        let scratch = self.buffers.iter().find(|(id, b)| not_terminal(id) && b.name() == "*scratch*").map(|(id, _)| *id);
+        let file = match newest_file.or(scratch) {
+            Some(id) => id,
+            None => self.add_buffer(Buffer::new("*scratch*")),
+        };
+        let area = self.layout_area();
+        let rect = self.window_rects().into_iter().find(|(w, _)| *w == top).map(|(_, r)| r);
+        let (y, h) = rect.map_or((area.y, area.h), |r| (r.y, r.h));
+        self.split_window(Axis::Column);
+        let bottom = self.selected;
+        self.select_window(top);
+        self.show_buffer(file);
+        if let Some(w) = self.window_by_id_mut(bottom) {
+            w.buffer = terminal;
+        }
+        self.move_window_border(top, Axis::Column, y + h * (1. - share.clamp(0.1, 0.9)));
+        true
     }
 
     /// The selected buffer's terminal, if it is one.
