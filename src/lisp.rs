@@ -606,7 +606,7 @@ fn register_terminals(reg: &mut Registry, editor: &Editor) {
         .lua
         .create_function(move |lua, (backend, command): (String, String)| {
             let shell = command.trim().is_empty();
-            let (backend, cwd, rows, cols, command) = {
+            let (backend, cwd, rows, cols, command, env) = {
                 let st = ed.lock();
                 let backend = if backend.is_empty() { st.terminal_backend.clone() } else { backend };
                 // No command: the terminal shell, as a login shell (its config and PATH load).
@@ -619,13 +619,14 @@ fn register_terminals(reg: &mut Registry, editor: &Editor) {
                     .buffer()
                     .file()
                     .map(|f| crate::picker::project_root(f))
+                    .or_else(|| st.terminal_dir.clone())
                     .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("/"));
                 let (rows, cols) = st.selected_size();
-                (backend, cwd, rows, cols, command)
+                (backend, cwd, rows, cols, command, st.terminal_env.clone())
             };
             if backend == "local" {
-                return Ok(match crate::terminal::LocalPty::start(&command, &cwd, rows, cols) {
+                return Ok(match crate::terminal::LocalPty::start_with_env(&command, &env, &cwd, rows, cols) {
                     Ok(pty) => {
                         let mut st = ed.lock();
                         let id = st.add_terminal(crate::editor::TermBackend::Local(pty));
@@ -883,6 +884,8 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
     // vmac.on_path(command): whether the command is on PATH.
     pure!(reg, "on-path?", |command: String| crate::packages::on_path(&command));
     // The fuzzy picker. Lua opens it and decides what picking does.
+    // The session's project folder ("" before it opens one).
+    prim!(reg, editor, "session-project", |s| s.project.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
     prim!(reg, editor, "project-root", |s| {
         let start = s
             .buffer()
@@ -1648,6 +1651,12 @@ fn register_primitives(reg: &mut Registry, editor: &Editor) {
         s.session_requests.push(SessionRequest::Kill { name, force })
     });
     prim!(reg, editor, "session-rename", |s, name: String| s.session_requests.push(SessionRequest::Rename(name)));
+    prim!(reg, editor, "session-persist", |s, name: String| s.session_requests.push(SessionRequest::Persist(name)));
+    prim!(reg, editor, "session-adopt", |s, name: String| s.session_requests.push(SessionRequest::Adopt(name)));
+    prim!(reg, editor, "session-blank", |s| s.session_blank);
+    // The selected terminal docked below the editor (VS Code's way); false
+    // when it isn't a terminal.
+    prim!(reg, editor, "dock-terminal", |s, share: f64| s.dock_terminal(share as f32));
     prim!(reg, editor, "set-session-per-project", |s, on: bool| s.session_per_project = on);
     // The machines the window knows: {host, how it is, "connected" or ""}.
     prim!(reg, editor, "machines", |s| s

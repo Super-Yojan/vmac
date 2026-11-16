@@ -372,7 +372,12 @@ pub struct LocalPty {
 impl LocalPty {
     /// Runs `command` (the user's shell when empty) in `cwd`.
     pub fn start(command: &str, cwd: &Path, rows: u16, cols: u16) -> Result<Self, String> {
-        let cmd = if command.trim().is_empty() {
+        Self::start_with_env(command, &[], cwd, rows, cols)
+    }
+
+    /// Runs `command` (as `start` does) with extra environment.
+    pub fn start_with_env(command: &str, env: &[(String, String)], cwd: &Path, rows: u16, cols: u16) -> Result<Self, String> {
+        let mut cmd = if command.trim().is_empty() {
             CommandBuilder::new_default_prog()
         } else {
             let mut words = command.split_whitespace();
@@ -380,6 +385,9 @@ impl LocalPty {
             cmd.args(words);
             cmd
         };
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         Self::spawn(cmd, cwd, rows, cols)
     }
 

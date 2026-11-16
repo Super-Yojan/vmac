@@ -139,6 +139,8 @@ struct Entry {
     id: SessionId,
     name: String,
     session: Session,
+    /// A blank session: it ends when the last window detaches.
+    blank: bool,
 }
 
 pub struct Server {
@@ -168,6 +170,9 @@ pub struct Server {
     update: crate::update::Tracker,
     update_waiting: Vec<String>,
     update_offered: Option<String>,
+    /// The session the server started with, while no window has used it:
+    /// the first window starting fresh takes it rather than making another.
+    unused_first: Option<SessionId>,
 }
 
 impl Server {
@@ -186,12 +191,14 @@ impl Server {
             update: crate::update::Tracker::new(),
             update_waiting: Vec::new(),
             update_offered: None,
+            unused_first: None,
         };
         let name = {
             let st = first.editor().lock();
             st.project.as_ref().and_then(|p| p.file_name()).map_or("main".into(), |n| n.to_string_lossy().into_owned())
         };
         server.active = server.add(name, first);
+        server.unused_first = Some(server.active);
         server.sync();
         server
     }
@@ -211,8 +218,10 @@ impl Server {
             let mut st = session.editor().lock();
             st.in_server = true;
             st.session_name = name.clone();
+            // `vmac` run in its terminals opens here (daemon.rs's Open).
+            st.terminal_env = vec![("VMAC_SESSION".into(), id.to_string())];
         }
-        self.list.push(Entry { id, name, session });
+        self.list.push(Entry { id, name, session, blank: false });
         id
     }
 
@@ -418,6 +427,28 @@ impl Server {
                 let msg = if self.update.install() { "Installing the latest vmac..." } else { "Already installing vmac" };
                 self.message(msg.into());
             }
+            SessionRequest::Persist(name) => {
+                let name = self.unique(&name, Some(from));
+                let entry = self.entry(from);
+                entry.name = name.clone();
+                entry.blank = false;
+                let mut st = entry.session.editor().lock();
+                st.session_blank = false;
+                st.message = format!("Session {name}: it keeps running when the window closes");
+            }
+            SessionRequest::Adopt(name) => match self.by_name(&name) {
+                Some(id) if id != from => {
+                    self.switch(id);
+                    if self.list.iter().any(|e| e.id == from && e.blank) {
+                        self.list.retain(|e| e.id != from);
+                        if self.last == Some(from) {
+                            self.last = None;
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => self.message(format!("No session {name}")),
+            },
             SessionRequest::RestartServer { force } => {
                 let busy = self.busy();
                 if !force && !busy.is_empty() {
@@ -543,6 +574,7 @@ impl Server {
 
     /// Opens the sessions a restart saved: each with its project and files.
     pub fn restore(&mut self, restore: crate::update::Restore) {
+        self.unused_first = None;
         for (i, saved) in restore.sessions.iter().enumerate() {
             // The first goes in the session there is.
             if i > 0 {
@@ -648,7 +680,74 @@ impl Server {
     /// A window attaching: to the session named `target`, or the session
     /// of the project in that folder (relative to `cwd`), made when there's
     /// none such; None stays on the active one.
+    /// A window starting fresh (`vmac`, `vmac PATH`): a blank session, in
+    /// `cwd`, that starts as a terminal filling the window. With no `path`
+    /// it offers the start picker (a new persistent session, an existing
+    /// one, or staying blank); with one, it opens it as `vmac PATH` run in
+    /// that terminal does. A blank session ends when the window detaches.
+    pub fn start(&mut self, cwd: &Path, path: Option<&Path>) {
+        let id = match self.unused_first.take().filter(|id| self.list.iter().any(|e| e.id == *id)) {
+            Some(id) => {
+                let name = self.unique("blank", Some(id));
+                self.entry(id).name = name;
+                self.switch(id);
+                id
+            }
+            None => self.create("blank"),
+        };
+        let entry = self.entry(id);
+        entry.blank = true;
+        {
+            let mut st = entry.session.editor().lock();
+            st.session_blank = true;
+            st.terminal_dir = Some(cwd.to_path_buf());
+            st.cwd = cwd.to_path_buf();
+            // Not renamed after a project it opens: Persist names it.
+            st.session_requests.retain(|r| !matches!(r, SessionRequest::Rename(_)));
+        }
+        let call = match path {
+            Some(p) => format!("core.start_in_terminal({}, {})", lua_string(&p.display().to_string()), p.is_dir()),
+            None => "core.start_in_terminal()".to_string(),
+        };
+        let _ = entry.session.run_lua(&call);
+        self.serve_requests();
+    }
+
+    /// `vmac PATH` run in a terminal of session `id`: the session is shown,
+    /// the terminal docks below and PATH opens above it (a folder: its
+    /// files in the fuzzy finder). False when there's no such session.
+    pub fn open_from_terminal(&mut self, id: SessionId, path: &Path) -> bool {
+        if !self.list.iter().any(|e| e.id == id) {
+            return false;
+        }
+        self.unused_first = None;
+        self.switch(id);
+        let call = format!("core.open_from_terminal({}, {})", lua_string(&path.display().to_string()), path.is_dir());
+        let _ = self.entry(id).session.run_lua(&call);
+        self.serve_requests();
+        true
+    }
+
+    /// The last window detached: blank sessions end. True when that leaves
+    /// none (the server has nothing left to keep).
+    pub fn detached(&mut self) -> bool {
+        if !self.list.iter().any(|e| e.blank) {
+            return false;
+        }
+        self.list.retain(|e| !e.blank);
+        let Some(first) = self.list.first().map(|e| e.id) else { return true };
+        if !self.list.iter().any(|e| e.id == self.active) {
+            self.active = self.last.filter(|l| self.list.iter().any(|e| e.id == *l)).unwrap_or(first);
+        }
+        if self.last.is_some_and(|l| !self.list.iter().any(|e| e.id == l)) || self.last == Some(self.active) {
+            self.last = None;
+        }
+        self.sync();
+        false
+    }
+
     pub fn attach(&mut self, target: Option<&str>, cwd: &Path) {
+        self.unused_first = None;
         let Some(target) = target.filter(|t| !t.is_empty()) else { return };
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         let path = match target.strip_prefix("~/") {
@@ -798,6 +897,119 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn with_sh() -> Session {
+        let mut session = fresh();
+        session.eval("vmac.set_terminal_shell('/bin/sh')").unwrap();
+        session
+    }
+
+    fn key(server: &mut Server, key: &str, text: &str) {
+        server.handle(Input::Key { key: key.into(), text: text.into() });
+    }
+
+    fn typed(server: &mut Server, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\n' => key(server, "RET", ""),
+                ' ' => key(server, "SPC", " "),
+                c => key(server, &c.to_string(), &c.to_string()),
+            }
+        }
+    }
+
+    fn picker_title(server: &mut Server) -> Option<String> {
+        server.frame(VIEW).picker.map(|p| p.title)
+    }
+
+    #[test]
+    fn windows_start_as_a_terminal_in_a_blank_session() {
+        let dir = std::env::temp_dir().join(format!("vmac-start-{}", std::process::id()));
+        let alpha = project(&dir, "alpha");
+        let mut s = Server::new(with_sh(), Box::new(with_sh));
+        // The first window takes the session the server started with.
+        s.start(&alpha, None);
+        assert_eq!(s.names(), ("blank".into(), vec!["blank".into()]));
+        assert!(s.active_session().editor().lock().terminal_here().is_some(), "a terminal fills the window");
+        assert_eq!(picker_title(&mut s).as_deref(), Some("Start"));
+        // New persistent session: named (after the folder unless typed).
+        typed(&mut s, "New\n");
+        let echo = format!("{:?}", s.frame(VIEW).echo);
+        assert!(echo.contains("Session name"), "{echo}");
+        for _ in 0..10 {
+            key(&mut s, "DEL", "");
+        }
+        typed(&mut s, "work\n");
+        assert_eq!(s.names(), ("work".into(), vec!["work".into()]));
+        assert!(!s.detached(), "a persistent session stays when the window goes");
+        assert_eq!(s.names().1, vec!["work".to_string()]);
+
+        // Another window: its own blank session; detaching ends it.
+        s.start(&alpha, None);
+        assert_eq!(s.names(), ("blank".into(), vec!["work".into(), "blank".into()]));
+        key(&mut s, "ESC", "");
+        assert!(!s.detached());
+        assert_eq!(s.names(), ("work".into(), vec!["work".into()]));
+
+        // Find a session: go there, and the blank one ends at once.
+        s.start(&alpha, None);
+        typed(&mut s, "Find\n");
+        assert_eq!(picker_title(&mut s).as_deref(), Some("Find a session"));
+        typed(&mut s, "work\n");
+        assert_eq!(s.names(), ("work".into(), vec!["work".into()]));
+
+        // Only blank sessions left: the server has nothing to keep.
+        let mut lone = Server::new(with_sh(), Box::new(with_sh));
+        lone.start(&alpha, None);
+        key(&mut lone, "ESC", "");
+        assert!(lone.detached());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vmac_in_a_terminal_opens_the_editor_with_the_terminal_below() {
+        let dir = std::env::temp_dir().join(format!("vmac-open-{}", std::process::id()));
+        let alpha = project(&dir, "alpha");
+        let mut s = Server::new(with_sh(), Box::new(with_sh));
+        s.start(&alpha, None);
+        // ESC twice closes the start picker (the first is its normal state), typing still.
+        key(&mut s, "ESC", "");
+        key(&mut s, "ESC", "");
+        let id = s.active;
+        // Its terminals know which session they're in, and start in the folder.
+        typed(&mut s, "echo in-$VMAC_SESSION-$(basename $PWD)\n");
+        let want = format!("in-{id}-alpha");
+        let mut seen = false;
+        for _ in 0..200 {
+            s.pump_terminals();
+            if s.active_session().editor().lock().buffer().text().to_string().lines().any(|l| l.trim().ends_with(&want) && !l.contains("echo")) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(seen, "{}", s.active_session().editor().lock().buffer().text());
+        key(&mut s, "ESC", "");
+        // `vmac .` in it: the file finder over the folder, the terminal below.
+        assert!(s.open_from_terminal(id, &alpha));
+        assert_eq!(picker_title(&mut s).as_deref(), Some("Find file"));
+        typed(&mut s, "main\n");
+        {
+            let session = s.active_session();
+            let mut st = session.editor().lock();
+            assert_eq!(st.window_count(), 2);
+            assert_eq!(st.buffer().name(), "main.rs", "the file opens above");
+            assert!(st.terminal_here().is_none());
+            assert_eq!(st.project.as_deref(), Some(alpha.as_path()));
+            let rects = st.window_rects();
+            let (top, bottom) = (rects[0].1, rects[1].1);
+            assert!(bottom.y > top.y && bottom.h < top.h, "the terminal is docked below, smaller: {top:?} {bottom:?}");
+        }
+        assert_eq!(s.names().0, "alpha", "the blank session is named after its project");
+        // An unknown session says so.
+        assert!(!s.open_from_terminal(999, &alpha));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn unsaved_files_keep_a_session_alive_unless_forced() {
         let dir = std::env::temp_dir().join(format!("vmac-server-kill-{}", std::process::id()));
@@ -879,4 +1091,21 @@ mod tests {
         assert_eq!(fresh.active_session().editor().lock().project.as_ref(), Some(&beta));
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// `text` as a Lua string literal.
+fn lua_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\{:03}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

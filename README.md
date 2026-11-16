@@ -31,9 +31,10 @@ or, the same thing by hand:
 cargo install --git https://github.com/Super-Yojan/vmac --tag v0.0.10 --locked
 ```
 
-Then `vmac FILE`. Your config goes in `~/.config/vmac/` (`init.lua`,
-`plugins/`). From a checkout, `cargo run -- FILE` runs it with live reload
-of `lua/core/`.
+Then `vmac`: it opens as a terminal (see [Starting as a terminal](#starting-as-a-terminal)),
+and `vmac .` in it opens the editor. Your config goes in `~/.config/vmac/` (`init.lua`,
+`plugins/`). From a checkout, `cargo run -- --standalone FILE` runs it with live reload
+of `lua/core/`, without the server.
 
 **Built,** each [release](https://github.com/Super-Yojan/vmac/releases)
 has vmac with its window:
@@ -53,8 +54,8 @@ has vmac with its window:
 
 **As a Mac app, from source.** From a checkout, `scripts/make-app.sh` builds `vmac.app`
 into `/Applications` (or the folder you name), with its icon, so it opens
-from Spotlight, Launchpad and the Dock. Opened that way it starts on the
-dashboard, in your home folder, with your login shell's `PATH` (so it finds
+from Spotlight, Launchpad and the Dock. Opened that way it starts as a
+terminal, in your home folder, with your login shell's `PATH` (so it finds
 language servers, fish, `npx` and the agents). It needs `rsvg-convert` and
 ImageMagick (`brew install librsvg imagemagick`). Run it again after
 updating to rebuild the app.
@@ -305,9 +306,46 @@ outlive vmac while keys, size and colors work as in a local terminal.
 `vmac.exec(cmd, args)` runs a program and returns its output, for backends
 built on a command line tool.
 
+## Starting as a terminal
+
+`vmac` opens a window as a terminal filling it, in a *blank* session, and
+asks how to start:
+
+- **New persistent session**: name it (the folder's name by default). It
+  keeps running, terminals and all, when the window closes, like a tmux or
+  zellij session; `vmac` later finds it under *Find a session*.
+- **Find a session**: fuzzy-search the sessions running and go to one (the
+  blank one ends).
+- **Blank session** (or `ESC ESC`): stay as you are. A blank session ends
+  when its window closes.
+
+In a vmac terminal, `vmac` or `vmac .` opens the editor in that window, on
+that folder, with its files in the fuzzy finder; `vmac FILE` opens FILE.
+The terminal docks below, like VS Code's: `SPC o t` hides it or brings it
+back, `` C-` `` toggles it from anywhere, and `q` in its normal state hides it.
+`vmac PATH` from outside vmac does the same in a new window.
+
+Every window runs on the vmac server (below), so closing one only ends its
+blank session. `core.start_as = "dashboard"` starts on the dashboard
+instead, `core.docked_terminal_share = 0.4` gives the docked terminal more
+room, and `vmac --standalone [FILE]` is a window of its own without the
+server.
+
+### The leader key in terminals
+
+`SPC` leads only in normal state, the way a major mode's keys work in
+Emacs. While you type into a terminal every key, space included, goes to
+its program, so neovim, a shell's history search or htop get it, with no
+tmux-style `C-b` prefix in the way. `ESC` puts the terminal in normal
+state, where `SPC` leads again: `SPC o s` splits off another terminal,
+`SPC w h/j/k/l` moves between them, `SPC TAB` works the tabs, `SPC S`
+the sessions; `i` (or `a`, `o`...) goes back to typing. `C-\` sends the
+program an `ESC`. `vmac.set_terminal_leader(false)` keeps `SPC` from
+leading in a terminal at all (`s-` keys and `C-w` still move around).
+
 ## Dashboard and projects
 
-Started without a file, vmac opens on a dashboard: find a file, reopen a
+`core.start_as = "dashboard"` (or `vmac --standalone`) opens on a dashboard: find a file, reopen a
 recent one, switch project, open a folder, ask the agent, open your config.
 Each line's key runs it (or `RET` on it), and the projects you opened lately
 are listed below, `1` to `9`. `SPC b h` or `:dashboard` shows it again.
@@ -365,7 +403,9 @@ vmac kill-server       # stop it, and everything running in it
 
 Closing an attached window, or `:q`, only detaches: terminals, language
 servers and agents carry on, and the next `vmac attach` finds everything
-as it was. Plain `vmac FILE` still runs on its own, without a server. The
+as it was. Plain `vmac` attaches too, in a blank session that ends when the
+window closes (and the server with it, when nothing else is left); only
+`vmac --standalone` runs on its own. The
 server listens on a socket only you can reach (`$VMAC_SOCKET` to choose
 another) and logs to `~/.local/state/vmac/server.log`.
 

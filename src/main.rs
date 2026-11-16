@@ -50,7 +50,15 @@ use lisp::Lisp;
 use shell::Shell;
 
 const USAGE: &str = "\
-usage: vmac [FILE]              edit FILE (or show the dashboard) in this window
+usage: vmac [PATH]              open a window on the vmac server (starting it if
+                                needed) as a terminal: pick a new persistent
+                                session, an existing one, or stay blank (a blank
+                                session ends when the window closes). With PATH,
+                                open it, the terminal docked below. In a vmac
+                                terminal, `vmac` / `vmac PATH` open the editor
+                                in that window instead (`vmac` is `vmac .`)
+       vmac --standalone [FILE] edit FILE (or show the dashboard) in a window
+                                of its own, without the server
        vmac attach [TARGET]     open a window on the vmac server, starting it if
                                 needed; TARGET is a session's name or a project's
                                 folder (its session is made the first time)
@@ -145,24 +153,65 @@ fn main() {
             },
         },
         Some("kill-server") => daemon::kill(&socket).unwrap_or_else(|_| fail(&"no server running")),
+        Some("--standalone") => standalone(args.get(1).map(String::as_str)),
         Some(flag) if flag.starts_with('-') => fail(&format!("unknown option {flag}\n{USAGE}")),
+        // In a vmac terminal: the editor opens in that window.
+        path if in_vmac_terminal().is_some() => {
+            let session = in_vmac_terminal().unwrap_or_default();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let path = cwd.join(path.unwrap_or("."));
+            let path = std::path::absolute(&path).unwrap_or(path);
+            if let Err(e) = daemon::open_in_session(&socket, session, path) {
+                fail(&e);
+            }
+        }
         #[cfg(not(feature = "gui"))]
         _ => fail(&"this vmac is only the server (built without the window)"),
         #[cfg(feature = "gui")]
-        file => {
+        path => {
             sys::drop_own_console();
-            let buffer = match file {
-                Some(path) => Buffer::from_file(path.into()).unwrap_or_else(|e| fail(&e)),
-                None => Buffer::new("*scratch*"),
-            };
-            let dashboard = file.is_none();
-            // GPUI wants the window made on its thread: the sessions are made there.
-            open_window_with(move || {
-                packages::set_auto_install(true);
-                Box::new(new_server(Some((buffer, dashboard))))
-            });
+            let client = daemon::ensure_server(&socket)
+                .and_then(|()| daemon::Client::start(&socket, path.map(String::from)))
+                .unwrap_or_else(|e| fail(&e));
+            if let Some(why) = client.gone() {
+                fail(&why);
+            }
+            open_window(Box::new(client));
         }
     }
+}
+
+/// `vmac --standalone [FILE]`: a window with sessions of its own, without
+/// the server: FILE, or the dashboard.
+#[cfg(not(feature = "gui"))]
+fn standalone(_file: Option<&str>) {
+    eprintln!("vmac: this vmac is only the server (built without the window)");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "gui")]
+fn standalone(file: Option<&str>) {
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("vmac: {e}");
+        std::process::exit(1);
+    };
+    sys::drop_own_console();
+    let buffer = match file {
+        Some(path) => Buffer::from_file(path.into()).unwrap_or_else(|e| fail(&e)),
+        None => Buffer::new("*scratch*"),
+    };
+    let dashboard = file.is_none();
+    // GPUI wants the window made on its thread: the sessions are made there.
+    open_window_with(move || {
+        packages::set_auto_install(true);
+        Box::new(new_server(Some((buffer, dashboard))))
+    });
+}
+
+/// The session whose terminal this runs in (VMAC_SESSION, which the
+/// server's terminals get), when its server is the one on the socket.
+fn in_vmac_terminal() -> Option<u64> {
+    std::env::var("VMAC_SESSION").ok()?.parse().ok()
 }
 
 /// `vmac update`: says whether a newer release is out and, unless only

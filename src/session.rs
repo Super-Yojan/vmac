@@ -70,6 +70,11 @@ impl Session {
         self.lisp.eval(code)
     }
 
+    /// Runs Lua in this session (the server's calls into the core).
+    pub fn run_lua(&mut self, code: &str) -> Result<String, String> {
+        self.lisp.eval(code)
+    }
+
     /// Runs a command by name, as a key bound to it would.
     pub fn run_command(&mut self, name: &str) {
         self.lisp.run_command(name);
